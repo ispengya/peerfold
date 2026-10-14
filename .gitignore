@@ -1,5 +1,8 @@
-﻿.superpowers/
+.superpowers/
 /peerfold
 /peerfold.exe
-commitmsg.txt
-nobom.txt
+
+# Scratch files used to pass multi-line messages to git commit.
+commitmsg*
+nobom*
+.commitmsg*
