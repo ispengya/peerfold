@@ -1,0 +1,276 @@
+package index_test
+
+import (
+	"fmt"
+	"sync"
+	"testing"
+
+	"peerfold/internal/index"
+	"peerfold/internal/node"
+)
+
+// dir and file build the two node kinds the index stores, so the tests say
+// what they mean about kind without repeating struct literals.
+func dir(path string) node.Node { return node.Node{Path: path, Kind: node.KindDir} }
+func file(path string, size int64) node.Node {
+	return node.Node{Path: path, Kind: node.KindFile, Size: size}
+}
+
+// tree is the fixture every test starts from: one client with a directory, a
+// file inside it, and a nested directory with its own file.
+func tree() (*index.Index, []node.Node) {
+	nodes := []node.Node{
+		dir("Documents"),
+		file("Documents/a.txt", 5),
+		dir("Documents/sub"),
+		file("Documents/sub/b.txt", 6),
+	}
+	ix := &index.Index{}
+	ix.Apply("win", nodes)
+	return ix, nodes
+}
+
+func TestApplyAndLen(t *testing.T) {
+	ix, _ := tree()
+	if got := ix.Len(); got != 4 {
+		t.Fatalf("Len() = %d, want 4", got)
+	}
+	// Len counts every client's nodes, so a second client's node adds to the
+	// total rather than being tracked separately.
+	ix.Apply("mac", []node.Node{dir("Documents")})
+	if got := ix.Len(); got != 5 {
+		t.Fatalf("Len() after a second client = %d, want 5", got)
+	}
+	if got := ix.Clients(); len(got) != 2 {
+		t.Fatalf("Clients() = %v, want two clients", got)
+	}
+}
+
+func TestChildrenListsOnlyDirectChildren(t *testing.T) {
+	ix, _ := tree()
+	got, err := ix.Children("win", "Documents")
+	if err != nil {
+		t.Fatalf("Children: %v", err)
+	}
+	want := []string{"Documents/a.txt", "Documents/sub"}
+	if len(got) != len(want) {
+		t.Fatalf("Children(Documents) = %v, want %v", paths(got), want)
+	}
+	// Ascending by Path, and specifically not Documents/sub/b.txt.
+	for i, w := range want {
+		if got[i].Path != w {
+			t.Fatalf("Children(Documents)[%d] = %q, want %q (got %v)", i, got[i].Path, w, paths(got))
+		}
+	}
+	for _, n := range got {
+		if n.Path == "Documents/sub/b.txt" {
+			t.Fatal("Children returned a grandchild; it must list only direct children")
+		}
+	}
+}
+
+func TestChildrenOnFileIsNotADirectory(t *testing.T) {
+	ix, _ := tree()
+	if _, err := ix.Children("win", "Documents/a.txt"); err != index.ErrNotDir {
+		t.Fatalf("Children(file) error = %v, want ErrNotDir", err)
+	}
+}
+
+func TestChildrenOnMissingPath(t *testing.T) {
+	ix, _ := tree()
+	if _, err := ix.Children("win", "Nope"); err != index.ErrNotFound {
+		t.Fatalf("Children(missing) error = %v, want ErrNotFound", err)
+	}
+	if _, err := ix.Children("ghost", "Documents"); err != index.ErrNotFound {
+		t.Fatalf("Children(unknown client) error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestChildrenOfRootIsTopLevel(t *testing.T) {
+	ix, _ := tree()
+	got, err := ix.Children("win", "")
+	if err != nil {
+		t.Fatalf("Children(\"\") : %v", err)
+	}
+	if len(got) != 1 || got[0].Path != "Documents" {
+		t.Fatalf("Children(\"\") = %v, want [Documents]", paths(got))
+	}
+}
+
+func TestRemoveClient(t *testing.T) {
+	ix, _ := tree()
+	ix.Apply("mac", []node.Node{dir("Documents")})
+	ix.RemoveClient("win")
+	if got := ix.Len(); got != 1 {
+		t.Fatalf("Len() after RemoveClient = %d, want 1 (the other client)", got)
+	}
+	if _, ok := ix.Lookup("win", "Documents"); ok {
+		t.Error("Lookup found a node after RemoveClient")
+	}
+	if _, ok := ix.Lookup("mac", "Documents"); !ok {
+		t.Error("RemoveClient removed the wrong client's nodes")
+	}
+	ix.RemoveClient("ghost") // must not panic
+}
+
+func TestApplyOverwritesSameKey(t *testing.T) {
+	ix := &index.Index{}
+	ix.Apply("win", []node.Node{file("Documents/a.txt", 1)})
+	ix.Apply("win", []node.Node{file("Documents/a.txt", 2)})
+	if got := ix.Len(); got != 1 {
+		t.Fatalf("Len() after re-applying one path = %d, want 1", got)
+	}
+	n, ok := ix.Lookup("win", "Documents/a.txt")
+	if !ok {
+		t.Fatal("Lookup: not found")
+	}
+	if n.Size != 2 {
+		t.Fatalf("Lookup size = %d, want 2 (the later Apply must win)", n.Size)
+	}
+}
+
+func TestRemoveDeletesSubtree(t *testing.T) {
+	ix, _ := tree()
+	ix.Remove("win", "Documents/sub")
+	if _, ok := ix.Lookup("win", "Documents/sub"); ok {
+		t.Error("Remove left the directory itself behind")
+	}
+	if _, ok := ix.Lookup("win", "Documents/sub/b.txt"); ok {
+		t.Error("Remove left a descendant behind; it must take the whole subtree")
+	}
+	if _, ok := ix.Lookup("win", "Documents/a.txt"); !ok {
+		t.Error("Remove deleted a sibling that was not under the removed path")
+	}
+	if _, ok := ix.Lookup("win", "Documents"); !ok {
+		t.Error("Remove deleted an ancestor that contains the removed path")
+	}
+}
+
+func TestRemoveDoesNotMatchSiblingByPrefix(t *testing.T) {
+	ix := &index.Index{}
+	ix.Apply("win", []node.Node{
+		dir("Documents/sub"),
+		file("Documents/sub.bak", 1),
+		dir("Documents/subway"),
+		file("Documents/subway/x", 1),
+	})
+	ix.Remove("win", "Documents/sub")
+	for _, p := range []string{"Documents/sub.bak", "Documents/subway", "Documents/subway/x"} {
+		if _, ok := ix.Lookup("win", p); !ok {
+			t.Errorf("Remove(%q) also deleted %q: subtree removal must be path-component aware, not a raw prefix match", "Documents/sub", p)
+		}
+	}
+}
+
+func TestApplyDeletedNodeRemoves(t *testing.T) {
+	ix, _ := tree()
+	ix.Apply("win", []node.Node{
+		node.Node{Path: "Documents/sub", Kind: node.KindDeleted},
+	})
+	if _, ok := ix.Lookup("win", "Documents/sub/b.txt"); ok {
+		t.Error("applying a KindDeleted node left a descendant behind; it must behave as Remove")
+	}
+	if _, ok := ix.Lookup("win", "Documents/a.txt"); !ok {
+		t.Error("applying a KindDeleted node removed an unrelated path")
+	}
+}
+
+func TestPathsAreCaseSensitive(t *testing.T) {
+	ix := &index.Index{}
+	ix.Apply("win", []node.Node{dir("Documents"), dir("documents")})
+	if got := ix.Len(); got != 2 {
+		t.Fatalf("Len() = %d, want 2: Documents and documents are different keys", got)
+	}
+	if _, ok := ix.Lookup("win", "Documents"); !ok {
+		t.Error("Lookup(Documents) not found")
+	}
+	if _, ok := ix.Lookup("win", "documents"); !ok {
+		t.Error("Lookup(documents) not found")
+	}
+	if _, ok := ix.Lookup("win", "DOCUMENTS"); ok {
+		t.Error("Lookup(DOCUMENTS) found a node; the index must not fold case")
+	}
+}
+
+func TestLookupMissing(t *testing.T) {
+	ix, _ := tree()
+	if _, ok := ix.Lookup("win", "Nope"); ok {
+		t.Error("Lookup found a path that was never applied")
+	}
+	if _, ok := ix.Lookup("ghost", "Documents"); ok {
+		t.Error("Lookup found a client that was never applied")
+	}
+}
+
+func TestClientsAreSorted(t *testing.T) {
+	ix := &index.Index{}
+	ix.Apply("win", []node.Node{dir("Documents")})
+	ix.Apply("mac", []node.Node{dir("Documents")})
+	ix.Apply("bsd", []node.Node{dir("Documents")})
+	got := ix.Clients()
+	want := []string{"bsd", "mac", "win"}
+	if len(got) != len(want) {
+		t.Fatalf("Clients() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("Clients() = %v, want %v (ascending)", got, want)
+		}
+	}
+}
+
+// A path that could escape its share, or address a different one, must never
+// enter the index: the index is keyed by share-relative path, and a ".." would
+// make a remove reach outside the subtree it names.
+func TestApplyRejectsUnsafePaths(t *testing.T) {
+	ix := &index.Index{}
+	ix.Apply("win", []node.Node{
+		file("Documents/../../etc/passwd", 1),
+		file("..", 1),
+		file("../x", 1),
+		file("/etc/passwd", 1),
+		file("", 1),
+	})
+	if got := ix.Len(); got != 0 {
+		t.Fatalf("Len() = %d, want 0: unsafe paths must be dropped, got %v", got, ix.Clients())
+	}
+	// A legitimate path still goes in afterwards.
+	ix.Apply("win", []node.Node{file("Documents/a.txt", 5)})
+	if got := ix.Len(); got != 1 {
+		t.Fatalf("Len() = %d, want 1 after a valid Apply", got)
+	}
+}
+
+func TestConcurrentApplyAndLookup(t *testing.T) {
+	ix := &index.Index{}
+	const n = 1000
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ix.Apply("win", []node.Node{file(fmt.Sprintf("Documents/f%d", i), int64(i))})
+		}(i)
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ix.Lookup("win", fmt.Sprintf("Documents/f%d", i))
+			ix.Len()
+			ix.Children("win", "Documents")
+			ix.Clients()
+		}(i)
+	}
+	wg.Wait()
+	if got := ix.Len(); got != n {
+		t.Fatalf("Len() = %d, want %d", got, n)
+	}
+}
+
+// paths is for failure messages: it turns a node slice into just its paths.
+func paths(nodes []node.Node) []string {
+	out := make([]string, len(nodes))
+	for i, n := range nodes {
+		out[i] = n.Path
+	}
+	return out
+}
