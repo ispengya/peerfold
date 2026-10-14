@@ -32,28 +32,34 @@ func TestRunNoArgsListsCommands(t *testing.T) {
 	}
 }
 
-// TestRunStubSubcommandSucceeds pins the write commands' stub behaviour. Those
-// commands report pending work until Tasks 8/9 implement them. client, server
-// and ls are excluded: they are real now, so they fail on their own missing
-// arguments instead of printing a stub notice.
+// TestRunStubSubcommandSucceeds pins that a still-unimplemented subcommand
+// reports pending work rather than looking like a silent success or waking a
+// command that does not exist yet.
 func TestRunStubSubcommandSucceeds(t *testing.T) {
 	var out, errOut bytes.Buffer
 
-	if code := run([]string{"cat", "/nonexistent"}, &out, &errOut); code != 0 {
-		t.Fatalf("run([cat /nonexistent]) = %d, want 0 from the stub; stderr = %q", code, errOut.String())
+	if code := run([]string{"server", "--listen", "127.0.0.1:0"}, &out, &errOut); code != 0 {
+		t.Fatalf("run([server]) = %d, want 0 from the stub; stderr = %q", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "TODO") {
+		t.Fatalf("run([server]) stderr = %q, want the pending-work notice", errOut.String())
 	}
 }
 
-// TestRunDispatchesEveryKnownCommand pins every dispatch arm: a typo in a
-// case label would otherwise still pass every other test, because the usage
-// text alone is enough to satisfy TestRunNoArgsListsCommands.
+// TestRunDispatchesEveryKnownCommand pins every dispatch arm: a typo in a case
+// label would otherwise still pass every other test, because the usage text
+// alone is enough to satisfy TestRunNoArgsListsCommands.
 //
 // The commands that are still stubs answer with the pending-work notice. The
 // implemented ones are expected to get past the dispatch and fail on their own
 // missing arguments instead, which is a different code path from the default
-// arm.
+// arm. Every command in usageText must appear in exactly one of the two lists,
+// so a command that becomes real has to be moved rather than silently dropped.
 func TestRunDispatchesEveryKnownCommand(t *testing.T) {
-	for _, cmd := range []string{"put", "mkdir", "rm", "mv"} {
+	// Still stubs. server is on this list, not the other one: cmd_server.go
+	// prints the pending-work notice, and listing it as implemented would drop
+	// its dispatch arm from the pin entirely.
+	for _, cmd := range []string{"server", "cat", "put", "mkdir", "rm", "mv"} {
 		var out, errOut bytes.Buffer
 
 		if code := run([]string{cmd}, &out, &errOut); code != 0 {

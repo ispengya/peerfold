@@ -274,6 +274,16 @@ func (s *Server) serveLoop(name string, c *proto.Conn) {
 		// just published, because the index belongs to the connection and is
 		// dropped when this handler returns.
 		if env.Kind == proto.KindTreeDone {
+			if !env.EOF {
+				// An upload is a sequence of batches closed by one TreeDone,
+				// and every message is its own control frame. EOF is what
+				// marks the end of the sequence, so a TreeDone without it is
+				// an unfinished upload and must not be acknowledged as whole.
+				if err := c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: "tree done without the end-of-upload marker"}); err != nil {
+					return
+				}
+				continue
+			}
 			if err := c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind}); err != nil {
 				return
 			}

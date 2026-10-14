@@ -417,7 +417,7 @@ func TestServerTreeDoneKeepsTheConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Marshal tree done: %v", err)
 	}
-	if err := conn.Send(proto.Envelope{ID: 3, Kind: proto.KindTreeDone, Body: done}); err != nil {
+	if err := conn.Send(proto.Envelope{ID: 3, Kind: proto.KindTreeDone, Body: done, EOF: true}); err != nil {
 		t.Fatalf("Send tree done: %v", err)
 	}
 	ack, err := conn.Recv()
@@ -446,6 +446,54 @@ func TestServerTreeDoneKeepsTheConnection(t *testing.T) {
 	})
 	if _, ok := s.Index().Lookup("laptop", "Documents/second.txt"); !ok {
 		t.Fatal("the connection stopped serving after TreeDone")
+	}
+}
+
+// TestServerRejectsTreeDoneWithoutEOF pins the end-of-upload marker.
+//
+// An upload is several batches followed by one TreeDone, and every one of them
+// travels as a control frame. The EOF flag is what distinguishes "this was the
+// last message of the upload" from "there may be more", so a TreeDone without
+// it is an unfinished upload and must not be acknowledged as complete.
+func TestServerRejectsTreeDoneWithoutEOF(t *testing.T) {
+	s, addr := start(t)
+	raw, _ := hello(t, addr, "laptop", proto.RoleClient, false)
+	defer raw.Close()
+	conn := proto.NewConn(raw)
+
+	sendBatch(t, conn, 2, []proto.NodeJSON{
+		{Path: "Documents", Kind: uint8(node.KindDir)},
+	})
+	done, err := json.Marshal(proto.TreeDoneBody{Shares: []string{"Documents"}})
+	if err != nil {
+		t.Fatalf("Marshal tree done: %v", err)
+	}
+	// Deliberately no EOF.
+	if err := conn.Send(proto.Envelope{ID: 3, Kind: proto.KindTreeDone, Body: done}); err != nil {
+		t.Fatalf("Send tree done: %v", err)
+	}
+
+	ack, err := conn.Recv()
+	if err != nil {
+		t.Fatalf("Recv tree-done reply: %v", err)
+	}
+	if ack.Err == "" {
+		t.Fatal("a TreeDone without the EOF marker was accepted; an upload must be marked as finished")
+	}
+	// The refusal must not take the connection down: the client can still
+	// send the correctly marked TreeDone and finish.
+	if err := conn.Send(proto.Envelope{ID: 4, Kind: proto.KindTreeDone, Body: done, EOF: true}); err != nil {
+		t.Fatalf("Send marked tree done: %v", err)
+	}
+	ack2, err := conn.Recv()
+	if err != nil {
+		t.Fatalf("Recv marked tree-done reply: %v", err)
+	}
+	if ack2.Err != "" {
+		t.Fatalf("a correctly marked TreeDone was refused too: %q", ack2.Err)
+	}
+	if _, ok := s.Index().Lookup("laptop", "Documents"); !ok {
+		t.Fatal("the tree is missing after a correctly marked upload")
 	}
 }
 

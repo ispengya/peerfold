@@ -176,3 +176,47 @@ func TestClientUnknownFlagExitsTwo(t *testing.T) {
 		t.Fatalf("run(client --nonsense) = %d, want 2", code)
 	}
 }
+
+// TestClientDoesNotPersistAnInvalidShare pins that a bad --share is rejected
+// before anything is written.
+//
+// The config merge is add-only, so a share saved by a command that failed would
+// be permanent: every later run would fail on an entry the user never sees and
+// has no way to remove. "The command failed" is not enough — the config has to
+// be untouched.
+func TestClientDoesNotPersistAnInvalidShare(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	before := config.Default()
+	before.Server = "127.0.0.1:1"
+	if err := config.Save(cfgPath, before); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	cases := []struct {
+		name  string
+		share string
+	}{
+		{"a path that does not exist", "Documents=" + filepath.Join(t.TempDir(), "nope")},
+		{"a name that is not a single component", "a/b=" + t.TempDir()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			code := run([]string{"client", "--config", cfgPath, "--share", tc.share}, &out, &errOut)
+			if code == 0 {
+				t.Fatalf("run(client --share %q) = 0, want non-zero", tc.share)
+			}
+			if errOut.Len() == 0 {
+				t.Error("stderr is empty, want the reason for the failure")
+			}
+
+			after, err := config.Load(cfgPath)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if len(after.Shares) != 0 {
+				t.Fatalf("the rejected share was written to the config anyway: %v", after.Shares)
+			}
+		})
+	}
+}

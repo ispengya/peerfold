@@ -90,7 +90,7 @@ func Dial(o Options) (*Client, error) {
 		c.Close()
 		return nil, fmt.Errorf("client: encode hello: %w", err)
 	}
-	if _, err := c.send(proto.KindHello, body, 0); err != nil {
+	if _, err := c.send(proto.KindHello, body, false); err != nil {
 		c.Close()
 		return nil, err
 	}
@@ -124,8 +124,22 @@ func (c *Client) Name() string { return c.name }
 // that asked for it may still see false here.
 func (c *Client) Aggregate() bool { return c.aggregate }
 
+// maxBatchBody is the largest marshalled tree batch the client puts in one
+// control frame, deliberately half of proto.MaxPayload.
+//
+// A node count cannot bound a frame: a frame is limited in bytes and a node's
+// path is unbounded, so 4000 nodes with 195-byte paths already marshal to about
+// 1.03MB — at the payload limit itself. Half rather than all of it, so the
+// envelope's own JSON has room without a second calculation.
+const maxBatchBody = proto.MaxPayload / 2
+
 // UploadTree scans the shares and sends the result as tree batches, then closes
 // the upload with a tree-done and waits for the server to acknowledge it.
+//
+// A batch is flushed when it reaches the configured node count or when adding
+// one more node would push the marshalled body past maxBatchBody, whichever
+// comes first: both limits are real, and the size one cannot be written as a
+// node count.
 //
 // The batches are sent as they are scanned, so the server's index grows while
 // the upload runs. OnBatch is called after each batch is sent.
@@ -134,10 +148,9 @@ func (c *Client) UploadTree() error {
 	var sent int
 	var pending []node.Node
 
-	flush := func() error {
-		if len(pending) == 0 {
-			return nil
-		}
+	// encode marshals the pending nodes, so the budget is checked against
+	// exactly the bytes that would go on the wire.
+	encode := func() ([]byte, error) {
 		nodes := make([]proto.NodeJSON, len(pending))
 		for i, n := range pending {
 			nodes[i] = proto.NodeJSON{
@@ -148,11 +161,18 @@ func (c *Client) UploadTree() error {
 				Mtime: n.Mtime,
 			}
 		}
-		body, err := json.Marshal(proto.TreeBatchBody{Nodes: nodes})
+		return json.Marshal(proto.TreeBatchBody{Nodes: nodes})
+	}
+
+	flush := func() error {
+		if len(pending) == 0 {
+			return nil
+		}
+		b, err := encode()
 		if err != nil {
 			return fmt.Errorf("client: encode tree batch: %w", err)
 		}
-		if _, err := c.send(proto.KindTreeBatch, body, 0); err != nil {
+		if _, err := c.send(proto.KindTreeBatch, b, false); err != nil {
 			return err
 		}
 		sent += len(pending)
@@ -163,14 +183,31 @@ func (c *Client) UploadTree() error {
 		return nil
 	}
 
-	scanErr := Scan(c.shares, batch, func(nodes []node.Node) error {
-		for _, n := range nodes {
-			pending = append(pending, n)
-			if len(pending) >= batch {
-				// Send the batch and wait for the server to take it before
-				// reading more of the disk. A client that streams an entire
-				// million-file tree into a socket without ever reading a reply
-				// deadlocks both ends once the buffers fill.
+	// overflow reports whether pending, as it stands, is over the byte budget.
+	overflow := func() (bool, error) {
+		b, err := encode()
+		if err != nil {
+			return false, fmt.Errorf("client: encode tree batch: %w", err)
+		}
+		return len(b) > maxBatchBody, nil
+	}
+
+	// add buffers one node and flushes when either limit is reached.
+	add := func(n node.Node) error {
+		// A lone node is always sent on its own, so a path longer than the
+		// whole budget cannot wedge the upload: WriteFrame reports the real
+		// limit rather than the client looping for ever trying to fit it.
+		if len(pending) > 0 {
+			over, err := overflow()
+			if err != nil {
+				return err
+			}
+			if over || len(pending) >= batch {
+				// Whatever is already buffered is what fits. Send it and wait
+				// for the server to take it before reading more of the disk: a
+				// client that streamed an entire million-file tree into a socket
+				// without ever reading a reply deadlocks both ends once the
+				// buffers fill.
 				if err := flush(); err != nil {
 					return err
 				}
@@ -179,10 +216,19 @@ func (c *Client) UploadTree() error {
 				}
 			}
 		}
+		pending = append(pending, n)
 		return nil
-	})
-	if scanErr != nil {
-		return scanErr
+	}
+
+	if err := Scan(c.shares, batch, func(nodes []node.Node) error {
+		for _, n := range nodes {
+			if err := add(n); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	if err := flush(); err != nil {
 		return err
@@ -192,7 +238,10 @@ func (c *Client) UploadTree() error {
 	if err != nil {
 		return fmt.Errorf("client: encode tree done: %w", err)
 	}
-	id, err := c.send(proto.KindTreeDone, shares, 1)
+	// EOF marks this as the last message of the upload. The server refuses a
+	// TreeDone without it, because an upload is only ever "the batches, then
+	// the end" — there is no other way to say the sequence is over.
+	id, err := c.send(proto.KindTreeDone, shares, true)
 	if err != nil {
 		return err
 	}
@@ -215,21 +264,21 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
-// send writes one control message and returns the ID it was given. Allocate is
-// the caller's extra ID space, so a message that expects a reply can be
-// recognised when it arrives.
+// send writes one control message and returns the ID it was given.
 //
 // Every send carries an ID: a reply echoes the ID of the request it answers, so
-// a client that sends several requests without IDs cannot tell its replies
+// a client that sent two messages both numbered zero could not tell the replies
 // apart.
-func (c *Client) send(kind string, body []byte, allocate uint64) (uint64, error) {
+//
+// eof marks the message as the last of a sequence. It is only meaningful for a
+// message that ends one — today that is TreeDone — and is false otherwise.
+func (c *Client) send(kind string, body []byte, eof bool) (uint64, error) {
 	c.mu.Lock()
 	c.nextID++
 	id := c.nextID
-	c.nextID += allocate
 	c.mu.Unlock()
 
-	env := proto.Envelope{ID: id, Kind: kind}
+	env := proto.Envelope{ID: id, Kind: kind, EOF: eof}
 	if body != nil {
 		env.Body = body
 	}

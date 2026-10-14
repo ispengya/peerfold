@@ -98,14 +98,18 @@ func cmdClient(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	if err := config.Save(path, cfg); err != nil {
-		fmt.Fprintf(stderr, "client: save config %s: %v\n", path, err)
+	// Resolve the shares before saving anything. A share that does not exist is a
+	// mistake in the command that was just typed, and writing it to the config would
+	// make it permanent: the merge below is add-only, so every later run would fail
+	// on an entry the user cannot see how to remove.
+	sh, err := client.NewShares(shareArgs(cfg.Shares), nil)
+	if err != nil {
+		fmt.Fprintf(stderr, "%v\n", err)
 		return 1
 	}
 
-	sh, err := client.NewShares(shareArgs(cfg.Shares), nil)
-	if err != nil {
-		fmt.Fprintf(stderr, "client: %v\n", err)
+	if err := config.Save(path, cfg); err != nil {
+		fmt.Fprintf(stderr, "client: save config %s: %v\n", path, err)
 		return 1
 	}
 
@@ -119,13 +123,13 @@ func cmdClient(args []string, stdout, stderr io.Writer) int {
 		},
 	})
 	if err != nil {
-		fmt.Fprintf(stderr, "client: %v\n", err)
+		fmt.Fprintf(stderr, "%v\n", err)
 		return 1
 	}
 	defer c.Close()
 
 	if err := c.UploadTree(); err != nil {
-		fmt.Fprintf(stderr, "client: %v\n", err)
+		fmt.Fprintf(stderr, "%v\n", err)
 		return 1
 	}
 

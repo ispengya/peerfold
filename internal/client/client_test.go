@@ -1,7 +1,9 @@
 package client_test
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -36,6 +38,34 @@ func startServer(t *testing.T) (*server.Server, string) {
 func docsOf(t *testing.T) string {
 	t.Helper()
 	return filepath.Join(buildTree(t), "Documents")
+}
+
+// waitForChildCount polls until the index holds exactly want direct children
+// under client/dir. It is for fixtures whose exact count is known and large
+// enough that naming them one by one would be absurd.
+//
+// It requires the count to be stable across two reads, so a batch still in
+// flight cannot be mistaken for the finished tree.
+func waitForChildCount(t *testing.T, ix *index.Index, client, dir string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(120 * time.Second)
+	var last int
+	for time.Now().Before(deadline) {
+		kids, err := ix.Children(client, dir)
+		if err == nil && len(kids) == want {
+			time.Sleep(30 * time.Millisecond)
+			again, err := ix.Children(client, dir)
+			if err == nil && len(again) == want {
+				return
+			}
+			continue
+		}
+		if err == nil {
+			last = len(kids)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("index holds %d children of %q/%q, want %d", last, client, dir, want)
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -412,5 +442,99 @@ func TestClientViewerCannotUploadTree(t *testing.T) {
 	}
 	if got := s.Index().Len(); got != 0 {
 		t.Fatalf("Len() = %d after a viewer upload, want 0", got)
+	}
+}
+
+// TestClientMarksTreeDoneAsTheEndOfTheUpload pins the end-of-upload marker from
+// the sending side.
+//
+// The server refuses a TreeDone without it, so the client is where the contract
+// is kept; asserting it only through a successful end-to-end upload would leave
+// both ends free to agree on the wrong thing.
+func TestClientMarksTreeDoneAsTheEndOfTheUpload(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+
+	// The stub server: answer the hello, then collect everything the client
+	// sends until TreeDone arrives.
+	type result struct {
+		done proto.Envelope
+		err  error
+	}
+	got := make(chan result, 1)
+	go func() {
+		raw, err := ln.Accept()
+		if err != nil {
+			got <- result{err: err}
+			return
+		}
+		defer raw.Close()
+		conn := proto.NewConn(raw)
+
+		hello, err := conn.Recv()
+		if err != nil {
+			got <- result{err: err}
+			return
+		}
+		if hello.Kind != proto.KindHello {
+			got <- result{err: fmt.Errorf("first message kind = %q, want hello", hello.Kind)}
+			return
+		}
+		body, _ := json.Marshal(proto.HelloOKBody{Name: "laptop"})
+		if err := conn.Send(proto.Envelope{ID: hello.ID, Kind: proto.KindHelloOK, Body: body}); err != nil {
+			got <- result{err: err}
+			return
+		}
+
+		for {
+			env, err := conn.Recv()
+			if err != nil {
+				got <- result{err: err}
+				return
+			}
+			switch env.Kind {
+			case proto.KindTreeBatch:
+				// Acknowledge, the way the real server does, so the client
+				// keeps uploading.
+				if err := conn.Send(proto.Envelope{}); err != nil {
+					got <- result{err: err}
+					return
+				}
+			case proto.KindTreeDone:
+				got <- result{done: env}
+				return
+			default:
+				got <- result{err: fmt.Errorf("unexpected message kind %q", env.Kind)}
+				return
+			}
+		}
+	}()
+
+	sh, err := client.NewShares([]string{"Documents=" + docsOf(t)}, nil)
+	if err != nil {
+		t.Fatalf("NewShares: %v", err)
+	}
+	c, err := client.Dial(client.Options{Server: ln.Addr().String(), Name: "laptop", Shares: sh})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close()
+
+	// UploadTree cannot finish: the stub never acks TreeDone. The point is what
+	// the stub received, so the error is expected and ignored.
+	_ = c.UploadTree()
+
+	res := <-got
+	if res.err != nil {
+		t.Fatalf("stub server: %v", res.err)
+	}
+	if !res.done.EOF {
+		t.Fatal("TreeDone did not carry the end-of-upload marker; the server refuses an unmarked one")
+	}
+	if res.done.Err != "" {
+		t.Fatalf("TreeDone carried an error: %q", res.done.Err)
 	}
 }
