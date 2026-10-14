@@ -230,6 +230,20 @@ func TestApplyRejectsUnsafePaths(t *testing.T) {
 		file("../x", 1),
 		file("/etc/passwd", 1),
 		file("", 1),
+		// Windows separators. These arrive as one opaque component because
+		// there is no "/" to split on, so the ".." check above does not see
+		// them; a backslash-bearing key would later be joined onto a share root
+		// by a file operation and escape it.
+		file(`Documents\..\..\etc\passwd`, 1),
+		file(`Documents\..\..\etc`, 1),
+		file(`\etc\passwd`, 1),
+		// Empty components: a trailing slash makes a path its own parent's
+		// "child", and a doubled slash mis-parents what follows.
+		file("Documents/", 1),
+		file("Documents//a.txt", 1),
+		file("/Documents", 1),
+		file(".", 1),
+		file("Documents/.", 1),
 	})
 	if got := ix.Len(); got != 0 {
 		t.Fatalf("Len() = %d, want 0: unsafe paths must be dropped, got %v", got, ix.Clients())
@@ -238,6 +252,92 @@ func TestApplyRejectsUnsafePaths(t *testing.T) {
 	ix.Apply("win", []node.Node{file("Documents/a.txt", 5)})
 	if got := ix.Len(); got != 1 {
 		t.Fatalf("Len() = %d, want 1 after a valid Apply", got)
+	}
+}
+
+// A trailing-slash key would be returned by Children as a child of the
+// directory it names, which is not a child at all. It must never be stored.
+func TestChildrenNeverReturnsSelfFromTrailingSlash(t *testing.T) {
+	ix := &index.Index{}
+	ix.Apply("win", []node.Node{dir("Documents"), file("Documents/", 1), file("Documents/a.txt", 5)})
+	got, err := ix.Children("win", "Documents")
+	if err != nil {
+		t.Fatalf("Children: %v", err)
+	}
+	for _, n := range got {
+		if n.Path == "Documents/" || n.Path == "Documents" {
+			t.Fatalf("Children returned %q, which is not a child of Documents: %v", n.Path, paths(got))
+		}
+	}
+	if len(got) != 1 || got[0].Path != "Documents/a.txt" {
+		t.Fatalf("Children = %v, want [Documents/a.txt]", paths(got))
+	}
+}
+
+// Review Focus 5: a zero-byte file and an empty directory are ordinary entries.
+// Neither may be mistaken for "absent", which is what a size- or child-based
+// existence test would do.
+func TestEmptyDirAndZeroByteFileAreRealEntries(t *testing.T) {
+	ix := &index.Index{}
+	ix.Apply("win", []node.Node{dir("Empty"), file("zero.bin", 0)})
+
+	if _, ok := ix.Lookup("win", "Empty"); !ok {
+		t.Error("an empty directory was not indexed")
+	}
+	kids, err := ix.Children("win", "Empty")
+	if err != nil {
+		t.Fatalf("Children(Empty) = %v, want an empty slice and no error", err)
+	}
+	if len(kids) != 0 {
+		t.Fatalf("Children(Empty) = %v, want no children", paths(kids))
+	}
+
+	n, ok := ix.Lookup("win", "zero.bin")
+	if !ok {
+		t.Fatal("a zero-byte file was not indexed; Size == 0 must not mean absent")
+	}
+	if n.Size != 0 || n.Kind != node.KindFile {
+		t.Fatalf("zero.bin = {Size:%d Kind:%d}, want {Size:0 Kind:KindFile}", n.Size, n.Kind)
+	}
+	// And it shows up as a child of the top level, not swallowed.
+	roots, err := ix.Children("win", "")
+	if err != nil {
+		t.Fatalf(`Children("") : %v`, err)
+	}
+	if len(roots) != 2 {
+		t.Fatalf(`Children("") = %v, want both Empty and zero.bin`, paths(roots))
+	}
+}
+
+// A client that has had every node removed is gone as a key, not present and
+// empty: Clients() must not advertise a share-less client.
+func TestRemoveLastNodeDropsClient(t *testing.T) {
+	ix := &index.Index{}
+	ix.Apply("win", []node.Node{dir("Documents")})
+	ix.Remove("win", "Documents")
+	if got := ix.Clients(); len(got) != 0 {
+		t.Fatalf("Clients() = %v, want empty after the last node was removed", got)
+	}
+	if got := ix.Len(); got != 0 {
+		t.Fatalf("Len() = %d, want 0", got)
+	}
+	if kids, err := ix.Children("win", ""); err != nil || len(kids) != 0 {
+		t.Fatalf(`Children("") = (%v, %v), want (empty, nil)`, paths(kids), err)
+	}
+}
+
+// Re-applying after a full removal must work: the client key has to come back,
+// not stay deleted.
+func TestApplyAfterFullRemovalRecreatesClient(t *testing.T) {
+	ix := &index.Index{}
+	ix.Apply("win", []node.Node{dir("Documents")})
+	ix.Remove("win", "Documents")
+	ix.Apply("win", []node.Node{dir("Documents")})
+	if _, ok := ix.Lookup("win", "Documents"); !ok {
+		t.Fatal("Apply after a full removal did not recreate the client's nodes")
+	}
+	if got := ix.Clients(); len(got) != 1 || got[0] != "win" {
+		t.Fatalf("Clients() = %v, want [win]", got)
 	}
 }
 

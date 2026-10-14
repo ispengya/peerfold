@@ -63,7 +63,9 @@ func (ix *Index) Apply(client string, nodes []node.Node) {
 // Remove deletes path and everything beneath it on client.
 //
 // The comparison is by path component, not by raw string prefix: removing
-// "Documents/sub" must not also delete "Documents/subway".
+// "Documents/sub" must not also delete "Documents/subway". Removing a path that
+// is not indexed is a no-op, and the empty path is not a stored key, so it
+// removes nothing; RemoveClient is what drops a whole client.
 func (ix *Index) Remove(client, path string) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
@@ -81,6 +83,12 @@ func (ix *Index) removeLocked(client, path string) {
 		if strings.HasPrefix(p, prefix) {
 			delete(m, p)
 		}
+	}
+	// A client with no nodes left is gone as a key too. This keeps the
+	// comment on Clients honest, and stops a client that removed everything
+	// from looking present-but-empty.
+	if len(m) == 0 {
+		delete(ix.clients, client)
 	}
 }
 
@@ -103,7 +111,9 @@ func (ix *Index) Lookup(client, path string) (node.Node, bool) {
 //
 // The empty dir addresses the top level, which is where each share's root node
 // lives; it is not a path that is indexed, so it is handled before the
-// existence check rather than reported as missing.
+// existence check rather than reported as missing. An unknown client therefore
+// yields an empty slice and no error at "" — it has no roots — while any other
+// path on an unknown client is ErrNotFound, because nothing is indexed there.
 func (ix *Index) Children(client, dir string) ([]node.Node, error) {
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
@@ -169,15 +179,29 @@ func (ix *Index) Len() int {
 	return n
 }
 
-// validPath reports whether p may be indexed. Paths are share-relative and
-// slash-separated, so an empty or absolute path, or one with a ".." component,
-// is rejected.
+// validPath reports whether p may be indexed.
+//
+// Paths are share-relative and slash-separated, so this rejects:
+//   - the empty path;
+//   - anything absolute (leading "/");
+//   - any "." or ".." component, which would let a later subtree removal reach
+//     outside the subtree it names;
+//   - empty components, from a leading, trailing, or doubled "/", which make a
+//     path that is its own parent's "child" and that Remove cannot match;
+//   - any backslash. A Windows-style separator would otherwise arrive as one
+//     opaque component: "Documents\..\..\etc" contains no "/" to split on, so
+//     it would be stored and later joined onto a share root as a real escape.
+//
+// A rejected path is dropped rather than reported, so a non-conforming peer
+// cannot poison the index. That also means the index cannot be relied on to
+// tell a caller its path was bad.
 func validPath(p string) bool {
-	if p == "" || strings.HasPrefix(p, "/") {
+	if p == "" || strings.HasPrefix(p, "/") || strings.Contains(p, `\`) {
 		return false
 	}
-	for _, part := range strings.Split(p, "/") {
-		if part == ".." {
+	parts := strings.Split(p, "/")
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
 			return false
 		}
 	}
