@@ -95,7 +95,10 @@ type ReadBody struct {
 	Client string `json:"client"`
 	Path   string `json:"path"`
 	Off    int64  `json:"off"`
-	N      int64  `json:"n"`
+	// N is the largest number of bytes wanted, or negative for "to the end of
+	// the file". It is an int rather than an int64 because it reaches the
+	// owner's filesystem layer as a count, not an offset.
+	N int `json:"n"`
 }
 
 // WriteBody announces a whole-file write-back to the owning client. Content

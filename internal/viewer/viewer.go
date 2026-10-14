@@ -4,6 +4,7 @@ package viewer
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -110,8 +111,14 @@ func (v *Viewer) List(path string) ([]node.Node, error) {
 		return nil, fmt.Errorf("viewer: list reply kind = %q, want %q", env.Kind, proto.KindListOK)
 	}
 
+	// The reply body arrives as a data stream, not in the envelope: a listing
+	// can be far past one frame's payload, so the server sends it in chunks.
+	raw, err := v.recvBody(env, id, "list reply for "+path)
+	if err != nil {
+		return nil, err
+	}
 	var b proto.ListOKBody
-	if err := json.Unmarshal(env.Body, &b); err != nil {
+	if err := json.Unmarshal(raw, &b); err != nil {
 		return nil, fmt.Errorf("viewer: decode list reply: %w", err)
 	}
 	out := make([]node.Node, 0, len(b.Nodes))
@@ -125,6 +132,137 @@ func (v *Viewer) List(path string) ([]node.Node, error) {
 		})
 	}
 	return out, nil
+}
+
+// Read returns up to n bytes of a file, starting at off. A negative n means
+// "to the end of the file", which is how Cat asks for everything.
+//
+// The bytes come from the owner's disk, not from the server's index: the index
+// holds names and sizes, so a file that has been deleted since the upload is
+// reported by the owner rather than served from a stale copy.
+func (v *Viewer) Read(path string, off int64, n int) ([]byte, error) {
+	if off < 0 {
+		return nil, fmt.Errorf("viewer: read %q: offset %d is negative", path, off)
+	}
+	client, rest := splitPath(path)
+	if client == "" || rest == "" {
+		return nil, fmt.Errorf("viewer: read %q: a read needs a client and a path inside it", path)
+	}
+
+	body, err := json.Marshal(proto.ReadBody{Client: client, Path: rest, Off: off, N: n})
+	if err != nil {
+		return nil, fmt.Errorf("viewer: encode read: %w", err)
+	}
+	id, err := v.send(proto.KindRead, body)
+	if err != nil {
+		return nil, err
+	}
+
+	head, err := v.recv(callTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("viewer: read reply for %q: %w", path, err)
+	}
+	if head.Err != "" {
+		// The head frame is where "no such file" arrives. The content stream is
+		// still owed, so it is read before returning, or the next reply would be
+		// parsed out of the middle of it.
+		if _, err := v.pc.RecvBody(id); err != nil {
+			return nil, fmt.Errorf("viewer: read reply for %q: %s (and its stream: %v)", path, head.Err, err)
+		}
+		if _, err := v.recv(callTimeout); err != nil {
+			return nil, fmt.Errorf("viewer: read reply for %q: %s (and its closing frame: %v)", path, head.Err, err)
+		}
+		return nil, fmt.Errorf("viewer: %s", head.Err)
+	}
+	if head.ID != id {
+		return nil, fmt.Errorf("viewer: read reply ID = %d, want %d: replies are out of step", head.ID, id)
+	}
+	if head.Kind != proto.KindRead {
+		return nil, fmt.Errorf("viewer: read reply kind = %q, want %q", head.Kind, proto.KindRead)
+	}
+
+	// The content is a data stream, so it can exceed one frame. A zero-byte
+	// file arrives as one frame of zero bytes — which is not the same as no
+	// frame at all, and that is what tells it apart from a failed read.
+	fmt.Printf("PROBE viewer readContent id=%d headErr=%q\n", id, head.Err)
+	data, err := v.readContent(id)
+	if err != nil {
+		return nil, fmt.Errorf("viewer: read content for %q: %w", path, err)
+	}
+	// The tail frame closes the answer, and its outcome is the one that counts:
+	// it is what proves the whole stream was delivered.
+	tail, err := v.recv(callTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("viewer: read reply for %q ended without its closing frame: %w", path, err)
+	}
+	if tail.Err != "" {
+		return nil, fmt.Errorf("viewer: %s", tail.Err)
+	}
+	return data, nil
+}
+
+// readContent reads a data stream and strips the zero-byte marker that stands
+// for an empty file.
+//
+// The marker exists because an empty stream and an empty file are both zero
+// bytes: without it, a file that is legitimately empty would look like a read
+// that produced nothing.
+func (v *Viewer) readContent(id uint64) ([]byte, error) {
+	var body []byte
+	var sawMarker bool
+	first := true
+	for {
+		if err := v.conn.SetReadDeadline(time.Now().Add(callTimeout)); err != nil {
+			return nil, err
+		}
+		chunk, done, err := v.pc.RecvData(id)
+		if err != nil {
+			return nil, err
+		}
+		if done {
+			if first && len(body) == 0 && !sawMarker {
+				// The stream ended with nothing in it: the read produced no
+				// content at all, which is a failure rather than an empty file.
+				return nil, errEmptyStream
+			}
+			return body, nil
+		}
+		if len(chunk) == 0 {
+			sawMarker = true
+		} else {
+			body = append(body, chunk...)
+		}
+		first = false
+	}
+}
+
+// errEmptyStream reports a content stream that carried no frame at all, which is
+// how a failed read is delivered rather than how an empty file is.
+var errEmptyStream = errors.New("the read produced no content")
+
+// Cat returns a whole file.
+func (v *Viewer) Cat(path string) ([]byte, error) {
+	return v.Read(path, 0, -1)
+}
+
+// recvBody reads a reply's body.
+//
+// A streamed reply carries no body in its envelope, and one that fits carries
+// the whole body there. The distinction is "is Body nil", not "is Body empty":
+// a listing of nothing still marshals to "{}"-worth of bytes, so an empty,
+// non-nil Body is a body, while nil means the bytes are still coming.
+func (v *Viewer) recvBody(env proto.Envelope, id uint64, what string) ([]byte, error) {
+	if env.Body != nil {
+		return env.Body, nil
+	}
+	if err := v.conn.SetReadDeadline(time.Now().Add(callTimeout)); err != nil {
+		return nil, fmt.Errorf("viewer: %s: %w", what, err)
+	}
+	body, err := v.pc.RecvBody(id)
+	if err != nil {
+		return nil, fmt.Errorf("viewer: %s: %w", what, err)
+	}
+	return body, nil
 }
 
 // Close drops the connection. A viewer owns nothing on the server, so there is

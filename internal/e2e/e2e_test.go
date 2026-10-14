@@ -5,6 +5,7 @@ package e2e
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -299,5 +300,215 @@ func TestE2EListMultipleShares(t *testing.T) {
 	}
 	if paths := pathsOf(mediaKids); len(paths) != 1 || paths[0] != "Media/song.mp3" {
 		t.Fatalf("List(win/Media) = %v, want [Media/song.mp3]", paths)
+	}
+}
+
+// TestE2ECatReadsTheOriginalBytes is the whole point of cat: the bytes a viewer
+// gets back are the bytes on the owner's disk.
+func TestE2ECatReadsTheOriginalBytes(t *testing.T) {
+	_, addr := startServer(t)
+	docs := share(t, "Documents", map[string]string{"a.txt": "hello world"})
+	join(t, addr, "win", "Documents="+docs)
+
+	v, err := viewer.Dial(addr)
+	if err != nil {
+		t.Fatalf("viewer.Dial: %v", err)
+	}
+	defer v.Close()
+
+	got, err := v.Cat("win/Documents/a.txt")
+	if err != nil {
+		t.Fatalf("Cat: %v", err)
+	}
+	if string(got) != "hello world" {
+		t.Fatalf("Cat = %q, want %q", got, "hello world")
+	}
+}
+
+// TestE2EReadReturnsARange pins that a range read returns that range and not
+// the whole file: a server that ignored the offset would still return bytes.
+func TestE2EReadReturnsARange(t *testing.T) {
+	_, addr := startServer(t)
+	docs := share(t, "Documents", map[string]string{"a.txt": "hello world"})
+	join(t, addr, "win", "Documents="+docs)
+
+	v, err := viewer.Dial(addr)
+	if err != nil {
+		t.Fatalf("viewer.Dial: %v", err)
+	}
+	defer v.Close()
+
+	got, err := v.Read("win/Documents/a.txt", 6, 5)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if string(got) != "world" {
+		t.Fatalf("Read(off=6,n=5) = %q, want %q", got, "world")
+	}
+}
+
+// TestE2ECatAnEmptyFile pins the zero-byte case end-to-end: it is a real file,
+// and the reply must be an empty read rather than an error or a hang.
+func TestE2ECatAnEmptyFile(t *testing.T) {
+	_, addr := startServer(t)
+	docs := share(t, "Documents", map[string]string{"a.txt": "hello"})
+	if err := os.WriteFile(filepath.Join(docs, "empty.txt"), nil, 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	join(t, addr, "win", "Documents="+docs)
+
+	v, err := viewer.Dial(addr)
+	if err != nil {
+		t.Fatalf("viewer.Dial: %v", err)
+	}
+	defer v.Close()
+
+	got, err := v.Cat("win/Documents/empty.txt")
+	if err != nil {
+		t.Fatalf("Cat of an empty file: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("Cat of an empty file = %q, want nothing", got)
+	}
+}
+
+func TestE2ECatUnknownPathsFail(t *testing.T) {
+	_, addr := startServer(t)
+	docs := share(t, "Documents", map[string]string{"a.txt": "hello"})
+	join(t, addr, "win", "Documents="+docs)
+
+	v, err := viewer.Dial(addr)
+	if err != nil {
+		t.Fatalf("viewer.Dial: %v", err)
+	}
+	defer v.Close()
+
+	// A path the owner does not have, and a client that is not connected.
+	// The latter must not panic or hang: there is nobody to answer.
+	for _, path := range []string{"win/Documents/nope.txt", "nobody/x"} {
+		done := make(chan error, 1)
+		go func(p string) {
+			_, err := v.Cat(p)
+			done <- err
+		}(path)
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatalf("Cat(%q) = nil error, want a failure", path)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Cat(%q) did not return within 5s: an offline client must fail, not hang", path)
+		}
+	}
+}
+
+// TestE2ECatReflectsADeletedFile pins that the index is a cache of names, not of
+// content: once the owner's file is gone, reading it must fail rather than
+// return the bytes the index remembers.
+func TestE2ECatReflectsADeletedFile(t *testing.T) {
+	_, addr := startServer(t)
+	docs := share(t, "Documents", map[string]string{"a.txt": "hello"})
+	join(t, addr, "win", "Documents="+docs)
+
+	v, err := viewer.Dial(addr)
+	if err != nil {
+		t.Fatalf("viewer.Dial: %v", err)
+	}
+	defer v.Close()
+
+	if _, err := v.Cat("win/Documents/a.txt"); err != nil {
+		t.Fatalf("Cat before delete: %v", err)
+	}
+	if err := os.Remove(filepath.Join(docs, "a.txt")); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if _, err := v.Cat("win/Documents/a.txt"); err == nil {
+		t.Fatal("Cat after the file was deleted on the owner = nil error, want a failure; the index is not a content cache")
+	}
+}
+
+// TestE2ECatFailsFastWhenTheOwnerLeaves pins the offline case at the router: no
+// one can answer, so the caller must be told quickly rather than waiting out a
+// timeout meant for a slow but live owner.
+func TestE2ECatFailsFastWhenTheOwnerLeaves(t *testing.T) {
+	_, addr := startServer(t)
+	docs := share(t, "Documents", map[string]string{"a.txt": "hello"})
+	owner := join(t, addr, "win", "Documents="+docs)
+
+	v, err := viewer.Dial(addr)
+	if err != nil {
+		t.Fatalf("viewer.Dial: %v", err)
+	}
+	defer v.Close()
+
+	if err := owner.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	waitFor(t, "the owner to disappear from the top level", func() bool {
+		top, err := v.List("")
+		return err == nil && len(top) == 0
+	})
+
+	start := time.Now()
+	if _, err := v.Cat("win/Documents/a.txt"); err == nil {
+		t.Fatal("Cat with no connected owner = nil error, want a failure")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("Cat with no connected owner took %s, want it to fail fast rather than wait out a live-owner timeout", elapsed)
+	}
+}
+
+// TestE2EListAWidthPastOneFrame pins that a listing is not limited by one
+// frame's payload.
+//
+// A frame carries at most MaxPayload, and a listing of 20000 files is several
+// times that, so a listing implemented as one frame cannot answer at all — and
+// the user sees a transport error rather than "that directory is too big". The
+// plan requires listings to be batchable; this is where that is checked.
+func TestE2EListAWidthPastOneFrame(t *testing.T) {
+	_, addr := startServer(t)
+	root := t.TempDir()
+	const n = 20000
+	// 20-byte names, so the reply is comfortably past 1 MiB and the paths stay
+	// short enough to create quickly.
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("file-%014d.txt", i)
+		if err := os.WriteFile(filepath.Join(root, name), nil, 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+	join(t, addr, "wide", "Documents="+root)
+
+	v, err := viewer.Dial(addr)
+	if err != nil {
+		t.Fatalf("viewer.Dial: %v", err)
+	}
+	defer v.Close()
+
+	nodes, err := v.List("wide/Documents")
+	if err != nil {
+		t.Fatalf("listing an %d-entry directory: %v", n, err)
+	}
+	if len(nodes) != n {
+		t.Fatalf("listed %d entries, want %d", len(nodes), n)
+	}
+	// The whole reply must be one consistent listing, not a truncated prefix:
+	// the last entry has to be there too.
+	last := fmt.Sprintf("Documents/file-%014d.txt", n-1)
+	found := false
+	for _, nd := range nodes {
+		if nd.Path == last {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("the listing is missing %q: it was truncated", last)
+	}
+
+	// And the connection is still usable afterwards: a listing that overran a
+	// frame must not have torn the connection down on its way out.
+	if _, err := v.List(""); err != nil {
+		t.Fatalf("List after a wide listing: %v", err)
 	}
 }

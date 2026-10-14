@@ -18,6 +18,14 @@ var ErrNoSuchClient = errors.New("server: no such client")
 // ErrEmptyName reports a registration attempt with no name.
 var ErrEmptyName = errors.New("server: client name must not be empty")
 
+// ErrClientOffline reports that a request named a client that is not connected,
+// so there is no one to answer it. It is distinct from a failure the owner did
+// answer: this one never reached a machine at all.
+var ErrClientOffline = errors.New("server: client is not connected")
+
+// ErrNotFound reports that a request named a path the owner does not have.
+var ErrNotFound = errors.New("server: not found")
+
 // Registry tracks which clients are connected and which one supplies the
 // aggregated tree. The zero value is ready to use.
 //

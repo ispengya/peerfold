@@ -1,11 +1,13 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -18,15 +20,23 @@ import (
 // subject to it: an idle supplier is a legitimate state, not a stalled one.
 const helloTimeout = 30 * time.Second
 
+// readTimeout bounds a read forwarded to a client.
+//
+// It is shorter than a listing's budget because a read is what a user typed and
+// is waiting on: an owner that has not answered in two seconds is either gone or
+// wedged, and either way a failure serves the user better than a wait.
+const readTimeout = 2 * time.Second
+
 // Server accepts client connections and owns the aggregated index.
 //
 // New binds the listener, so Addr is meaningful before Serve is called and
 // "127.0.0.1:0" reports the port the kernel actually chose.
 type Server struct {
-	ln    net.Listener
-	lnErr error
-	ix    *index.Index
-	reg   *Registry
+	ln     net.Listener
+	lnErr  error
+	ix     *index.Index
+	reg    *Registry
+	router *Router
 
 	mu      sync.Mutex
 	conns   map[net.Conn]struct{}
@@ -40,9 +50,10 @@ type Server struct {
 // startup error; Addr is nil in that case.
 func New(listen string) *Server {
 	s := &Server{
-		ix:    &index.Index{},
-		reg:   &Registry{},
-		conns: make(map[net.Conn]struct{}),
+		ix:     &index.Index{},
+		reg:    &Registry{},
+		conns:  make(map[net.Conn]struct{}),
+		router: &Router{clients: make(map[string]*clientLink)},
 	}
 	s.ln, s.lnErr = net.Listen("tcp", listen)
 	return s
@@ -210,11 +221,19 @@ func (s *Server) handleConn(conn net.Conn) {
 	defer func() {
 		s.ix.RemoveClient(hb.Name)
 		s.reg.Unregister(hb.Name)
+		// The router link goes last. A request forwarded to a client that is on
+		// its way out must find it gone and fail, rather than be written into a
+		// connection nobody is reading.
+		s.router.detach(hb.Name)
 	}()
 
 	if err := s.replyHello(c, env.ID, hb.Name, aggregate); err != nil {
 		return
 	}
+	// Requests can only be forwarded to a client that is reachable, and this
+	// starts after the hello is answered so the order stays "the handshake, then
+	// everything else".
+	s.router.attach(hb.Name, c)
 	s.serveLoop(hb.Name, c)
 }
 
@@ -297,6 +316,50 @@ func (s *Server) serveLoop(name string, c *proto.Conn) {
 			continue
 		}
 
+		// KindRead on a client's own connection is either a question or an
+		// answer, and the direction is what tells them apart: a question is
+		// forwarded and names the target client in its body, while an owner's
+		// answer is addressed from itself, so it arrives on the connection whose
+		// name it carries. A viewer has no name, so its KindRead is always a
+		// question.
+		if env.Kind == proto.KindRead {
+			var b proto.ReadBody
+			if err := json.Unmarshal(env.Body, &b); err != nil {
+				if name == "" {
+					_ = c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: fmt.Sprintf("bad read request: %v", err)})
+					continue
+				}
+				// A malformed answer from a client is a protocol failure, not a
+				// request to answer, so the connection is dropped.
+				return
+			}
+			if name != "" && b.Client == name {
+				// An owner answering a forwarded read. Its content is still on
+				// the wire, so the serve loop forwards it: only this goroutine
+				// may read this connection.
+				os.Stderr.WriteString(fmt.Sprintf("PROBE complete name=%q id=%d err=%q\n", name, env.ID, env.Err))
+				if !s.router.complete(name, env) {
+					_ = c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: "unsolicited reply: nothing is waiting for this"})
+				}
+				continue
+			}
+			if err := s.replyRead(c, env); err != nil {
+				return
+			}
+			continue
+		}
+
+		// Any other forwarded kind is a plain answer, so it goes to whoever
+		// asked rather than being answered here. One with no waiter is a peer
+		// answering something it was not asked, which is a protocol error rather
+		// than noise to discard.
+		if isReply(env) {
+			if !s.router.deliver(name, env) {
+				_ = c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: "unsolicited reply: nothing is waiting for this"})
+			}
+			continue
+		}
+
 		if err := c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: "not implemented"}); err != nil {
 			return
 		}
@@ -334,7 +397,49 @@ func (s *Server) replyList(c *proto.Conn, env proto.Envelope) error {
 		// reported as an ordinary error rather than a framing failure.
 		return c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: fmt.Sprintf("encode list reply: %v", err)})
 	}
-	return c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindListOK, Body: body})
+	// The control frame goes first and carries no body, which is what tells the
+	// reader that the bytes are coming as a stream. It has to: a directory of
+	// 20000 files is far past one frame's payload, so a listing cannot be
+	// answered in the envelope at all.
+	if err := c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindListOK}); err != nil {
+		return err
+	}
+	return c.SendBody(env.ID, body)
+}
+
+// replyRead forwards one read request to the client that owns the path.
+//
+// The content itself does not pass through this function: the owner's serve loop
+// reads it and writes it straight onto this connection, because only that loop
+// may read the owner's socket. This function waits for the answer's control frame
+// — which is where "no such file" lives, since content alone cannot tell a
+// deleted file from an empty one — and then tells the requester the read is over.
+func (s *Server) replyRead(c *proto.Conn, env proto.Envelope) error {
+	var b proto.ReadBody
+	if err := json.Unmarshal(env.Body, &b); err != nil {
+		return c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: fmt.Sprintf("bad read request: %v", err)})
+	}
+	if b.Client == "" {
+		return c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: "bad read request: client is required"})
+	}
+	if b.Off < 0 {
+		return c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: "bad read request: offset must not be negative"})
+	}
+
+	// The requester is recorded with the request so the owner's loop knows where
+	// to put the content. This handler runs on the server's connection to the
+	// requester, not on the owner's, so the owner's loop is free to answer.
+	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
+	defer cancel()
+	reply, err := s.router.Send(ctx, b.Client, proto.Envelope{Kind: proto.KindRead, Body: env.Body}, c, env.ID)
+	if err != nil {
+		os.Stderr.WriteString(fmt.Sprintf("PROBE replyRead sendErr=%v\n", err))
+		return c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: err.Error()})
+	}
+	os.Stderr.WriteString(fmt.Sprintf("PROBE replyRead ok replyID=%d replyErr=%q sending tail\n", reply.ID, reply.Err))
+	// The content has already been written, so this is the last thing the
+	// requester needs: it marks the end of the read and carries its outcome.
+	return c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindRead})
 }
 
 // applyBatch indexes one tree batch for the named client.

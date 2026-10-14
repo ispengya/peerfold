@@ -126,6 +126,52 @@ func (c *Conn) RecvData(id uint64) ([]byte, bool, error) {
 	return chunk, false, nil
 }
 
+// SendBody writes body as the response stream identified by id, in chunks, then
+// ends the stream.
+//
+// It makes a response of unbounded length possible: a listing of a million files
+// is far past one frame's payload, and building it as one buffer would allocate
+// the whole thing before finding that out. Here the sender only ever holds one
+// chunk.
+//
+// A zero-byte body is still sent as no chunk at all, followed by the end marker:
+// a stream of exactly one end marker. The caller must therefore treat an empty
+// reply as a streamed one, which means the envelope's Body must be nil to mark
+// a stream — never an empty non-nil slice.
+func (c *Conn) SendBody(id uint64, body []byte) error {
+	for len(body) > 0 {
+		n := len(body)
+		if n > MaxChunk {
+			n = MaxChunk
+		}
+		if err := c.SendData(id, body[:n]); err != nil {
+			return err
+		}
+		body = body[n:]
+	}
+	return c.SendData(id, nil)
+}
+
+// RecvBody reads a response stream identified by id until the peer ends it, and
+// returns the concatenation.
+//
+// One frame is read at a time and appended, so memory grows with the body. The
+// alternative for a listing would be a cursor, which the protocol does not have:
+// until it does, a caller that cannot hold the body must not ask for it.
+func (c *Conn) RecvBody(id uint64) ([]byte, error) {
+	var body []byte
+	for {
+		chunk, done, err := c.RecvData(id)
+		if err != nil {
+			return nil, err
+		}
+		if done {
+			return body, nil
+		}
+		body = append(body, chunk...)
+	}
+}
+
 // Close closes the underlying stream.
 func (c *Conn) Close() error {
 	return c.rw.Close()
