@@ -348,6 +348,87 @@ func TestConnSendWritesWholeFrame(t *testing.T) {
 	}
 }
 
+// Send and SendData must share one write lock: the brief's Step 5 is about the
+// two entry points together, not about Send alone. This drives both at once at
+// the same writer and requires that no two of them be inside a Write together.
+func TestConnSendAndSendDataShareWriteLock(t *testing.T) {
+	rec := &recordingWriter{}
+	excl := &exclusiveWriter{w: rec}
+	ca := proto.NewConn(duplex{w: excl})
+
+	const senders = 4
+	const chunks = 4
+	body := json.RawMessage(`{"n":1}`)
+	chunk := bytes.Repeat([]byte("x"), 1<<10)
+
+	var wg sync.WaitGroup
+	errs := make([]error, senders+chunks)
+	for i := 0; i < senders; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = ca.Send(proto.Envelope{ID: uint64(i), Kind: proto.KindHello, Body: body})
+		}(i)
+	}
+	for i := 0; i < chunks; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[senders+i] = ca.SendData(uint64(100+i), chunk)
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("writer %d: %v", i, err)
+		}
+	}
+
+	if overlap := excl.maxOverlap(); overlap > 1 {
+		t.Fatalf("up to %d of Send/SendData were inside the stream's Write at once; the two entry points must share one write lock", overlap)
+	}
+	want := senders + chunks
+	if got := rec.count(); got != want {
+		t.Fatalf("made %d Write calls for %d frames, want one each", got, want)
+	}
+	// Each call must still hold exactly one whole frame, of the kind its entry
+	// point uses.
+	kinds := make(map[proto.FrameKind]int)
+	for i, call := range rec.snapshot() {
+		kind, _, err := proto.ReadFrame(bytes.NewReader(call))
+		if err != nil {
+			t.Fatalf("Write call %d does not hold exactly one whole frame: %v", i, err)
+		}
+		kinds[kind]++
+	}
+	if kinds[proto.FrameControl] != senders {
+		t.Errorf("wrote %d control frames, want %d", kinds[proto.FrameControl], senders)
+	}
+	if kinds[proto.FrameData] != chunks {
+		t.Errorf("wrote %d data frames, want %d", kinds[proto.FrameData], chunks)
+	}
+}
+
+// A chunk of exactly MaxChunk fits; one byte more is refused, and refused
+// before anything is allocated for it. MaxChunk is MaxPayload minus the data
+// frame's 8-byte stream id, which is where a caller streaming a file slices.
+func TestSendDataChunkBoundary(t *testing.T) {
+	sw := &shortWriter{accept: 1 << 30}
+	ca := proto.NewConn(duplex{w: sw})
+
+	if err := ca.SendData(1, make([]byte, proto.MaxChunk)); err != nil {
+		t.Fatalf("SendData(MaxChunk) = %v, want nil", err)
+	}
+	if err := ca.SendData(1, make([]byte, proto.MaxChunk+1)); err == nil {
+		t.Fatal("SendData accepted a chunk larger than MaxChunk")
+	}
+	// The refusal must not poison the connection: nothing was written, so the
+	// next valid chunk still goes out.
+	if err := ca.SendData(1, []byte("ok")); err != nil {
+		t.Fatalf("SendData after a refused too-large chunk = %v, want nil", err)
+	}
+}
+
 // A writer that stops short must not corrupt the stream. Write's contract lets
 // it accept fewer bytes than it was offered, and net.Conn can return a short
 // write; if that byte count is discarded, the rest of the frame is dropped
