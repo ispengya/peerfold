@@ -59,7 +59,7 @@ func TestRunDispatchesEveryKnownCommand(t *testing.T) {
 	// Still stubs. server is on this list, not the other one: cmd_server.go
 	// prints the pending-work notice, and listing it as implemented would drop
 	// its dispatch arm from the pin entirely.
-	for _, cmd := range []string{"server", "cat", "put", "mkdir", "rm", "mv"} {
+	for _, cmd := range []string{"server", "put", "mkdir", "rm", "mv"} {
 		var out, errOut bytes.Buffer
 
 		if code := run([]string{cmd}, &out, &errOut); code != 0 {
@@ -72,7 +72,7 @@ func TestRunDispatchesEveryKnownCommand(t *testing.T) {
 	}
 
 	// These reach their real implementations, which reject the missing input.
-	for _, cmd := range []string{"client", "ls"} {
+	for _, cmd := range []string{"client", "ls", "cat"} {
 		var out, errOut bytes.Buffer
 		if code := run([]string{cmd}, &out, &errOut); code == 0 {
 			t.Fatalf("run([%s]) = 0, want non-zero", cmd)

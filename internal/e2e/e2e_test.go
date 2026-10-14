@@ -325,6 +325,35 @@ func TestE2ECatReadsTheOriginalBytes(t *testing.T) {
 	}
 }
 
+// TestE2ECatTwiceOnOneConnection pins that a read answer is consumed whole.
+//
+// A read is a control frame, a content stream and a closing control frame, all
+// on the same connection as every other read. A reader that stopped after the
+// content would leave the closing frame to be taken as the next answer's control
+// frame, and the second read would be parsed out of the wrong stream. One
+// connection and two reads is the smallest case that shows it.
+func TestE2ECatTwiceOnOneConnection(t *testing.T) {
+	_, addr := startServer(t)
+	docs := share(t, "Documents", map[string]string{"a.txt": "hello world"})
+	join(t, addr, "win", "Documents="+docs)
+
+	v, err := viewer.Dial(addr)
+	if err != nil {
+		t.Fatalf("viewer.Dial: %v", err)
+	}
+	defer v.Close()
+
+	for i := 1; i <= 3; i++ {
+		got, err := v.Cat("win/Documents/a.txt")
+		if err != nil {
+			t.Fatalf("Cat #%d: %v", i, err)
+		}
+		if string(got) != "hello world" {
+			t.Fatalf("Cat #%d = %q, want %q", i, got, "hello world")
+		}
+	}
+}
+
 // TestE2EReadReturnsARange pins that a range read returns that range and not
 // the whole file: a server that ignored the offset would still return bytes.
 func TestE2EReadReturnsARange(t *testing.T) {

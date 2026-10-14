@@ -1,0 +1,31 @@
+﻿Task 8: make a read answer the same shape whether it worked or not
+
+A read is three parts in every direction: a control frame, the content as
+a data stream ended by the zero-length end marker, and a closing control
+frame. The owner's answer is read_ok, which is a kind of its own because
+the answer carries no body and neither does a read request whose body
+failed to encode: classifying the answer by the absence of a body made
+the server treat the owner's answer as a second question.
+
+The shape must not vary between a read that worked and one that did not.
+A failure that stopped after the control frame left the requester's next
+answer to be read from where this answer's content should have been, and
+every frame after it was then parsed out of the wrong stream. That is why
+an offline client hung for five seconds and why a deleted file worked only
+by accident.
+
+The owner's connection has exactly one reader, and for the owner that is
+its serve loop, so the loop reads the whole answer -- control frame,
+content and closing frame -- before it returns and resumes reading control
+frames. Reading the closing frame is what keeps the connection at a frame
+boundary. Its contents are not checked: the whole answer is already in
+hand, so nothing it says can be observed by anyone.
+
+A zero-byte file is an empty stream, not a failed read. ReadAt past the
+end returns an empty success for the same reason: io.EOF is what would
+make an empty file and a missing one the same thing to every caller above.
+
+TestE2ECatTwiceOnOneConnection is what caught the closing frame being
+skipped; before it, that mutation passed every test.
+
+Verified: gofmt clean, go vet 0, go test ./... green.

@@ -256,6 +256,8 @@ func (s *Server) replyHello(c *proto.Conn, id uint64, name string, aggregate boo
 func (s *Server) serveLoop(name string, c *proto.Conn) {
 	for {
 		env, err := c.Recv()
+		if os.Getenv("PEERFOLD_DEBUG") != "" {
+		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 				// Recv reports a read failure with no envelope, so there is no
@@ -316,33 +318,22 @@ func (s *Server) serveLoop(name string, c *proto.Conn) {
 			continue
 		}
 
-		// KindRead on a client's own connection is either a question or an
-		// answer, and the direction is what tells them apart: a question is
-		// forwarded and names the target client in its body, while an owner's
-		// answer is addressed from itself, so it arrives on the connection whose
-		// name it carries. A viewer has no name, so its KindRead is always a
-		// question.
+		// A read answer is a kind of its own. That is what keeps request and
+		// answer apart: they travel in opposite directions on the same
+		// connection, and the answer carries no body, but neither does a request
+		// whose body failed to encode. Guessing from the body's presence would
+		// mistake the owner's answer for a second question.
+		if env.Kind == proto.KindReadOK {
+			// An owner answering a forwarded read. Its content is still on the
+			// wire, so the serve loop reads it: only this goroutine may read
+			// this connection.
+			if !s.router.complete(name, env) {
+				_ = c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: "unsolicited reply: nothing is waiting for this"})
+			}
+			continue
+		}
+
 		if env.Kind == proto.KindRead {
-			var b proto.ReadBody
-			if err := json.Unmarshal(env.Body, &b); err != nil {
-				if name == "" {
-					_ = c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: fmt.Sprintf("bad read request: %v", err)})
-					continue
-				}
-				// A malformed answer from a client is a protocol failure, not a
-				// request to answer, so the connection is dropped.
-				return
-			}
-			if name != "" && b.Client == name {
-				// An owner answering a forwarded read. Its content is still on
-				// the wire, so the serve loop forwards it: only this goroutine
-				// may read this connection.
-				os.Stderr.WriteString(fmt.Sprintf("PROBE complete name=%q id=%d err=%q\n", name, env.ID, env.Err))
-				if !s.router.complete(name, env) {
-					_ = c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: "unsolicited reply: nothing is waiting for this"})
-				}
-				continue
-			}
 			if err := s.replyRead(c, env); err != nil {
 				return
 			}
@@ -407,38 +398,83 @@ func (s *Server) replyList(c *proto.Conn, env proto.Envelope) error {
 	return c.SendBody(env.ID, body)
 }
 
-// replyRead forwards one read request to the client that owns the path.
+// replyRead forwards one read request to the client that owns the path and
+// streams that client's answer back.
 //
-// The content itself does not pass through this function: the owner's serve loop
-// reads it and writes it straight onto this connection, because only that loop
-// may read the owner's socket. This function waits for the answer's control frame
-// — which is where "no such file" lives, since content alone cannot tell a
-// deleted file from an empty one — and then tells the requester the read is over.
+// The answer is three parts in the same shape whether the read worked or not: a
+// control frame, the content as a data stream, and a closing control frame. The
+// control frame is what carries "this file is not available" — the content stream
+// alone cannot say why a read produced nothing, and reporting every failure as an
+// empty body would make a deleted file and a zero-byte file the same thing to the
+// caller.
+//
+// The shape must not vary between the two outcomes. A failure that stopped after
+// the control frame would leave the requester's next answer to be read from where
+// this answer's content should have been, because frames are one sequence.
 func (s *Server) replyRead(c *proto.Conn, env proto.Envelope) error {
 	var b proto.ReadBody
-	if err := json.Unmarshal(env.Body, &b); err != nil {
-		return c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: fmt.Sprintf("bad read request: %v", err)})
+	var fail error
+	var stream <-chan answerContent
+	var reply proto.Envelope
+	switch err := json.Unmarshal(env.Body, &b); {
+	case err != nil:
+		fail = fmt.Errorf("bad read request: %v", err)
+	case b.Client == "":
+		fail = errors.New("bad read request: client is required")
+	case b.Off < 0:
+		fail = errors.New("bad read request: offset must not be negative")
+	default:
+		// The owner is asked over its connection, and this handler runs on the
+		// server's connection to the requester — not on the owner's serve loop —
+		// so the owner's loop is free to answer.
+		ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
+		defer cancel()
+		var err error
+		reply, stream, err = s.router.Send(ctx, b.Client, proto.Envelope{Kind: proto.KindRead, Body: env.Body})
+		switch {
+		case err != nil:
+			fail = err
+		case stream == nil:
+			// The owner answered without announcing content, which is not a read.
+			fail = errors.New("the owner answered a read without announcing any content")
+		case reply.Err != "":
+			fail = errors.New(reply.Err)
+			// The owner's content is still on the way and is empty, so it is read
+			// off here rather than left on the wire. The router reads a whole
+			// answer before it hands it over, so this is already in the channel.
+			<-stream
+		}
 	}
-	if b.Client == "" {
-		return c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: "bad read request: client is required"})
-	}
-	if b.Off < 0 {
-		return c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: "bad read request: offset must not be negative"})
+	if fail != nil {
+		// The head frame is where "no such file" travels, and a failed read is an
+		// empty stream rather than a missing one.
+		if err := c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindRead, Err: fail.Error()}); err != nil {
+			return err
+		}
+		if err := c.SendData(env.ID, nil); err != nil {
+			return err
+		}
+		return c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindRead})
 	}
 
-	// The requester is recorded with the request so the owner's loop knows where
-	// to put the content. This handler runs on the server's connection to the
-	// requester, not on the owner's, so the owner's loop is free to answer.
-	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
-	defer cancel()
-	reply, err := s.router.Send(ctx, b.Client, proto.Envelope{Kind: proto.KindRead, Body: env.Body}, c, env.ID)
-	if err != nil {
-		os.Stderr.WriteString(fmt.Sprintf("PROBE replyRead sendErr=%v\n", err))
-		return c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: err.Error()})
+	// The content is already in hand — the router reads a whole answer before it
+	// hands it over, so the owner's connection is never read by two goroutines at
+	// once — and the reading failure, if there was one, is attached to the frame
+	// that is about to be sent.
+	content := <-stream
+	if err := c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindRead, Err: reply.Err}); err != nil {
+		return err
 	}
-	os.Stderr.WriteString(fmt.Sprintf("PROBE replyRead ok replyID=%d replyErr=%q sending tail\n", reply.ID, reply.Err))
-	// The content has already been written, so this is the last thing the
-	// requester needs: it marks the end of the read and carries its outcome.
+	if len(content.body) > 0 {
+		// SendBody ends the stream with the marker itself.
+		if err := c.SendBody(env.ID, content.body); err != nil {
+			return err
+		}
+		return c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindRead})
+	}
+	if err := c.SendData(env.ID, nil); err != nil {
+		return err
+	}
 	return c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindRead})
 }
 

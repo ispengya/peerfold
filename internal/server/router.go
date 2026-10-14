@@ -16,11 +16,16 @@ import (
 // which serialises frames, so a forwarded request never interleaves with
 // another.
 //
-// A request whose answer carries content is special: the content is a stream
-// that has to be read off the owner's connection, and only one goroutine may
-// read a connection. So the owner's own serve loop reads that stream and
-// forwards it, rather than the requester's goroutine reaching across to read
-// someone else's socket. That is why this type knows both ends of a request.
+// A request whose answer carries content is special. Only one goroutine may read
+// a connection, and for the owner that goroutine is its serve loop. So the loop
+// reads the whole answer — control frame and content — and hands it to the
+// requester, rather than the requester reaching across to read someone else's
+// socket. The loop must finish before it returns: the moment it does, it resumes
+// reading control frames, and a second reader would take the first content frame
+// as a control frame and have both sides resynchronising on the other's
+// leftovers. That is also why the content is collected rather than streamed
+// through a channel: a channel would let the loop return while content was still
+// outstanding.
 type Router struct {
 	mu      sync.Mutex
 	clients map[string]*clientLink
@@ -37,19 +42,25 @@ type clientLink struct {
 	pending map[uint64]*forwarded
 }
 
-// forwarded is one in-flight request: who is waiting, and where an answer goes.
+// forwarded is one in-flight request: who is waiting for it.
 type forwarded struct {
-	// ch receives the envelope that wakes the waiter.
+	// ch receives the envelope that wakes the waiter: a plain reply, or the
+	// owner's control frame for an answer that carries content.
 	ch chan proto.Envelope
-	// back is the requester's connection, and backID the request ID that
-	// requester is waiting on. Together they are how streamed content is
-	// re-stamped on the way through: the owner answers the router's ID, the
-	// requester waits on its own.
-	back   *proto.Conn
-	backID uint64
-	// reply is the owner's closing control frame, recorded so the waiter can be
-	// woken with it once the stream has been dealt with.
-	reply proto.Envelope
+	// streaming marks a request whose answer carries content rather than being a
+	// plain reply.
+	streaming bool
+	// content carries the collected content of an answer that has it, once the
+	// control frame has been sent on ch.
+	content chan answerContent
+}
+
+// answerContent is the content half of an answer that carries it.
+type answerContent struct {
+	// body is the content with the peer's end marker stripped. It is nil for an
+	// empty answer, which is a zero-byte file as much as it is a failed read
+	// whose reason is in the control frame.
+	body []byte
 }
 
 // Router returns the request router for this server.
@@ -112,7 +123,10 @@ func (r *Router) deliver(name string, env proto.Envelope) bool {
 		return false
 	}
 	f, ok := link.pending[env.ID]
-	if ok {
+	if ok && !f.streaming {
+		// A streaming request stays registered: its content is still on the
+		// wire, and complete is the only thing that may read it, so complete
+		// clears the entry.
 		delete(link.pending, env.ID)
 	}
 	r.mu.Unlock()
@@ -123,20 +137,17 @@ func (r *Router) deliver(name string, env proto.Envelope) bool {
 	return true
 }
 
-// complete handles a reply from an owner, forwarding the content it announced.
+// complete handles a reply from an owner whose answer carries content.
 //
-// It runs on the owner's serve loop, which is the only goroutine allowed to read
-// the owner's connection. The requester's goroutine cannot reach across and read
-// someone else's socket, and if the owner's loop simply resumed reading, the two
-// would shred the stream between them: one would consume the content while the
-// other took the following frame, each resynchronising on the other's leftovers.
-// So the loop does the reading, one chunk at a time, straight onto the
-// requester's connection.
+// A read answer is three parts: a control frame, the content as a data stream,
+// and a closing control frame. All three carry the same kind and ID. The closing
+// frame is not decoration — frames are one sequence, so a part left unread does
+// not stay where it is; it becomes the serve loop's next control frame, and the
+// answer after this one is read from the middle of the wrong stream.
 //
-// A read answer is three parts: a head frame, a data stream, then a tail frame.
-// All three are read here — the head is what this function is handed, the stream
-// has to be drained before control frames can be read again, and the tail is what
-// says the answer finished and how it went.
+// It runs on the owner's serve loop, because that is the only goroutine allowed
+// to read the owner's connection, and it does not return until every part has
+// been read.
 //
 // It reports whether this envelope answered an outstanding request.
 func (r *Router) complete(name string, env proto.Envelope) bool {
@@ -148,35 +159,77 @@ func (r *Router) complete(name string, env proto.Envelope) bool {
 	}
 	f, ok := link.pending[env.ID]
 	if !ok {
+		// The request has already been given up on. The rest of the answer is
+		// still on the wire, so it is read off before control frames can be read
+		// again.
 		r.mu.Unlock()
-		return false
+		_ = pumpStream(link.conn, env.ID, nil)
+		_, _ = link.conn.Recv()
+		return true
 	}
-	back, backID := f.back, f.backID
+	streaming := f.streaming
+	delete(link.pending, env.ID)
 	r.mu.Unlock()
 
-	fmt.Printf("PROBE complete name=%q id=%d err=%q\n", name, env.ID, env.Err)
-	if _, err := pumpStream(link.conn, env.ID, back, backID); err != nil {
-		r.settle(name, env.ID, proto.Envelope{ID: env.ID, Kind: env.Kind, Err: err.Error()})
-		return true
+	// The content is read here, on this goroutine, before anything is handed
+	// over. An answer that claims content has to be read off even when nobody
+	// wants it, or the next control frame would be parsed out of its middle.
+	var body []byte
+	readErr := pumpStream(link.conn, env.ID, &body)
+	if readErr != nil {
+		// The frame is still delivered, with the reading failure attached: a
+		// truncated file and a complete one must not look the same.
+		if env.Err == "" {
+			env.Err = fmt.Sprintf("the answer's content ended early: %v", readErr)
+		}
 	}
-	tail, err := link.conn.Recv()
-	fmt.Printf("PROBE tail id=%d err=%q recverr=%v\n", tail.ID, tail.Err, err)
-	if err != nil {
-		r.settle(name, env.ID, proto.Envelope{ID: env.ID, Kind: env.Kind, Err: fmt.Sprintf("the answer's stream ended without its closing frame: %v", err)})
-		return true
+	// The owner's closing frame is read and discarded: the requester's own closing
+	// frame is written by the requester, from what is handed over here, so the
+	// contents of the owner's cannot reach anyone. What reading it does is keep
+	// the connection at a frame boundary — a part of an answer left unread becomes
+	// the next control frame, and the following request is then parsed out of this
+	// answer's middle.
+	if _, err := link.conn.Recv(); err != nil {
+		// The connection ended inside the answer. The answer is already complete
+		// and is handed over as such; there is nothing left to read next, so the
+		// serve loop will see the end of the connection on its own.
+		_ = err
 	}
-	if tail.ID != env.ID {
-		r.settle(name, env.ID, proto.Envelope{ID: env.ID, Kind: env.Kind, Err: fmt.Sprintf("the answer's closing frame is for request %d, want %d", tail.ID, env.ID)})
-		return true
+	// The control frame wakes the waiter only now, when the whole answer is in
+	// hand, so the waiter can put the head on the wire and then the content
+	// knowing nothing else is arriving behind it.
+	f.ch <- env
+	if streaming {
+		f.content <- answerContent{body: body}
 	}
-	r.settle(name, env.ID, tail)
 	return true
+}
+
+// pumpStream reads a data stream off a connection, appending its content to body
+// or discarding it when body is nil.
+//
+// Frames are read one at a time so neither end ever holds more than one chunk of
+// a file that may be far larger than memory. The peer's end marker is what ends
+// the stream, so an answer with no content is an empty stream and its reason
+// travels in the control frame that precedes it.
+func pumpStream(from *proto.Conn, fromID uint64, body *[]byte) error {
+	for {
+		chunk, done, err := from.RecvData(fromID)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+		if body != nil {
+			*body = append(*body, chunk...)
+		}
+	}
 }
 
 // settle takes a request out of the pending table and wakes its waiter.
 //
-// It is the one exit for a completed request, so a waiter is never left behind
-// by a path that forgot to release it.
+// It is the one exit for a request that is not answered by the owner.
 func (r *Router) settle(name string, id uint64, reply proto.Envelope) {
 	r.mu.Lock()
 	link, ok := r.clients[name]
@@ -195,49 +248,6 @@ func (r *Router) settle(name string, id uint64, reply proto.Envelope) {
 	f.ch <- reply
 }
 
-// pumpStream copies a data stream from one connection to another.
-//
-// Frames are re-stamped as they pass through, one at a time, so neither side
-// holds more than one chunk of a file that may be far larger than memory.
-//
-// A write failure does not stop the reading. Frames are one sequence, so a
-// half-read stream would leave the owner's next frame being parsed as content.
-// The remainder is read and dropped, and the first failure is what the caller is
-// told about.
-func pumpStream(from *proto.Conn, fromID uint64, to *proto.Conn, toID uint64) (int, error) {
-	var first error
-	var frames int
-	stop := false
-	for {
-		chunk, done, err := from.RecvData(fromID)
-		if err != nil {
-			if first == nil {
-				first = err
-			}
-			break
-		}
-		if done {
-			if !stop && to != nil {
-				if err := to.SendData(toID, nil); err != nil && first == nil {
-					first = err
-				}
-			}
-			break
-		}
-		frames++
-		if stop || to == nil {
-			// Still draining: the chunk is read so the stream stays in step, and
-			// discarded because its destination is gone.
-			continue
-		}
-		if err := to.SendData(toID, chunk); err != nil {
-			first = err
-			stop = true
-		}
-	}
-	return frames, first
-}
-
 // isReply reports whether env is an answer to a forwarded request rather than a
 // message a client originated on its own.
 //
@@ -246,7 +256,7 @@ func pumpStream(from *proto.Conn, fromID uint64, to *proto.Conn, toID uint64) (i
 // forwards is a reply by construction.
 func isReply(env proto.Envelope) bool {
 	switch env.Kind {
-	case proto.KindRead, proto.KindWrite, proto.KindMkdir, proto.KindCreate,
+	case proto.KindReadOK, proto.KindWrite, proto.KindMkdir, proto.KindCreate,
 		proto.KindRename, proto.KindRemove:
 		return true
 	}
@@ -257,46 +267,47 @@ func isReply(env proto.Envelope) bool {
 // same ID. It waits until the reply arrives, ctx is done, or the client
 // disconnects.
 //
-// back and backID describe the requester, so content the owner streams can be
-// forwarded without the requester reading the owner's connection itself.
+// A KindRead answer is a control frame plus content: the frame comes back here
+// and the content on the returned channel, which is delivered once, after the
+// frame. Any other kind's answer is the envelope itself and the channel is nil.
 //
 // The caller supplies ctx, so the deadline is the caller's to choose: a listing
-// can afford to wait far longer than a read a user is staring at, and one number
-// baked in here would get one of them wrong.
-func (r *Router) Send(ctx context.Context, client string, env proto.Envelope, back *proto.Conn, backID uint64) (proto.Envelope, error) {
+// can afford to wait far longer than a read a user is staring at.
+func (r *Router) Send(ctx context.Context, client string, env proto.Envelope) (proto.Envelope, <-chan answerContent, error) {
 	r.mu.Lock()
 	link, ok := r.clients[client]
 	if !ok {
 		r.mu.Unlock()
-		return proto.Envelope{}, fmt.Errorf("%w: %q", ErrClientOffline, client)
+		return proto.Envelope{}, nil, fmt.Errorf("%w: %q", ErrClientOffline, client)
 	}
 	link.next++
 	id := link.next
-	f := &forwarded{ch: make(chan proto.Envelope, 1), back: back, backID: backID}
+	f := &forwarded{ch: make(chan proto.Envelope, 1)}
+	var content chan answerContent
+	if env.Kind == proto.KindRead {
+		f.streaming = true
+		content = make(chan answerContent, 1)
+		f.content = content
+	}
 	link.pending[id] = f
 	r.mu.Unlock()
 
 	env.ID = id
 	if err := link.conn.Send(env); err != nil {
 		r.settle(client, id, proto.Envelope{ID: env.ID, Kind: env.Kind, Err: err.Error()})
-		return proto.Envelope{}, fmt.Errorf("server: forward to %q: %w", client, err)
+		return proto.Envelope{}, nil, fmt.Errorf("server: forward to %q: %w", client, err)
 	}
 
 	select {
 	case reply, ok := <-f.ch:
 		if !ok {
-			// detach closed the channel: the owner went away while this
-			// request was in flight.
-			return proto.Envelope{}, fmt.Errorf("%w: %q disconnected", ErrClientOffline, client)
+			// detach closed the channel: the owner went away while this request
+			// was in flight.
+			return proto.Envelope{}, nil, fmt.Errorf("%w: %q disconnected", ErrClientOffline, client)
 		}
-		if reply.Err != "" {
-			return reply, fmt.Errorf("%w: %s", ErrNotFound, reply.Err)
-		}
-		return reply, nil
+		return reply, content, nil
 	case <-ctx.Done():
-		r.mu.Lock()
-		delete(link.pending, id)
-		r.mu.Unlock()
-		return proto.Envelope{}, fmt.Errorf("server: %q did not answer: %w", client, ctx.Err())
+		r.settle(client, id, proto.Envelope{ID: env.ID, Kind: env.Kind, Err: ctx.Err().Error()})
+		return proto.Envelope{}, nil, fmt.Errorf("server: %q did not answer: %w", client, ctx.Err())
 	}
 }

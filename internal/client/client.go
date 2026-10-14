@@ -424,7 +424,7 @@ func (c *Client) satisfyRead(env proto.Envelope) error {
 		}
 	}
 
-	head := proto.Envelope{ID: env.ID, Kind: proto.KindRead}
+	head := proto.Envelope{ID: env.ID, Kind: proto.KindReadOK}
 	if reason != nil {
 		// The reason is reported, not swallowed: this is the only place a user
 		// can learn why the read failed.
@@ -435,19 +435,18 @@ func (c *Client) satisfyRead(env proto.Envelope) error {
 	}
 
 	// The stream is owed in every case, including the failure: a caller waiting
-	// for content cannot be told to stop waiting by silence.
+	// for content cannot be told to stop waiting by silence. A zero-byte file is
+	// an empty stream, and it is told apart from a failed read by the head frame,
+	// which is where every failure is reported. Marking it inside the stream
+	// would not work: a zero-length frame is the stream's own end marker, so a
+	// marker frame would be read as the end and the frames after it would be
+	// parsed as the next answer.
 	switch {
 	case !ok:
 		if err := c.pc.SendData(env.ID, nil); err != nil {
 			return err
 		}
 	case len(data) == 0:
-		// A zero-byte file. An empty stream here would be indistinguishable
-		// from a failure, so it is marked: one frame of zero bytes, then the
-		// end of the stream.
-		if err := c.pc.SendData(env.ID, []byte{}); err != nil {
-			return err
-		}
 		if err := c.pc.SendData(env.ID, nil); err != nil {
 			return err
 		}
@@ -679,5 +678,4 @@ func debugf(format string, args ...any) {
 	if os.Getenv("PEERFOLD_DEBUG") == "" {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "peerfold client: "+format+"\n", args...)
 }

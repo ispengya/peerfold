@@ -45,7 +45,11 @@ func (f *FS) LocalPath(share, rel string) (string, error) {
 //
 // A read that runs past the end returns the bytes that exist and no error, so
 // "read the rest of the file" is expressible. A read that starts at or past the
-// end returns nothing and io.EOF. n < 0 means "to the end of the file".
+// end returns no bytes and no error either: a zero-byte file is a file, and
+// answering it with io.EOF would make it indistinguishable from a missing one
+// at every layer above this. A read that starts past the end of the file is the
+// same nothing, and the caller asks for a range, not for a diagnosis. n < 0
+// means "to the end of the file".
 func (f *FS) ReadAt(share, rel string, off int64, n int) ([]byte, os.FileInfo, error) {
 	full, err := f.LocalPath(share, rel)
 	if err != nil {
@@ -75,9 +79,13 @@ func (f *FS) ReadAt(share, rel string, off int64, n int) ([]byte, os.FileInfo, e
 
 	size := info.Size()
 	if off >= size {
-		// Nothing left to read. The metadata still comes back, so a caller
-		// can learn the size from a read that returned no bytes.
-		return nil, info, io.EOF
+		// Nothing left to read. This is not a failure: a zero-byte file has
+		// nothing to read at offset zero, and reporting io.EOF here would make
+		// an empty file a read error at every layer above. The metadata still
+		// comes back, so a caller can learn the size from a read that returned
+		// no bytes. It is returned as an empty, non-nil slice so the caller can
+		// tell "read succeeded, nothing there" from "no data at all".
+		return []byte{}, info, nil
 	}
 
 	// Clamp the request to what exists: a short read at the end is a normal

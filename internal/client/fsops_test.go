@@ -3,7 +3,6 @@ package client_test
 import (
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -92,31 +91,36 @@ func TestFSReadClampsAtEOF(t *testing.T) {
 	}
 }
 
-// Starting at or past the end yields nothing and io.EOF: a caller can tell
-// "there is nothing more" from "the file is empty".
-func TestFSReadAtEOFIsEOF(t *testing.T) {
+// Starting at or past the end yields nothing and no error. A caller that asked
+// for a range past the end gets an empty answer, not a diagnosis: the alternative
+// makes an empty read a failure, which would make a zero-byte file a missing one
+// at every layer above this.
+func TestFSReadPastTheEndIsEmpty(t *testing.T) {
 	fs, share := fsFixture(t)
 
-	got, _, err := fs.ReadAt(share, "known.bin", 400, 10)
+	got, info, err := fs.ReadAt(share, "known.bin", 400, 10)
+	if err != nil {
+		t.Fatalf("ReadAt(400,10): %v", err)
+	}
 	if len(got) != 0 {
 		t.Errorf("len = %d, want 0", len(got))
 	}
-	if !errors.Is(err, io.EOF) {
-		t.Fatalf("err = %v, want io.EOF", err)
+	if info == nil {
+		t.Fatal("FileInfo is nil: a read past the end still names the file")
 	}
 }
 
-// A zero-byte file is a real file with real metadata. It must report its size
-// and read as io.EOF, not as a missing file.
+// A zero-byte file is a real file with real metadata. It must report its size and
+// read as an empty success, not as a missing file and not as a read error.
 func TestFSReadZeroByteFile(t *testing.T) {
 	fs, share := fsFixture(t)
 
 	got, info, err := fs.ReadAt(share, "zero.bin", 0, 10)
+	if err != nil {
+		t.Fatalf("ReadAt of a zero-byte file: %v", err)
+	}
 	if len(got) != 0 {
 		t.Errorf("len = %d, want 0", len(got))
-	}
-	if !errors.Is(err, io.EOF) {
-		t.Fatalf("err = %v, want io.EOF", err)
 	}
 	if info == nil {
 		t.Fatal("FileInfo is nil: a zero-byte file still has metadata")

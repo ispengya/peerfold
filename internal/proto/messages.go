@@ -24,11 +24,16 @@ const (
 	KindList      = "list"
 	KindListOK    = "list_ok"
 	KindRead      = "read"
-	KindWrite     = "write"
-	KindMkdir     = "mkdir"
-	KindCreate    = "create"
-	KindRename    = "rename"
-	KindRemove    = "remove"
+	// KindReadOK is a client's answer to a read request. It is a kind of its own
+	// because request and answer travel in opposite directions on the same
+	// connection and are otherwise the same shape: an answer carries no body, but
+	// neither does a request whose body failed to encode.
+	KindReadOK = "read_ok"
+	KindWrite  = "write"
+	KindMkdir  = "mkdir"
+	KindCreate = "create"
+	KindRename = "rename"
+	KindRemove = "remove"
 )
 
 // Roles a client declares in its hello. A viewer dials in to observe the

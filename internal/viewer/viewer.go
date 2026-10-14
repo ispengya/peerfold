@@ -4,7 +4,6 @@ package viewer
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -163,9 +162,10 @@ func (v *Viewer) Read(path string, off int64, n int) ([]byte, error) {
 		return nil, fmt.Errorf("viewer: read reply for %q: %w", path, err)
 	}
 	if head.Err != "" {
-		// The head frame is where "no such file" arrives. The content stream is
-		// still owed, so it is read before returning, or the next reply would be
-		// parsed out of the middle of it.
+		// The head frame is where "no such file" arrives. The content stream and
+		// the closing frame are still owed — frames are one sequence, so a part
+		// left unread would be parsed as the next answer — so both are read
+		// before the failure is returned.
 		if _, err := v.pc.RecvBody(id); err != nil {
 			return nil, fmt.Errorf("viewer: read reply for %q: %s (and its stream: %v)", path, head.Err, err)
 		}
@@ -184,7 +184,6 @@ func (v *Viewer) Read(path string, off int64, n int) ([]byte, error) {
 	// The content is a data stream, so it can exceed one frame. A zero-byte
 	// file arrives as one frame of zero bytes — which is not the same as no
 	// frame at all, and that is what tells it apart from a failed read.
-	fmt.Printf("PROBE viewer readContent id=%d headErr=%q\n", id, head.Err)
 	data, err := v.readContent(id)
 	if err != nil {
 		return nil, fmt.Errorf("viewer: read content for %q: %w", path, err)
@@ -201,16 +200,13 @@ func (v *Viewer) Read(path string, off int64, n int) ([]byte, error) {
 	return data, nil
 }
 
-// readContent reads a data stream and strips the zero-byte marker that stands
-// for an empty file.
+// readContent reads a data stream.
 //
-// The marker exists because an empty stream and an empty file are both zero
-// bytes: without it, a file that is legitimately empty would look like a read
-// that produced nothing.
+// A stream that ends without carrying any bytes is a zero-byte file, which is a
+// successful answer. Every failure travels in the head frame instead, so there is
+// nothing here to tell apart.
 func (v *Viewer) readContent(id uint64) ([]byte, error) {
 	var body []byte
-	var sawMarker bool
-	first := true
 	for {
 		if err := v.conn.SetReadDeadline(time.Now().Add(callTimeout)); err != nil {
 			return nil, err
@@ -220,25 +216,11 @@ func (v *Viewer) readContent(id uint64) ([]byte, error) {
 			return nil, err
 		}
 		if done {
-			if first && len(body) == 0 && !sawMarker {
-				// The stream ended with nothing in it: the read produced no
-				// content at all, which is a failure rather than an empty file.
-				return nil, errEmptyStream
-			}
 			return body, nil
 		}
-		if len(chunk) == 0 {
-			sawMarker = true
-		} else {
-			body = append(body, chunk...)
-		}
-		first = false
+		body = append(body, chunk...)
 	}
 }
-
-// errEmptyStream reports a content stream that carried no frame at all, which is
-// how a failed read is delivered rather than how an empty file is.
-var errEmptyStream = errors.New("the read produced no content")
 
 // Cat returns a whole file.
 func (v *Viewer) Cat(path string) ([]byte, error) {
