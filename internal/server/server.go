@@ -485,13 +485,13 @@ func (s *Server) replyRead(c *proto.Conn, env proto.Envelope) error {
 	if fail != nil {
 		// The head frame is where "no such file" travels, and a failed read is an
 		// empty stream rather than a missing one.
-		if err := c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindRead, Err: fail.Error()}); err != nil {
+		if err := c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindReadOK, Err: fail.Error()}); err != nil {
 			return err
 		}
 		if err := c.SendData(env.ID, nil); err != nil {
 			return err
 		}
-		return c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindRead})
+		return c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindReadOK})
 	}
 
 	// The content is already in hand — the router reads a whole answer before it
@@ -499,7 +499,7 @@ func (s *Server) replyRead(c *proto.Conn, env proto.Envelope) error {
 	// once — and the reading failure, if there was one, is attached to the frame
 	// that is about to be sent.
 	content := <-stream
-	if err := c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindRead, Err: reply.Err}); err != nil {
+	if err := c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindReadOK, Err: reply.Err}); err != nil {
 		return err
 	}
 	if len(content.body) > 0 {
@@ -507,12 +507,12 @@ func (s *Server) replyRead(c *proto.Conn, env proto.Envelope) error {
 		if err := c.SendBody(env.ID, content.body); err != nil {
 			return err
 		}
-		return c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindRead})
+		return c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindReadOK})
 	}
 	if err := c.SendData(env.ID, nil); err != nil {
 		return err
 	}
-	return c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindRead})
+	return c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindReadOK})
 }
 
 // replyWrite forwards one write request to the client that owns the path and

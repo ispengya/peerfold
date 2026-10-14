@@ -179,8 +179,8 @@ func (v *Viewer) Read(path string, off int64, n int) ([]byte, error) {
 	if head.ID != id {
 		return nil, fmt.Errorf("viewer: read reply ID = %d, want %d: replies are out of step", head.ID, id)
 	}
-	if head.Kind != proto.KindRead {
-		return nil, fmt.Errorf("viewer: read reply kind = %q, want %q", head.Kind, proto.KindRead)
+	if head.Kind != proto.KindReadOK {
+		return nil, fmt.Errorf("viewer: read reply kind = %q, want %q", head.Kind, proto.KindReadOK)
 	}
 
 	// The content is a data stream, so it can exceed one frame. A zero-byte
@@ -358,6 +358,15 @@ func (v *Viewer) writeRequest(kind string, body []byte, what string) error {
 // All three are always read, including on failure. The answer is a frame
 // sequence, so a part left unread does not stay where it is: it becomes the next
 // frame read, and every later answer is then one frame out of step.
+//
+// The head is read and reported before the stream that follows it, and that
+// order is the point: the head is where every outcome travels, and the two
+// frames after it are the stream and the close. If the answer is already
+// known — the head says what happened — then a failure to read the rest of it,
+// which is the server failing to write frames it was cleaning up with, must not
+// replace what the head said with a report about the transport. That is how an
+// error the server had already sent would be lost in favour of "the connection
+// closed", which says less.
 func (v *Viewer) awaitWrite(id uint64, what string) error {
 	head, err := v.recv(callTimeout)
 	if err != nil {
@@ -369,6 +378,13 @@ func (v *Viewer) awaitWrite(id uint64, what string) error {
 	if head.Kind != proto.KindWriteOK {
 		return fmt.Errorf("viewer: %s: reply kind = %q, want %q", what, head.Kind, proto.KindWriteOK)
 	}
+	if head.Err != "" {
+		// The outcome is decided and the stream that follows is empty by
+		// construction — a write's answer never carries content — so nothing is
+		// left unread by returning here: the close that comes next is the
+		// server's to send and no part of it can change this answer.
+		return fmt.Errorf("viewer: %s: %s", what, head.Err)
+	}
 	// The stream is read whatever the outcome says: a failed write still sent
 	// one, and its end marker is what puts this connection back at a frame
 	// boundary.
@@ -378,9 +394,6 @@ func (v *Viewer) awaitWrite(id uint64, what string) error {
 	tail, err := v.recv(callTimeout)
 	if err != nil {
 		return fmt.Errorf("viewer: %s ended without its closing frame: %w", what, err)
-	}
-	if head.Err != "" {
-		return fmt.Errorf("viewer: %s: %s", what, head.Err)
 	}
 	if tail.Err != "" {
 		return fmt.Errorf("viewer: %s: %s", what, tail.Err)

@@ -61,7 +61,7 @@ func startFakeServer(t *testing.T, answers []answer) string {
 				return
 			}
 			// The three parts, in order, all stamped with the requester's ID.
-			head := proto.Envelope{ID: req.ID, Kind: proto.KindRead, Err: a.err}
+			head := proto.Envelope{ID: req.ID, Kind: proto.KindReadOK, Err: a.err}
 			if err := conn.Send(head); err != nil {
 				return
 			}
@@ -219,7 +219,7 @@ func TestViewerReadEncodesTheRange(t *testing.T) {
 		if err := json.Unmarshal(req.Body, &b); err == nil {
 			bodies <- b
 		}
-		head := proto.Envelope{ID: req.ID, Kind: proto.KindRead}
+		head := proto.Envelope{ID: req.ID, Kind: proto.KindReadOK}
 		_ = conn.Send(head)
 		_ = conn.SendData(req.ID, nil)
 		_ = conn.Send(head)

@@ -93,14 +93,14 @@ func askRead(t *testing.T, conn *proto.Conn, id uint64, client, path string) (pr
 // right bytes, and would still look correct until a second read arrived.
 func checkReadShape(t *testing.T, id uint64, head proto.Envelope, tail proto.Envelope, wantErr string) {
 	t.Helper()
-	if head.Kind != proto.KindRead {
-		t.Fatalf("head kind = %q, want %q", head.Kind, proto.KindRead)
+	if head.Kind != proto.KindReadOK {
+		t.Fatalf("head kind = %q, want %q", head.Kind, proto.KindReadOK)
 	}
 	if head.ID != id {
 		t.Fatalf("head id = %d, want %d", head.ID, id)
 	}
-	if tail.Kind != proto.KindRead {
-		t.Fatalf("closing frame kind = %q, want %q", tail.Kind, proto.KindRead)
+	if tail.Kind != proto.KindReadOK {
+		t.Fatalf("closing frame kind = %q, want %q", tail.Kind, proto.KindReadOK)
 	}
 	if tail.ID != id {
 		t.Fatalf("closing frame id = %d, want %d", tail.ID, id)
