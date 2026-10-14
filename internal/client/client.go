@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -337,6 +338,14 @@ func (c *Client) readLoop() {
 			}
 			continue
 		}
+		if isWriteRequest(env.Kind) && env.ID != 0 {
+			if err := c.satisfyWrite(env); err != nil {
+				debugf("client serving a write: %v", err)
+				c.endLoop(err)
+				return
+			}
+			continue
+		}
 		c.deliver(env)
 	}
 }
@@ -459,6 +468,225 @@ func (c *Client) satisfyRead(env proto.Envelope) error {
 	// The tail frame closes the answer. It repeats the outcome so the server's
 	// loop can report it once the content has been forwarded.
 	return c.pc.Send(head)
+}
+
+// satisfyWrite answers a write request with the same three parts a read uses: a
+// control frame saying whether it worked, the content stream (empty, but always
+// present and always ended), and a control frame closing the answer.
+//
+// The stream is owed even by the operations that carry no content. The server
+// reads it before it resumes reading control frames, so a mkdir that skipped its
+// stream would leave the server's frame count wrong on this connection for ever
+// after — the next control frame would be read as that stream's data.
+//
+// Content arrives after the announcement, on the same connection, one frame at a
+// time. That is why the file is written from inside this loop: the frames are
+// consumed as they arrive, so a file far larger than one frame never has to be
+// held whole, and the connection stays at a frame boundary throughout.
+func (c *Client) satisfyWrite(env proto.Envelope) error {
+	var reason error
+	switch env.Kind {
+	case proto.KindMkdir:
+		reason = c.serveMkdir(env)
+	case proto.KindRemove:
+		reason = c.serveRemove(env)
+	case proto.KindRename:
+		reason = c.serveRename(env)
+	case proto.KindWrite:
+		reason = c.servePut(env)
+	default:
+		reason = fmt.Errorf("write request has unknown kind %q", env.Kind)
+	}
+
+	head := proto.Envelope{ID: env.ID, Kind: proto.KindWriteOK}
+	if reason != nil {
+		head.Err = reason.Error()
+	}
+	if err := c.pc.Send(head); err != nil {
+		return err
+	}
+	if err := c.pc.SendData(env.ID, nil); err != nil {
+		return err
+	}
+	return c.pc.Send(head)
+}
+
+// drainContent reads the request's content stream to its end and discards it.
+//
+// It is used when the operation has already failed before the content was
+// wanted. The frames are still on the wire, so they have to be consumed; leaving
+// them would make every later frame on this connection be read as one position
+// earlier than it really is.
+func (c *Client) drainContent(id uint64) error {
+	for {
+		_, done, err := c.pc.RecvData(id)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+	}
+}
+
+// servePut handles a whole-file write-back, either replacing the target or
+// refusing to touch a name that is already taken.
+func (c *Client) servePut(env proto.Envelope) error {
+	var req proto.WriteBody
+	if err := json.Unmarshal(env.Body, &req); err != nil {
+		// The content still has to leave the connection, whatever the
+		// announcement said. Decoding failed, but the stream did not.
+		_ = c.drainContent(env.ID)
+		return fmt.Errorf("bad write request: %v", err)
+	}
+	if req.Client != c.name {
+		_ = c.drainContent(env.ID)
+		return fmt.Errorf("write request is addressed to %q, not %q", req.Client, c.name)
+	}
+	share, rel := shareOf(req.Path), restOf(req.Path)
+
+	// The sink pulls one frame at a time off the connection and hands the bytes
+	// straight to the file, so no copy of the file is ever held.
+	//
+	// A failure to read the stream is recorded rather than returned from the
+	// sink, so that the write itself is still attempted and can be undone. The
+	// difference matters: a sink that returned the error would abandon a
+	// partially written temporary file, and the caller that asked for the write
+	// would never learn why.
+	var streamErr error
+	sink := func(w io.Writer) error {
+		for {
+			chunk, done, err := c.pc.RecvData(env.ID)
+			if err != nil {
+				streamErr = err
+				return nil
+			}
+			if done {
+				return nil
+			}
+			if _, err := w.Write(chunk); err != nil {
+				return err
+			}
+		}
+	}
+	// "The stream ended" and "the stream is all there" are different questions,
+	// and this is the only place that can answer the second. It is asked before
+	// the file is published, so a stream that stopped part-way leaves nothing at
+	// the target name: a prefix of a file looks exactly like a whole one to
+	// every later reader.
+	ended := func() error {
+		if streamErr != nil {
+			return fmt.Errorf("the content ended early: %w", streamErr)
+		}
+		return nil
+	}
+	switch req.Mode {
+	case proto.WriteModeCreate:
+		// A create takes the name before the content arrives, so a stream that
+		// stops part-way leaves a file behind that this end has to remove. The
+		// name was free when it was taken, which is the part that cannot be
+		// undone.
+		if err := c.fs.CreateFrom(share, rel, sink); err != nil {
+			return err
+		}
+		if streamErr != nil {
+			c.fs.removeIfPresent(share, rel)
+			return fmt.Errorf("content of %q ended early: %w", rel, streamErr)
+		}
+		return nil
+	case proto.WriteModePut, "":
+		return c.fs.replaceAtomically(share, rel, sink, ended)
+	default:
+		// An unknown mode is refused before the content is written: guessing
+		// which of the two writes was meant could destroy a file.
+		_ = c.drainContent(env.ID)
+		return fmt.Errorf("write request has unknown mode %q", req.Mode)
+	}
+}
+
+// serveMkdir handles a directory creation.
+func (c *Client) serveMkdir(env proto.Envelope) error {
+	var req proto.MkdirBody
+	if err := json.Unmarshal(env.Body, &req); err != nil {
+		_ = c.drainContent(env.ID)
+		return fmt.Errorf("bad mkdir request: %v", err)
+	}
+	if req.Client != c.name {
+		_ = c.drainContent(env.ID)
+		return fmt.Errorf("mkdir request is addressed to %q, not %q", req.Client, c.name)
+	}
+	reason := c.fs.Mkdir(shareOf(req.Path), restOf(req.Path))
+	if err := c.drainContent(env.ID); err != nil {
+		// Losing the connection while answering is the more serious failure:
+		// the operation's own result cannot be reported on a dead connection.
+		return err
+	}
+	return reason
+}
+
+// serveRemove handles a delete of one file or one empty directory.
+func (c *Client) serveRemove(env proto.Envelope) error {
+	var req proto.RemoveBody
+	if err := json.Unmarshal(env.Body, &req); err != nil {
+		_ = c.drainContent(env.ID)
+		return fmt.Errorf("bad remove request: %v", err)
+	}
+	if req.Client != c.name {
+		_ = c.drainContent(env.ID)
+		return fmt.Errorf("remove request is addressed to %q, not %q", req.Client, c.name)
+	}
+	reason := c.fs.Remove(shareOf(req.Path), restOf(req.Path))
+	if err := c.drainContent(env.ID); err != nil {
+		return err
+	}
+	return reason
+}
+
+// serveRename handles a rename within this client's own tree.
+//
+// A rename that named two different clients never reaches here: the server
+// refuses it because neither client could perform it alone, and copying the file
+// between machines would make a rename into a transfer with a window in the
+// middle where both names exist.
+func (c *Client) serveRename(env proto.Envelope) error {
+	var req proto.RenameBody
+	if err := json.Unmarshal(env.Body, &req); err != nil {
+		_ = c.drainContent(env.ID)
+		return fmt.Errorf("bad rename request: %v", err)
+	}
+	if req.Client != c.name {
+		_ = c.drainContent(env.ID)
+		return fmt.Errorf("rename request is addressed to %q, not %q", req.Client, c.name)
+	}
+	// Both ends are in the same client, so they must be in the same share:
+	// a share name is a directory, and no client has one directory that is
+	// also another. Sending the rename to one share with a path from the other
+	// would move the file to a name nobody asked for.
+	oldShare, newShare := shareOf(req.OldPath), shareOf(req.NewPath)
+	if oldShare != newShare {
+		_ = c.drainContent(env.ID)
+		return fmt.Errorf("rename spans shares %q and %q: a rename stays inside one share", oldShare, newShare)
+	}
+	reason := c.fs.Rename(oldShare, restOf(req.OldPath), restOf(req.NewPath))
+	if err := c.drainContent(env.ID); err != nil {
+		return err
+	}
+	return reason
+}
+
+// isWriteRequest reports whether kind is one of the write requests the server
+// forwards to the client that owns the path.
+//
+// It is a list of the request kinds, and it must stay separate from the kinds
+// that answer them: a request and an answer are the same shape in both
+// directions, so a classification that matched both would have the client answer
+// its own answer.
+func isWriteRequest(kind string) bool {
+	switch kind {
+	case proto.KindWrite, proto.KindMkdir, proto.KindRemove, proto.KindRename:
+		return true
+	}
+	return false
 }
 
 // shareOf returns the share name in a client-relative path, which is its first

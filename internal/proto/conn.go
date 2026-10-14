@@ -87,6 +87,12 @@ func (c *Conn) SendData(id uint64, chunk []byte) error {
 	}
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
+	return c.sendDataLocked(id, chunk)
+}
+
+// sendDataLocked writes one data frame. The caller holds wmu, and the caller is
+// responsible for checking werr first if it cares about the reason for a refusal.
+func (c *Conn) sendDataLocked(id uint64, chunk []byte) error {
 	if c.werr != nil {
 		return fmt.Errorf("proto: write on a broken connection: %w", c.werr)
 	}
@@ -170,6 +176,56 @@ func (c *Conn) RecvBody(id uint64) ([]byte, error) {
 		}
 		body = append(body, chunk...)
 	}
+}
+
+// SendAnnounced writes a request frame and then, while still holding the write
+// lock, the content stream that belongs to it.
+//
+// The lock is what this method exists for. A write is an announcement followed
+// by content on the same stream ID, and a second sender slipping a frame between
+// the two would leave the peer reading a data frame where it expected a control
+// frame. Holding the lock across both keeps the pair indivisible.
+//
+// content receives the stream ID the announcement was stamped with, and a
+// function that writes one content chunk under the lock this method holds. A nil
+// content means the announcement stands alone, which is what a write with no
+// bytes (mkdir, remove, rename) sends.
+//
+// The stream is always terminated with the end marker, so the peer can tell
+// "the content has ended" from "the connection stalled".
+func (c *Conn) SendAnnounced(id uint64, env Envelope, content func(id uint64, send func([]byte) error) error) error {
+	payload, err := json.Marshal(env)
+	if err != nil {
+		return fmt.Errorf("proto: encode control envelope: %w", err)
+	}
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	if c.werr != nil {
+		return fmt.Errorf("proto: write on a broken connection: %w", c.werr)
+	}
+	if err := WriteFrame(c.rw, FrameControl, payload); err != nil {
+		c.werr = err
+		return err
+	}
+	if content != nil {
+		send := func(chunk []byte) error {
+			if len(chunk) > MaxChunk {
+				return fmt.Errorf("proto: content chunk %d bytes too large (max %d)", len(chunk), MaxChunk)
+			}
+			return c.sendDataLocked(id, chunk)
+		}
+		if err := content(id, send); err != nil {
+			// The content failed part-way. The marker is still sent, so the
+			// peer sees a short stream rather than a stream that never ends,
+			// and the failure is reported to the sender.
+			_ = c.sendDataLocked(id, nil)
+			return err
+		}
+	}
+	if err := c.sendDataLocked(id, nil); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Close closes the underlying stream.

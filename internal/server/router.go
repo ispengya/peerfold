@@ -44,15 +44,29 @@ type clientLink struct {
 
 // forwarded is one in-flight request: who is waiting for it.
 type forwarded struct {
-	// ch receives the envelope that wakes the waiter: a plain reply, or the
-	// owner's control frame for an answer that carries content.
-	ch chan proto.Envelope
+	// ch receives the thing that wakes the waiter: the owner's control frame for
+	// an answer that carries content, or a reply that never came from the owner
+	// at all.
+	ch chan settled
 	// streaming marks a request whose answer carries content rather than being a
 	// plain reply.
 	streaming bool
 	// content carries the collected content of an answer that has it, once the
 	// control frame has been sent on ch.
 	content chan answerContent
+}
+
+// settled is what wakes a waiter.
+//
+// It carries an error alongside the envelope because the two ways a request can
+// end without an answer — the owner disconnected, or the request was given up on
+// — are values the caller has to be able to recognise, and an error flattened
+// into a string in the envelope cannot be recognised by anyone. Passing it
+// through unchanged is what lets a caller ask whether the owner is offline
+// rather than matching on the wording of a message.
+type settled struct {
+	env proto.Envelope
+	err error
 }
 
 // answerContent is the content half of an answer that carries it.
@@ -133,7 +147,7 @@ func (r *Router) deliver(name string, env proto.Envelope) bool {
 	if !ok {
 		return false
 	}
-	f.ch <- env
+	f.ch <- settled{env: env}
 	return true
 }
 
@@ -174,6 +188,11 @@ func (r *Router) complete(name string, env proto.Envelope) bool {
 	// The content is read here, on this goroutine, before anything is handed
 	// over. An answer that claims content has to be read off even when nobody
 	// wants it, or the next control frame would be parsed out of its middle.
+	//
+	// Every answer is read this way, whatever its kind: a data stream terminated
+	// by an end marker is the shape of an answer from a client, and the
+	// alternative — reading frames until something looks like a control frame —
+	// would make the frame count depend on the bytes inside a file.
 	var body []byte
 	readErr := pumpStream(link.conn, env.ID, &body)
 	if readErr != nil {
@@ -198,7 +217,7 @@ func (r *Router) complete(name string, env proto.Envelope) bool {
 	// The control frame wakes the waiter only now, when the whole answer is in
 	// hand, so the waiter can put the head on the wire and then the content
 	// knowing nothing else is arriving behind it.
-	f.ch <- env
+	f.ch <- settled{env: env}
 	if streaming {
 		f.content <- answerContent{body: body}
 	}
@@ -230,7 +249,11 @@ func pumpStream(from *proto.Conn, fromID uint64, body *[]byte) error {
 // settle takes a request out of the pending table and wakes its waiter.
 //
 // It is the one exit for a request that is not answered by the owner.
-func (r *Router) settle(name string, id uint64, reply proto.Envelope) {
+//
+// The error is carried separately from the envelope rather than flattened into
+// its Err field, so the waiter can still recognise it: a caller that wants to
+// know whether the owner is offline needs the value, not a sentence about it.
+func (r *Router) settle(name string, id uint64, reply proto.Envelope, reason error) {
 	r.mu.Lock()
 	link, ok := r.clients[name]
 	if !ok {
@@ -245,7 +268,21 @@ func (r *Router) settle(name string, id uint64, reply proto.Envelope) {
 	if !ok {
 		return
 	}
-	f.ch <- reply
+	f.ch <- settled{env: reply, err: reason}
+}
+
+// isWriteRequest reports whether kind is one of the write requests the server
+// forwards to the client that owns the path.
+//
+// The request kinds must not appear in isReply, and the two must not overlap: a
+// request and its answer are the same shape in both directions, so a kind that
+// matched both would have the server read its own request as the answer to it.
+func isWriteRequest(kind string) bool {
+	switch kind {
+	case proto.KindWrite, proto.KindMkdir, proto.KindRemove, proto.KindRename:
+		return true
+	}
+	return false
 }
 
 // isReply reports whether env is an answer to a forwarded request rather than a
@@ -254,10 +291,15 @@ func (r *Router) settle(name string, id uint64, reply proto.Envelope) {
 // A client originates tree uploads and events; everything else on this
 // connection exists only because the server asked for it, so a kind the server
 // forwards is a reply by construction.
+//
+// The request kinds must not appear here. A request and its answer are the same
+// shape in both directions — a control frame, and for a write a content stream —
+// so classifying a message by what it looks like rather than by which direction
+// it came from reads the owner's answer as a second request. That is exactly
+// what made every read hang before KindReadOK existed.
 func isReply(env proto.Envelope) bool {
 	switch env.Kind {
-	case proto.KindReadOK, proto.KindWrite, proto.KindMkdir, proto.KindCreate,
-		proto.KindRename, proto.KindRemove:
+	case proto.KindReadOK, proto.KindWriteOK:
 		return true
 	}
 	return false
@@ -282,9 +324,13 @@ func (r *Router) Send(ctx context.Context, client string, env proto.Envelope) (p
 	}
 	link.next++
 	id := link.next
-	f := &forwarded{ch: make(chan proto.Envelope, 1)}
+	f := &forwarded{ch: make(chan settled, 1)}
 	var content chan answerContent
 	if env.Kind == proto.KindRead {
+		// A read's content is the answer, and it is handed to the caller to
+		// forward. A write's content travels the other way — from the caller to
+		// the owner — so the answer's own stream is empty and read off in
+		// complete instead.
 		f.streaming = true
 		content = make(chan answerContent, 1)
 		f.content = content
@@ -294,20 +340,70 @@ func (r *Router) Send(ctx context.Context, client string, env proto.Envelope) (p
 
 	env.ID = id
 	if err := link.conn.Send(env); err != nil {
-		r.settle(client, id, proto.Envelope{ID: env.ID, Kind: env.Kind, Err: err.Error()})
+		r.settle(client, id, proto.Envelope{ID: env.ID, Kind: env.Kind, Err: err.Error()}, err)
 		return proto.Envelope{}, nil, fmt.Errorf("server: forward to %q: %w", client, err)
 	}
 
 	select {
-	case reply, ok := <-f.ch:
+	case got, ok := <-f.ch:
 		if !ok {
 			// detach closed the channel: the owner went away while this request
 			// was in flight.
 			return proto.Envelope{}, nil, fmt.Errorf("%w: %q disconnected", ErrClientOffline, client)
 		}
-		return reply, content, nil
+		if got.err != nil {
+			return proto.Envelope{}, nil, got.err
+		}
+		return got.env, content, nil
 	case <-ctx.Done():
-		r.settle(client, id, proto.Envelope{ID: env.ID, Kind: env.Kind, Err: ctx.Err().Error()})
+		r.settle(client, id, proto.Envelope{ID: env.ID, Kind: env.Kind, Err: ctx.Err().Error()}, ctx.Err())
 		return proto.Envelope{}, nil, fmt.Errorf("server: %q did not answer: %w", client, ctx.Err())
+	}
+}
+
+// ForwardWrite sends a write request to a named client and waits for its answer.
+//
+// It differs from Send in the one way that matters: the content of a write
+// travels from the server to the owner, so it has to be written to the owner's
+// connection while the request announcing it is still in flight. That is what
+// content is for — the router calls it once the announcement is on the wire, and
+// the chunks it sends become a data stream ended by the marker.
+//
+// The connection's write mutex is held across the whole of it, which is the
+// reason this method exists rather than the caller sending the frames itself: no
+// other frame may land between the announcement and its content.
+//
+// content is nil for a request that carries no bytes.
+func (r *Router) ForwardWrite(ctx context.Context, client string, env proto.Envelope, content func(id uint64, send func([]byte) error) error) (proto.Envelope, error) {
+	r.mu.Lock()
+	link, ok := r.clients[client]
+	if !ok {
+		r.mu.Unlock()
+		return proto.Envelope{}, fmt.Errorf("%w: %q", ErrClientOffline, client)
+	}
+	link.next++
+	id := link.next
+	f := &forwarded{ch: make(chan settled, 1)}
+	link.pending[id] = f
+	r.mu.Unlock()
+
+	env.ID = id
+	if err := link.conn.SendAnnounced(id, env, content); err != nil {
+		r.settle(client, id, proto.Envelope{ID: env.ID, Kind: env.Kind, Err: err.Error()}, err)
+		return proto.Envelope{}, fmt.Errorf("server: forward to %q: %w", client, err)
+	}
+
+	select {
+	case got, ok := <-f.ch:
+		if !ok {
+			return proto.Envelope{}, fmt.Errorf("%w: %q disconnected", ErrClientOffline, client)
+		}
+		if got.err != nil {
+			return proto.Envelope{}, got.err
+		}
+		return got.env, nil
+	case <-ctx.Done():
+		r.settle(client, id, proto.Envelope{ID: env.ID, Kind: env.Kind, Err: ctx.Err().Error()}, ctx.Err())
+		return proto.Envelope{}, fmt.Errorf("server: %q did not answer: %w", client, ctx.Err())
 	}
 }

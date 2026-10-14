@@ -4,7 +4,9 @@ package viewer
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"time"
@@ -225,6 +227,196 @@ func (v *Viewer) readContent(id uint64) ([]byte, error) {
 // Cat returns a whole file.
 func (v *Viewer) Cat(path string) ([]byte, error) {
 	return v.Read(path, 0, -1)
+}
+
+// Put replaces the file at path with everything r produces.
+//
+// The content is sent while the request is still open, one chunk at a time, so a
+// file far larger than memory is still one call. Nothing is buffered here: the
+// reader is drained straight into frames.
+func (v *Viewer) Put(path string, r io.Reader) error {
+	return v.put(path, r, proto.WriteModePut)
+}
+
+// PutExclusive writes path only if nothing is already there, and refuses if
+// something is.
+//
+// It is separate from Put because the two differ in what they will destroy. A
+// caller that means "save this here" wants Put; one that means "this file must
+// not already exist" — writing a lock file, or refusing to clobber somebody
+// else's work — wants this, and could not get it by checking first: the check
+// and the write would not be one step, so a file created between them would be
+// overwritten anyway.
+func (v *Viewer) PutExclusive(path string, r io.Reader) error {
+	return v.put(path, r, proto.WriteModeCreate)
+}
+
+// put sends a whole-file write-back in the given mode.
+func (v *Viewer) put(path string, r io.Reader, mode string) error {
+	client, rest, err := splitWritePath("write", path)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(proto.WriteBody{Client: client, Path: rest, Mode: mode})
+	if err != nil {
+		return fmt.Errorf("viewer: encode write: %w", err)
+	}
+	id, err := v.send(proto.KindWrite, body)
+	if err != nil {
+		return err
+	}
+
+	// The content goes out after the announcement and before the answer is
+	// read: the server is waiting for it, and a viewer that waited for the
+	// answer first would be waiting for the owner to answer a request whose
+	// content had not been sent.
+	if err := v.sendContent(id, r); err != nil {
+		return err
+	}
+	return v.awaitWrite(id, "write to "+path)
+}
+
+// Mkdir creates a directory on the owning client.
+func (v *Viewer) Mkdir(path string) error {
+	client, rest, err := splitWritePath("mkdir", path)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(proto.MkdirBody{Client: client, Path: rest})
+	if err != nil {
+		return fmt.Errorf("viewer: encode mkdir: %w", err)
+	}
+	return v.writeRequest(proto.KindMkdir, body, "mkdir "+path)
+}
+
+// Remove deletes one file or one empty directory on the owning client.
+func (v *Viewer) Remove(path string) error {
+	client, rest, err := splitWritePath("remove", path)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(proto.RemoveBody{Client: client, Path: rest})
+	if err != nil {
+		return fmt.Errorf("viewer: encode remove: %w", err)
+	}
+	return v.writeRequest(proto.KindRemove, body, "remove "+path)
+}
+
+// Rename moves a path within one client.
+//
+// Both ends must name the same client. A rename across clients is refused rather
+// than turned into a copy, because two clients share no filesystem and a copy is
+// not what was asked for. Both the viewer and the owner apply that rule, and the
+// viewer's is the one that can: see the comment inside.
+func (v *Viewer) Rename(oldPath, newPath string) error {
+	oldClient, oldRest, err := splitWritePath("rename", oldPath)
+	if err != nil {
+		return err
+	}
+	newClient, newRest, err := splitWritePath("rename", newPath)
+	if err != nil {
+		return err
+	}
+	if newClient != oldClient {
+		// Refused here as well as by the owner, and deliberately so. The two
+		// ends are stripped of the client name before they are sent, so what the
+		// owner receives cannot say which clients they came from — if the
+		// refusal lived only there, this request would be indistinguishable from
+		// a legitimate rename of two identically spelled paths and would be
+		// carried out. This is the only party that still knows.
+		return fmt.Errorf("viewer: rename %q to %q: the two ends are on different clients (%q and %q): a rename stays inside one client",
+			oldPath, newPath, oldClient, newClient)
+	}
+	body, err := json.Marshal(proto.RenameBody{Client: oldClient, OldPath: oldRest, NewPath: newRest})
+	if err != nil {
+		return fmt.Errorf("viewer: encode rename: %w", err)
+	}
+	return v.writeRequest(proto.KindRename, body, "rename "+oldPath+" to "+newPath)
+}
+
+// splitWritePath separates the client name from the path inside it and requires
+// both, since a write has to name a machine and a place on it.
+func splitWritePath(what, path string) (client, rest string, err error) {
+	client, rest = splitPath(path)
+	if client == "" || rest == "" {
+		return "", "", fmt.Errorf("viewer: %s %q: a %s needs a client and a path inside it", what, path, what)
+	}
+	return client, rest, nil
+}
+
+// writeRequest sends a write that carries no content and returns its outcome.
+func (v *Viewer) writeRequest(kind string, body []byte, what string) error {
+	id, err := v.send(kind, body)
+	if err != nil {
+		return err
+	}
+	return v.awaitWrite(id, what)
+}
+
+// awaitWrite reads the three parts of a write answer and reports the outcome.
+//
+// All three are always read, including on failure. The answer is a frame
+// sequence, so a part left unread does not stay where it is: it becomes the next
+// frame read, and every later answer is then one frame out of step.
+func (v *Viewer) awaitWrite(id uint64, what string) error {
+	head, err := v.recv(callTimeout)
+	if err != nil {
+		return fmt.Errorf("viewer: %s: %w", what, err)
+	}
+	if head.ID != id {
+		return fmt.Errorf("viewer: %s: reply ID = %d, want %d: replies are out of step", what, head.ID, id)
+	}
+	if head.Kind != proto.KindWriteOK {
+		return fmt.Errorf("viewer: %s: reply kind = %q, want %q", what, head.Kind, proto.KindWriteOK)
+	}
+	// The stream is read whatever the outcome says: a failed write still sent
+	// one, and its end marker is what puts this connection back at a frame
+	// boundary.
+	if _, err := v.readContent(id); err != nil {
+		return fmt.Errorf("viewer: %s: reading the answer's stream: %w", what, err)
+	}
+	tail, err := v.recv(callTimeout)
+	if err != nil {
+		return fmt.Errorf("viewer: %s ended without its closing frame: %w", what, err)
+	}
+	if head.Err != "" {
+		return fmt.Errorf("viewer: %s: %s", what, head.Err)
+	}
+	if tail.Err != "" {
+		return fmt.Errorf("viewer: %s: %s", what, tail.Err)
+	}
+	return nil
+}
+
+// sendContent writes everything r produces as the content stream of id, in
+// chunks, and ends it.
+//
+// The reader is never collected first: one chunk is read from r and one frame is
+// written, so the memory a put needs does not grow with the file.
+func (v *Viewer) sendContent(id uint64, r io.Reader) error {
+	buf := make([]byte, proto.MaxChunk)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			if err := v.pc.SendData(id, buf[:n]); err != nil {
+				return fmt.Errorf("viewer: send content: %w", err)
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			// The stream still has to be ended, so the server is not left
+			// waiting for bytes that will never come. The failure is reported
+			// afterwards, but the attempt to close the stream is unconditional.
+			endErr := v.pc.SendData(id, nil)
+			if endErr != nil {
+				return fmt.Errorf("viewer: content failed (%v) and its stream could not be ended (%v)", err, endErr)
+			}
+			return fmt.Errorf("viewer: send content: %w", err)
+		}
+	}
+	return v.pc.SendData(id, nil)
 }
 
 // recvBody reads a reply's body.

@@ -81,8 +81,8 @@ func TestLsListsTheTopLevel(t *testing.T) {
 	cfg := writeConfig(t, addr)
 
 	var out, errOut bytes.Buffer
-	if code := run([]string{"ls", "--config", cfg}, &out, &errOut); code != 0 {
-		t.Fatalf("run(ls) = %d, want 0; stderr = %q", code, errOut.String())
+	if code := runWithEmptyStdin([]string{"ls", "--config", cfg}, &out, &errOut); code != 0 {
+		t.Fatalf("runWithEmptyStdin(ls) = %d, want 0; stderr = %q", code, errOut.String())
 	}
 	got := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
 	want := []string{"d\tlinux", "d\twin"}
@@ -104,8 +104,8 @@ func TestLsWalksIntoAClient(t *testing.T) {
 	cfg := writeConfig(t, addr)
 
 	var out, errOut bytes.Buffer
-	if code := run([]string{"ls", "--config", cfg, "win"}, &out, &errOut); code != 0 {
-		t.Fatalf("run(ls win) = %d, want 0; stderr = %q", code, errOut.String())
+	if code := runWithEmptyStdin([]string{"ls", "--config", cfg, "win"}, &out, &errOut); code != 0 {
+		t.Fatalf("runWithEmptyStdin(ls win) = %d, want 0; stderr = %q", code, errOut.String())
 	}
 	if got := strings.TrimSpace(out.String()); got != "d\tDocuments" {
 		t.Fatalf("ls win = %q, want %q", got, "d\tDocuments")
@@ -120,8 +120,8 @@ func TestLsMarksFilesAndDirectories(t *testing.T) {
 	cfg := writeConfig(t, addr)
 
 	var out, errOut bytes.Buffer
-	if code := run([]string{"ls", "--config", cfg, "win/Documents"}, &out, &errOut); code != 0 {
-		t.Fatalf("run(ls win/Documents) = %d, want 0; stderr = %q", code, errOut.String())
+	if code := runWithEmptyStdin([]string{"ls", "--config", cfg, "win/Documents"}, &out, &errOut); code != 0 {
+		t.Fatalf("runWithEmptyStdin(ls win/Documents) = %d, want 0; stderr = %q", code, errOut.String())
 	}
 	lines := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
 	want := map[string]bool{
@@ -146,9 +146,9 @@ func TestLsMissingPathFails(t *testing.T) {
 	cfg := writeConfig(t, addr)
 
 	var out, errOut bytes.Buffer
-	code := run([]string{"ls", "--config", cfg, "win/Documents/nope"}, &out, &errOut)
+	code := runWithEmptyStdin([]string{"ls", "--config", cfg, "win/Documents/nope"}, &out, &errOut)
 	if code == 0 {
-		t.Fatalf("run(ls of a missing path) = 0, want non-zero; stdout = %q", out.String())
+		t.Fatalf("runWithEmptyStdin(ls of a missing path) = 0, want non-zero; stdout = %q", out.String())
 	}
 	if strings.TrimSpace(out.String()) != "" {
 		t.Errorf("stdout = %q, want it empty on failure", out.String())
@@ -164,8 +164,8 @@ func TestLsUnknownClientFails(t *testing.T) {
 	cfg := writeConfig(t, addr)
 
 	var out, errOut bytes.Buffer
-	if code := run([]string{"ls", "--config", cfg, "nobody"}, &out, &errOut); code == 0 {
-		t.Fatalf("run(ls nobody) = 0, want non-zero")
+	if code := runWithEmptyStdin([]string{"ls", "--config", cfg, "nobody"}, &out, &errOut); code == 0 {
+		t.Fatalf("runWithEmptyStdin(ls nobody) = 0, want non-zero")
 	}
 }
 
@@ -175,8 +175,8 @@ func TestLsUnreachableServerFails(t *testing.T) {
 	cfg := writeConfig(t, "127.0.0.1:1")
 
 	var out, errOut bytes.Buffer
-	if code := run([]string{"ls", "--config", cfg}, &out, &errOut); code == 0 {
-		t.Fatalf("run(ls with no server) = 0, want non-zero")
+	if code := runWithEmptyStdin([]string{"ls", "--config", cfg}, &out, &errOut); code == 0 {
+		t.Fatalf("runWithEmptyStdin(ls with no server) = 0, want non-zero")
 	}
 	if errOut.Len() == 0 {
 		t.Error("stderr is empty, want the reason for the failure")
@@ -192,9 +192,9 @@ func TestLsWithoutAConfiguredServerFails(t *testing.T) {
 	}
 
 	var out, errOut bytes.Buffer
-	code := run([]string{"ls", "--config", path}, &out, &errOut)
+	code := runWithEmptyStdin([]string{"ls", "--config", path}, &out, &errOut)
 	if code == 0 {
-		t.Fatalf("run(ls with no server configured) = 0, want non-zero")
+		t.Fatalf("runWithEmptyStdin(ls with no server configured) = 0, want non-zero")
 	}
 	if !strings.Contains(errOut.String(), "no server") {
 		t.Errorf("stderr = %q, want it to mention the missing server", errOut.String())
@@ -205,8 +205,8 @@ func TestLsWithoutAConfiguredServerFails(t *testing.T) {
 // list only one of them.
 func TestLsTooManyArgsFails(t *testing.T) {
 	var out, errOut bytes.Buffer
-	if code := run([]string{"ls", "a", "b"}, &out, &errOut); code != 2 {
-		t.Fatalf("run(ls a b) = %d, want 2", code)
+	if code := runWithEmptyStdin([]string{"ls", "a", "b"}, &out, &errOut); code != 2 {
+		t.Fatalf("runWithEmptyStdin(ls a b) = %d, want 2", code)
 	}
 }
 
@@ -218,7 +218,7 @@ func TestLsFollowsAChange(t *testing.T) {
 	cfg := writeConfig(t, addr)
 
 	var out, errOut bytes.Buffer
-	if code := run([]string{"ls", "--config", cfg, "win/Documents"}, &out, &errOut); code != 0 {
+	if code := runWithEmptyStdin([]string{"ls", "--config", cfg, "win/Documents"}, &out, &errOut); code != 0 {
 		t.Fatalf("first ls = %d, want 0; stderr = %q", code, errOut.String())
 	}
 	first := out.String()
@@ -230,7 +230,7 @@ func TestLsFollowsAChange(t *testing.T) {
 	for {
 		out.Reset()
 		errOut.Reset()
-		if code := run([]string{"ls", "--config", cfg}, &out, &errOut); code != 0 {
+		if code := runWithEmptyStdin([]string{"ls", "--config", cfg}, &out, &errOut); code != 0 {
 			t.Fatalf("second ls = %d, want 0; stderr = %q", code, errOut.String())
 		}
 		if strings.Contains(out.String(), "linux") {

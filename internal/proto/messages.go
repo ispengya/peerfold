@@ -30,10 +30,29 @@ const (
 	// neither does a request whose body failed to encode.
 	KindReadOK = "read_ok"
 	KindWrite  = "write"
-	KindMkdir  = "mkdir"
-	KindCreate = "create"
-	KindRename = "rename"
-	KindRemove = "remove"
+	// KindWriteOK is a client's answer to a write request. Every write — put,
+	// create, mkdir, remove, rename — is answered with this one kind, because
+	// the answer carries nothing but "it worked" or the reason it did not, and
+	// the request already said which operation it was. It is a kind of its own
+	// for the same reason as KindReadOK: request and answer travel in opposite
+	// directions on one connection and are otherwise identical in shape.
+	KindWriteOK = "write_ok"
+	KindMkdir   = "mkdir"
+	KindRename  = "rename"
+	KindRemove  = "remove"
+)
+
+// Write-body modes. A whole-file write-back either replaces what is there or
+// refuses to touch a name that is already taken, and those are the only two
+// things a "put this file" request can mean.
+const (
+	// WriteModePut replaces the target, creating it if it is absent. This is
+	// what `peerfold put` sends.
+	WriteModePut = "put"
+	// WriteModeCreate refuses if the name is taken. This is `peerfold put
+	// --exclusive`, for a caller that must not clobber a file it did not know
+	// was there.
+	WriteModeCreate = "create"
 )
 
 // Roles a client declares in its hello. A viewer dials in to observe the
@@ -107,21 +126,25 @@ type ReadBody struct {
 }
 
 // WriteBody announces a whole-file write-back to the owning client. Content
-// follows as a data stream on the same ID.
+// follows as a data stream on the same ID, exactly as a read's content does, so
+// a put does not have to fit in one frame.
+//
+// Path is share-relative on the owner ("Documents/a.txt"), and the owner splits
+// it into a share name and a path within that share the same way it does for a
+// read.
+//
+// Mode is one of the WriteMode values, and it is a single word rather than a
+// boolean because there is no sensible default: a caller has to say whether it
+// means "make this the file's content" or "make this file, and only if it is
+// not already there".
 type WriteBody struct {
-	Client   string `json:"client"`
-	Path     string `json:"path"`
-	Truncate bool   `json:"truncate"`
+	Client string `json:"client"`
+	Path   string `json:"path"`
+	Mode   string `json:"mode"`
 }
 
 // MkdirBody asks the owning client to create a directory.
 type MkdirBody struct {
-	Client string `json:"client"`
-	Path   string `json:"path"`
-}
-
-// CreateBody asks the owning client to create an empty file.
-type CreateBody struct {
 	Client string `json:"client"`
 	Path   string `json:"path"`
 }

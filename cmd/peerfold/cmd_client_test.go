@@ -18,7 +18,7 @@ func TestClientSavesConfigBeforeDialing(t *testing.T) {
 	cfgPath := filepath.Join(t.TempDir(), "config.json")
 
 	var out, errOut bytes.Buffer
-	code := run([]string{
+	code := runWithEmptyStdin([]string{
 		"client",
 		"--server", "127.0.0.1:1",
 		"--share", "Documents=" + tmp,
@@ -27,7 +27,7 @@ func TestClientSavesConfigBeforeDialing(t *testing.T) {
 	}, &out, &errOut)
 
 	if code == 0 {
-		t.Fatalf("run(client to a dead port) = 0, want non-zero; stdout = %q", out.String())
+		t.Fatalf("runWithEmptyStdin(client to a dead port) = 0, want non-zero; stdout = %q", out.String())
 	}
 
 	// The connection failed, but the configuration did not.
@@ -56,7 +56,7 @@ func TestClientMergesIntoAnExistingConfig(t *testing.T) {
 	runOne := func(share string) {
 		t.Helper()
 		var out, errOut bytes.Buffer
-		if code := run([]string{
+		if code := runWithEmptyStdin([]string{
 			"client",
 			"--server", "127.0.0.1:1",
 			"--share", share,
@@ -89,7 +89,7 @@ func TestClientUnsetFlagsKeepTheConfig(t *testing.T) {
 	cfgPath := filepath.Join(t.TempDir(), "config.json")
 
 	var out, errOut bytes.Buffer
-	if code := run([]string{
+	if code := runWithEmptyStdin([]string{
 		"client",
 		"--server", "127.0.0.1:1",
 		"--share", "Documents=" + t.TempDir(),
@@ -100,7 +100,7 @@ func TestClientUnsetFlagsKeepTheConfig(t *testing.T) {
 	}
 
 	// Only a new share this time: --server and --name are absent.
-	if code := run([]string{
+	if code := runWithEmptyStdin([]string{
 		"client",
 		"--share", "Other=" + t.TempDir(),
 		"--config", cfgPath,
@@ -125,8 +125,8 @@ func TestClientUnsetFlagsKeepTheConfig(t *testing.T) {
 
 func TestClientRejectsMalformedShare(t *testing.T) {
 	var out, errOut bytes.Buffer
-	if code := run([]string{"client", "--share", "no-equals-sign", "--server", "127.0.0.1:1"}, &out, &errOut); code == 0 {
-		t.Fatalf("run(client --share no-equals-sign) = 0, want non-zero")
+	if code := runWithEmptyStdin([]string{"client", "--share", "no-equals-sign", "--server", "127.0.0.1:1"}, &out, &errOut); code == 0 {
+		t.Fatalf("runWithEmptyStdin(client --share no-equals-sign) = 0, want non-zero")
 	}
 }
 
@@ -134,8 +134,8 @@ func TestClientRejectsMalformedShare(t *testing.T) {
 // a silent no-op that leaves the process running with no server.
 func TestClientRequiresAServer(t *testing.T) {
 	var out, errOut bytes.Buffer
-	if code := run([]string{"client", "--config", filepath.Join(t.TempDir(), "config.json")}, &out, &errOut); code == 0 {
-		t.Fatalf("run(client with no server) = 0, want non-zero")
+	if code := runWithEmptyStdin([]string{"client", "--config", filepath.Join(t.TempDir(), "config.json")}, &out, &errOut); code == 0 {
+		t.Fatalf("runWithEmptyStdin(client with no server) = 0, want non-zero")
 	}
 }
 
@@ -149,7 +149,7 @@ func TestClientNameDefaultsToHostname(t *testing.T) {
 	cfgPath := filepath.Join(t.TempDir(), "config.json")
 
 	var out, errOut bytes.Buffer
-	if code := run([]string{
+	if code := runWithEmptyStdin([]string{
 		"client",
 		"--server", "127.0.0.1:1",
 		"--share", "Documents=" + t.TempDir(),
@@ -172,8 +172,8 @@ func TestClientNameDefaultsToHostname(t *testing.T) {
 // ever.
 func TestClientUnknownFlagExitsTwo(t *testing.T) {
 	var out, errOut bytes.Buffer
-	if code := run([]string{"client", "--nonsense"}, &out, &errOut); code != 2 {
-		t.Fatalf("run(client --nonsense) = %d, want 2", code)
+	if code := runWithEmptyStdin([]string{"client", "--nonsense"}, &out, &errOut); code != 2 {
+		t.Fatalf("runWithEmptyStdin(client --nonsense) = %d, want 2", code)
 	}
 }
 
@@ -202,9 +202,9 @@ func TestClientDoesNotPersistAnInvalidShare(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var out, errOut bytes.Buffer
-			code := run([]string{"client", "--config", cfgPath, "--share", tc.share}, &out, &errOut)
+			code := runWithEmptyStdin([]string{"client", "--config", cfgPath, "--share", tc.share}, &out, &errOut)
 			if code == 0 {
-				t.Fatalf("run(client --share %q) = 0, want non-zero", tc.share)
+				t.Fatalf("runWithEmptyStdin(client --share %q) = 0, want non-zero", tc.share)
 			}
 			if errOut.Len() == 0 {
 				t.Error("stderr is empty, want the reason for the failure")

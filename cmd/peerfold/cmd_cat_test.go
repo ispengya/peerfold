@@ -52,8 +52,8 @@ func TestCatWritesTheOriginalBytes(t *testing.T) {
 	cfg := writeConfig(t, addr)
 
 	var out, errOut bytes.Buffer
-	if code := run([]string{"cat", "--config", cfg, "win/Documents/a.txt"}, &out, &errOut); code != 0 {
-		t.Fatalf("run(cat) = %d, want 0; stderr = %q", code, errOut.String())
+	if code := runWithEmptyStdin([]string{"cat", "--config", cfg, "win/Documents/a.txt"}, &out, &errOut); code != 0 {
+		t.Fatalf("runWithEmptyStdin(cat) = %d, want 0; stderr = %q", code, errOut.String())
 	}
 	if out.String() != "hello world\n" {
 		t.Fatalf("stdout = %q, want %q", out.String(), "hello world\n")
@@ -72,8 +72,8 @@ func TestCatPassesBinaryBytesThrough(t *testing.T) {
 	cfg := writeConfig(t, addr)
 
 	var out, errOut bytes.Buffer
-	if code := run([]string{"cat", "--config", cfg, "win/Documents/bin.dat"}, &out, &errOut); code != 0 {
-		t.Fatalf("run(cat) = %d, want 0; stderr = %q", code, errOut.String())
+	if code := runWithEmptyStdin([]string{"cat", "--config", cfg, "win/Documents/bin.dat"}, &out, &errOut); code != 0 {
+		t.Fatalf("runWithEmptyStdin(cat) = %d, want 0; stderr = %q", code, errOut.String())
 	}
 	if out.String() != want {
 		t.Fatalf("stdout = %v, want %v", []byte(out.String()), []byte(want))
@@ -89,8 +89,8 @@ func TestCatOfAnEmptyFileWritesNothing(t *testing.T) {
 	cfg := writeConfig(t, addr)
 
 	var out, errOut bytes.Buffer
-	if code := run([]string{"cat", "--config", cfg, "win/Documents/empty.txt"}, &out, &errOut); code != 0 {
-		t.Fatalf("run(cat) = %d, want 0 for an empty file; stderr = %q", code, errOut.String())
+	if code := runWithEmptyStdin([]string{"cat", "--config", cfg, "win/Documents/empty.txt"}, &out, &errOut); code != 0 {
+		t.Fatalf("runWithEmptyStdin(cat) = %d, want 0 for an empty file; stderr = %q", code, errOut.String())
 	}
 	if out.Len() != 0 {
 		t.Fatalf("stdout = %q, want nothing", out.String())
@@ -109,8 +109,8 @@ func TestCatMissingPathFails(t *testing.T) {
 	cfg := writeConfig(t, addr)
 
 	var out, errOut bytes.Buffer
-	if code := run([]string{"cat", "--config", cfg, "win/Documents/nope.txt"}, &out, &errOut); code == 0 {
-		t.Fatalf("run(cat of a missing file) = 0, want non-zero; stdout = %q", out.String())
+	if code := runWithEmptyStdin([]string{"cat", "--config", cfg, "win/Documents/nope.txt"}, &out, &errOut); code == 0 {
+		t.Fatalf("runWithEmptyStdin(cat of a missing file) = 0, want non-zero; stdout = %q", out.String())
 	}
 	if out.Len() != 0 {
 		t.Fatalf("stdout = %q, want nothing on a failure", out.String())
@@ -128,8 +128,8 @@ func TestCatUnknownClientFails(t *testing.T) {
 	cfg := writeConfig(t, addr)
 
 	var out, errOut bytes.Buffer
-	if code := run([]string{"cat", "--config", cfg, "nobody/x"}, &out, &errOut); code == 0 {
-		t.Fatalf("run(cat of an unknown client) = 0, want non-zero; stdout = %q", out.String())
+	if code := runWithEmptyStdin([]string{"cat", "--config", cfg, "nobody/x"}, &out, &errOut); code == 0 {
+		t.Fatalf("runWithEmptyStdin(cat of an unknown client) = 0, want non-zero; stdout = %q", out.String())
 	}
 	if errOut.Len() == 0 {
 		t.Fatal("stderr is empty: an unknown client must be reported")
@@ -140,8 +140,8 @@ func TestCatUnknownClientFails(t *testing.T) {
 // not dial and then report something misleading.
 func TestCatWithoutAPathIsAUsageError(t *testing.T) {
 	var out, errOut bytes.Buffer
-	if code := run([]string{"cat"}, &out, &errOut); code != 2 {
-		t.Fatalf("run(cat) = %d, want 2; stderr = %q", code, errOut.String())
+	if code := runWithEmptyStdin([]string{"cat"}, &out, &errOut); code != 2 {
+		t.Fatalf("runWithEmptyStdin(cat) = %d, want 2; stderr = %q", code, errOut.String())
 	}
 	if !strings.Contains(errOut.String(), "exactly one PATH") {
 		t.Fatalf("stderr = %q, want it to name the missing PATH", errOut.String())
@@ -152,8 +152,8 @@ func TestCatWithoutAPathIsAUsageError(t *testing.T) {
 // silently printing the first one.
 func TestCatTooManyPathsIsAUsageError(t *testing.T) {
 	var out, errOut bytes.Buffer
-	if code := run([]string{"cat", "a", "b"}, &out, &errOut); code != 2 {
-		t.Fatalf("run(cat a b) = %d, want 2; stderr = %q", code, errOut.String())
+	if code := runWithEmptyStdin([]string{"cat", "a", "b"}, &out, &errOut); code != 2 {
+		t.Fatalf("runWithEmptyStdin(cat a b) = %d, want 2; stderr = %q", code, errOut.String())
 	}
 }
 
@@ -163,8 +163,8 @@ func TestCatUnreachableServerFails(t *testing.T) {
 	cfg := writeConfig(t, "127.0.0.1:1")
 
 	var out, errOut bytes.Buffer
-	if code := run([]string{"cat", "--config", cfg, "win/Documents/a.txt"}, &out, &errOut); code == 0 {
-		t.Fatalf("run(cat) = 0 against an unreachable server, want non-zero")
+	if code := runWithEmptyStdin([]string{"cat", "--config", cfg, "win/Documents/a.txt"}, &out, &errOut); code == 0 {
+		t.Fatalf("runWithEmptyStdin(cat) = 0 against an unreachable server, want non-zero")
 	}
 	if errOut.Len() == 0 {
 		t.Fatal("stderr is empty: an unreachable server must be reported")
@@ -180,8 +180,8 @@ func TestCatWithoutAConfiguredServerFails(t *testing.T) {
 	}
 
 	var out, errOut bytes.Buffer
-	if code := run([]string{"cat", "--config", path, "win/Documents/a.txt"}, &out, &errOut); code == 0 {
-		t.Fatal("run(cat) = 0 with no server configured, want non-zero")
+	if code := runWithEmptyStdin([]string{"cat", "--config", path, "win/Documents/a.txt"}, &out, &errOut); code == 0 {
+		t.Fatal("runWithEmptyStdin(cat) = 0 with no server configured, want non-zero")
 	}
 	if errOut.Len() == 0 {
 		t.Fatal("stderr is empty: a missing server must be reported")

@@ -10,14 +10,26 @@ import (
 	"peerfold/internal/viewer"
 )
 
-// cmdTree dispatches the tree commands. The write commands arrive in later tasks
-// and still report pending work.
-func cmdTree(cmd string, args []string, stdout, stderr io.Writer) int {
+// cmdTree dispatches the tree commands: the reads, the writes, and the two
+// commands that name a path rather than move bytes through the terminal.
+//
+// stdin is the source of a put and is unused by everything else. It is a
+// parameter rather than os.Stdin so the command that reads a stream can be
+// driven from one in a test.
+func cmdTree(cmd string, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	switch cmd {
 	case "ls":
 		return cmdLs(args, stdout, stderr)
 	case "cat":
 		return cmdCat(args, stdout, stderr)
+	case "put":
+		return cmdPut(args, stdin, stderr)
+	case "mkdir":
+		return cmdMkdir(args, stderr)
+	case "rm":
+		return cmdRm(args, stderr)
+	case "mv":
+		return cmdMv(args, stderr)
 	default:
 		fmt.Fprintf(stderr, "TODO: %s %v\n", cmd, args)
 		return 0
@@ -96,6 +108,144 @@ func cmdCat(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// cmdPut writes stdin to PATH on the machine that owns it.
+//
+// The content is stdin and nothing else, so `peerfold put win/file < local`
+// uploads a file without the command reading anything the user did not point at
+// it. It is not a progress display: a command whose output is a transfer cannot
+// also print to stdout without corrupting the transfer.
+func cmdPut(args []string, stdin io.Reader, stderr io.Writer) int {
+	fs := flag.NewFlagSet("put", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cfgPath := fs.String("config", "", "config file (default: the per-user config path)")
+	exclusive := fs.Bool("exclusive", false, "fail if PATH already exists instead of replacing it")
+	fs.Usage = func() {
+		fmt.Fprint(stderr, putUsage)
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintf(stderr, "put: exactly one PATH is required, got %d\n", fs.NArg())
+		return 2
+	}
+
+	v, code, ok := connect("put", *cfgPath, stderr)
+	if !ok {
+		return code
+	}
+	defer v.Close()
+
+	// stdin is read here, not read whole first: a put may be any size, and the
+	// viewer streams whatever the reader produces.
+	var err error
+	if *exclusive {
+		err = v.PutExclusive(fs.Arg(0), stdin)
+	} else {
+		err = v.Put(fs.Arg(0), stdin)
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "put: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// cmdMkdir creates a directory on the machine that owns the path.
+func cmdMkdir(args []string, stderr io.Writer) int {
+	fs := flag.NewFlagSet("mkdir", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cfgPath := fs.String("config", "", "config file (default: the per-user config path)")
+	fs.Usage = func() {
+		fmt.Fprint(stderr, mkdirUsage)
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintf(stderr, "mkdir: exactly one PATH is required, got %d\n", fs.NArg())
+		return 2
+	}
+
+	v, code, ok := connect("mkdir", *cfgPath, stderr)
+	if !ok {
+		return code
+	}
+	defer v.Close()
+
+	if err := v.Mkdir(fs.Arg(0)); err != nil {
+		fmt.Fprintf(stderr, "mkdir: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// cmdRm removes one file or one empty directory.
+//
+// There is no --recursive flag, and that is the point: the operation deletes
+// something on somebody else's machine, and a single wrong path must not be able
+// to take a tree with it. A directory with anything in it is refused.
+func cmdRm(args []string, stderr io.Writer) int {
+	fs := flag.NewFlagSet("rm", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cfgPath := fs.String("config", "", "config file (default: the per-user config path)")
+	fs.Usage = func() {
+		fmt.Fprint(stderr, rmUsage)
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintf(stderr, "rm: exactly one PATH is required, got %d\n", fs.NArg())
+		return 2
+	}
+
+	v, code, ok := connect("rm", *cfgPath, stderr)
+	if !ok {
+		return code
+	}
+	defer v.Close()
+
+	if err := v.Remove(fs.Arg(0)); err != nil {
+		fmt.Fprintf(stderr, "rm: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// cmdMv renames OLD to NEW within one client.
+func cmdMv(args []string, stderr io.Writer) int {
+	fs := flag.NewFlagSet("mv", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cfgPath := fs.String("config", "", "config file (default: the per-user config path)")
+	fs.Usage = func() {
+		fmt.Fprint(stderr, mvUsage)
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 2 {
+		fmt.Fprintf(stderr, "mv: exactly two paths are required, got %d\n", fs.NArg())
+		return 2
+	}
+
+	v, code, ok := connect("mv", *cfgPath, stderr)
+	if !ok {
+		return code
+	}
+	defer v.Close()
+
+	if err := v.Rename(fs.Arg(0), fs.Arg(1)); err != nil {
+		fmt.Fprintf(stderr, "mv: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
 // cmdLs lists the aggregated tree at PATH, or the top level when PATH is
 // omitted.
 //
@@ -165,6 +315,48 @@ const catUsage = `usage: peerfold cat PATH
 
 Writes one file from the aggregated tree to stdout, unchanged. PATH is
 client/share/path, for example win/Documents/notes.txt.
+
+flags:
+`
+
+const putUsage = `usage: peerfold put [--exclusive] PATH
+
+Writes stdin to PATH on the machine that owns it, replacing whatever is there.
+PATH is client/share/path, for example win/Documents/notes.txt.
+
+With --exclusive the write fails if PATH already exists, which is what a caller
+that must not clobber a file it did not know about wants. Checking first would
+not be the same thing: the check and the write are one step here.
+
+flags:
+`
+
+const mkdirUsage = `usage: peerfold mkdir PATH
+
+Creates a directory on the machine that owns it. PATH is client/share/path. The
+parents are not created: a mistyped path fails rather than building a tree
+nobody named.
+
+flags:
+`
+
+const rmUsage = `usage: peerfold rm PATH
+
+Removes one file or one empty directory on the machine that owns it. PATH is
+client/share/path.
+
+A non-empty directory is refused. The delete is not recursive, so one wrong path
+cannot take a tree with it.
+
+flags:
+`
+
+const mvUsage = `usage: peerfold mv OLD NEW
+
+Renames OLD to NEW. Both must name the same client and the same share, since a
+rename is one step in one filesystem; it is never a copy. For example:
+
+  peerfold mv win/Documents/draft.txt win/Documents/final.txt
 
 flags:
 `

@@ -9,9 +9,9 @@ import (
 func TestRunUnknownCommand(t *testing.T) {
 	var out, errOut bytes.Buffer
 
-	code := run([]string{"bogus"}, &out, &errOut)
+	code := runWithEmptyStdin([]string{"bogus"}, &out, &errOut)
 	if code == 0 {
-		t.Fatalf("run([bogus]) = 0, want non-zero")
+		t.Fatalf("runWithEmptyStdin([bogus]) = 0, want non-zero")
 	}
 	if !strings.Contains(errOut.String(), "unknown command") {
 		t.Fatalf("stderr = %q, want it to contain %q", errOut.String(), "unknown command")
@@ -21,8 +21,8 @@ func TestRunUnknownCommand(t *testing.T) {
 func TestRunNoArgsListsCommands(t *testing.T) {
 	var out, errOut bytes.Buffer
 
-	if code := run(nil, &out, &errOut); code == 0 {
-		t.Fatalf("run(nil) = 0, want non-zero")
+	if code := runWithEmptyStdin(nil, &out, &errOut); code == 0 {
+		t.Fatalf("runWithEmptyStdin(nil) = 0, want non-zero")
 	}
 	s := out.String()
 	for _, want := range []string{"server", "client"} {
@@ -38,11 +38,11 @@ func TestRunNoArgsListsCommands(t *testing.T) {
 func TestRunStubSubcommandSucceeds(t *testing.T) {
 	var out, errOut bytes.Buffer
 
-	if code := run([]string{"server", "--listen", "127.0.0.1:0"}, &out, &errOut); code != 0 {
-		t.Fatalf("run([server]) = %d, want 0 from the stub; stderr = %q", code, errOut.String())
+	if code := runWithEmptyStdin([]string{"server", "--listen", "127.0.0.1:0"}, &out, &errOut); code != 0 {
+		t.Fatalf("runWithEmptyStdin([server]) = %d, want 0 from the stub; stderr = %q", code, errOut.String())
 	}
 	if !strings.Contains(errOut.String(), "TODO") {
-		t.Fatalf("run([server]) stderr = %q, want the pending-work notice", errOut.String())
+		t.Fatalf("runWithEmptyStdin([server]) stderr = %q, want the pending-work notice", errOut.String())
 	}
 }
 
@@ -59,26 +59,26 @@ func TestRunDispatchesEveryKnownCommand(t *testing.T) {
 	// Still stubs. server is on this list, not the other one: cmd_server.go
 	// prints the pending-work notice, and listing it as implemented would drop
 	// its dispatch arm from the pin entirely.
-	for _, cmd := range []string{"server", "put", "mkdir", "rm", "mv"} {
+	for _, cmd := range []string{"server"} {
 		var out, errOut bytes.Buffer
 
-		if code := run([]string{cmd}, &out, &errOut); code != 0 {
-			t.Fatalf("run([%s]) = %d, want 0 from the stub; stderr = %q", cmd, code, errOut.String())
+		if code := runWithEmptyStdin([]string{cmd}, &out, &errOut); code != 0 {
+			t.Fatalf("runWithEmptyStdin([%s]) = %d, want 0 from the stub; stderr = %q", cmd, code, errOut.String())
 		}
 		if !strings.Contains(errOut.String(), "TODO") {
-			t.Fatalf("run([%s]) stderr = %q, want the pending-work notice — did it fall through to the default arm?",
+			t.Fatalf("runWithEmptyStdin([%s]) stderr = %q, want the pending-work notice — did it fall through to the default arm?",
 				cmd, errOut.String())
 		}
 	}
 
 	// These reach their real implementations, which reject the missing input.
-	for _, cmd := range []string{"client", "ls", "cat"} {
+	for _, cmd := range []string{"client", "ls", "cat", "put", "mkdir", "rm", "mv"} {
 		var out, errOut bytes.Buffer
-		if code := run([]string{cmd}, &out, &errOut); code == 0 {
-			t.Fatalf("run([%s]) = 0, want non-zero", cmd)
+		if code := runWithEmptyStdin([]string{cmd}, &out, &errOut); code == 0 {
+			t.Fatalf("runWithEmptyStdin([%s]) = 0, want non-zero", cmd)
 		}
 		if strings.Contains(errOut.String(), "TODO") {
-			t.Fatalf("run([%s]) stderr = %q, want the real implementation rather than the stub notice", cmd, errOut.String())
+			t.Fatalf("runWithEmptyStdin([%s]) stderr = %q, want the real implementation rather than the stub notice", cmd, errOut.String())
 		}
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +27,22 @@ const helloTimeout = 30 * time.Second
 // is waiting on: an owner that has not answered in two seconds is either gone or
 // wedged, and either way a failure serves the user better than a wait.
 const readTimeout = 2 * time.Second
+
+// writeTimeout bounds a write forwarded to a client.
+//
+// It is far longer than a read's, and deliberately: a read is answered by the
+// owner reading its own disk, while a write may be waiting for the requester to
+// finish sending a file across a slow link. Failing a transfer that is still
+// making progress would be wrong; the bound exists so a wedged owner or a
+// requester that stops sending fails the call rather than holding it for ever.
+const writeTimeout = 10 * time.Minute
+
+// ErrCrossClient reports a rename whose two ends are not in one place.
+//
+// It is exported because the condition is a property of what was asked, not of
+// this server's internals: a caller may reasonably decide to do something else
+// with that answer.
+var ErrCrossClient = errors.New("server: a rename cannot span two clients")
 
 // Server accepts client connections and owns the aggregated index.
 //
@@ -340,6 +357,26 @@ func (s *Server) serveLoop(name string, c *proto.Conn) {
 			continue
 		}
 
+		// A write answer is a kind of its own for the same reason a read's is:
+		// the request and the answer travel in opposite directions on this
+		// connection and are identical in shape, so nothing about the frame
+		// itself can say which one arrived. It carries a stream even though
+		// every one of them is empty, and the stream has to be read here
+		// because only this goroutine may read this connection.
+		if env.Kind == proto.KindWriteOK {
+			if !s.router.complete(name, env) {
+				_ = c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: "unsolicited reply: nothing is waiting for this"})
+			}
+			continue
+		}
+
+		if isWriteRequest(env.Kind) {
+			if err := s.replyWrite(c, env); err != nil {
+				return
+			}
+			continue
+		}
+
 		// Any other forwarded kind is a plain answer, so it goes to whoever
 		// asked rather than being answered here. One with no waiter is a peer
 		// answering something it was not asked, which is a protocol error rather
@@ -476,6 +513,201 @@ func (s *Server) replyRead(c *proto.Conn, env proto.Envelope) error {
 		return err
 	}
 	return c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindRead})
+}
+
+// replyWrite forwards one write request to the client that owns the path and
+// reports how it went.
+//
+// The answer has the same three-part shape a read uses — a control frame, a
+// content stream, a closing control frame — for the same reason: frames are one
+// sequence, so a part left unread becomes the next frame whoever reads it. The
+// stream here is empty on every path and still present, because its absence is
+// indistinguishable from a dropped frame.
+//
+// The content of a put travels the other way. It is read off the requester's
+// connection one frame at a time and written to the owner's, so a file larger
+// than memory is still a single request. The owner is handed a whole stream and
+// answers only once it has it.
+func (s *Server) replyWrite(c *proto.Conn, env proto.Envelope) error {
+	switch env.Kind {
+	case proto.KindWrite:
+		return s.replyPut(c, env)
+	case proto.KindMkdir:
+		var b proto.MkdirBody
+		if err := json.Unmarshal(env.Body, &b); err != nil {
+			return s.writeAnswer(c, env, fmt.Errorf("bad mkdir request: %v", err))
+		}
+		return s.replyNamed(c, env, b.Client, "mkdir")
+	case proto.KindRemove:
+		var b proto.RemoveBody
+		if err := json.Unmarshal(env.Body, &b); err != nil {
+			return s.writeAnswer(c, env, fmt.Errorf("bad remove request: %v", err))
+		}
+		return s.replyNamed(c, env, b.Client, "remove")
+	case proto.KindRename:
+		var b proto.RenameBody
+		if err := json.Unmarshal(env.Body, &b); err != nil {
+			return s.writeAnswer(c, env, fmt.Errorf("bad rename request: %v", err))
+		}
+		return s.replyRename(c, env, b)
+	default:
+		return s.writeAnswer(c, env, fmt.Errorf("bad write request: unknown kind %q", env.Kind))
+	}
+}
+
+// replyNamed forwards a write request that carries no content, once its
+// addressing has been checked.
+func (s *Server) replyNamed(c *proto.Conn, env proto.Envelope, client, what string) error {
+	if client == "" {
+		return s.writeAnswer(c, env, fmt.Errorf("bad %s request: client is required", what))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
+	defer cancel()
+	// content is nil: there is nothing to send, and the announcement still ends
+	// the stream, so the owner reads exactly one.
+	reply, err := s.router.ForwardWrite(ctx, client, proto.Envelope{Kind: env.Kind, Body: env.Body}, nil)
+	if err != nil {
+		return s.writeAnswer(c, env, err)
+	}
+	if reply.Err != "" {
+		return s.writeAnswer(c, env, errors.New(reply.Err))
+	}
+	return s.writeAnswer(c, env, nil)
+}
+
+// replyRename forwards a rename after checking that its two ends still name the
+// same place.
+//
+// The cross-client case is refused before the request is ever built, by the
+// viewer that knows both client names — the paths travel with the client name
+// stripped off, so by the time they arrive the information is no longer in them.
+// What is left to check here is the same rule one level down: a rename must stay
+// inside one share, because a share is a directory and no two of them are the
+// same directory. It is the client's refusal that is authoritative, since it
+// holds the share map; this one keeps a request that cannot succeed from
+// travelling.
+func (s *Server) replyRename(c *proto.Conn, env proto.Envelope, b proto.RenameBody) error {
+	if b.Client == "" {
+		return s.writeAnswer(c, env, errors.New("bad rename request: client is required"))
+	}
+	oldShare, _ := splitPath(b.OldPath)
+	newShare, _ := splitPath(b.NewPath)
+	if oldShare != newShare {
+		return s.writeAnswer(c, env, fmt.Errorf("%w: %s is in share %q and %s is in share %q",
+			ErrCrossClient, b.OldPath, oldShare, b.NewPath, newShare))
+	}
+	return s.replyNamed(c, env, b.Client, "rename")
+}
+
+// replyPut forwards a whole-file write-back, streaming the requester's content
+// to the owner as it arrives.
+func (s *Server) replyPut(c *proto.Conn, env proto.Envelope) error {
+	var b proto.WriteBody
+	switch {
+	case json.Unmarshal(env.Body, &b) != nil:
+		// The body is not readable as a put, so the content behind it is still
+		// on this connection. It is drained before the answer, or the frames
+		// would be read later as part of something else.
+		return s.drainThenAnswer(c, env, errors.New("bad write request: unreadable body"))
+	case b.Client == "":
+		return s.drainThenAnswer(c, env, errors.New("bad write request: client is required"))
+	case b.Path == "":
+		return s.drainThenAnswer(c, env, errors.New("bad write request: path is required"))
+	case b.Mode != proto.WriteModePut && b.Mode != proto.WriteModeCreate:
+		return s.drainThenAnswer(c, env, fmt.Errorf("bad write request: unknown mode %q", b.Mode))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
+	defer cancel()
+	// The content is copied straight through, one chunk at a time: it is read
+	// from the requester and written to the owner inside this call, so neither
+	// side ever holds the file. The router keeps the owner's connection locked
+	// for the whole sequence, so the stream cannot be interleaved with another.
+	reply, err := s.router.ForwardWrite(ctx, b.Client, proto.Envelope{Kind: proto.KindWrite, Body: env.Body},
+		func(id uint64, send func([]byte) error) error {
+			for {
+				chunk, done, err := c.RecvData(env.ID)
+				if err != nil {
+					return err
+				}
+				if done {
+					return nil
+				}
+				if err := send(chunk); err != nil {
+					return err
+				}
+			}
+		})
+	if err != nil {
+		return s.writeAnswer(c, env, err)
+	}
+	if reply.Err != "" {
+		return s.writeAnswer(c, env, errors.New(reply.Err))
+	}
+	return s.writeAnswer(c, env, nil)
+}
+
+// drainThenAnswer reads a put's content off the connection and then reports a
+// failure.
+//
+// Draining is not optional even though the request was refused: the requester
+// has already sent the content by the time the server looks at the
+// announcement, so the frames are on the wire and the only question is whether
+// this connection reads them here or reads the wrong thing later.
+func (s *Server) drainThenAnswer(c *proto.Conn, env proto.Envelope, reason error) error {
+	for {
+		_, done, err := c.RecvData(env.ID)
+		if err != nil {
+			return s.writeAnswer(c, env, reason)
+		}
+		if done {
+			break
+		}
+	}
+	return s.writeAnswer(c, env, reason)
+}
+
+// writeAnswer sends the three-part answer a write always gets, and reports
+// whether writing it failed.
+//
+// reason is what to tell the requester, or nil for success. It never varies the
+// shape: the head carries the outcome, the stream is empty and ended, and the
+// tail closes it.
+//
+// The kind is KindWriteOK and not the request's own kind. Echoing the request
+// would make the answer and the next request the same thing on the wire, and the
+// requester's assertion that it got an answer would then hold for a request too.
+func (s *Server) writeAnswer(c *proto.Conn, env proto.Envelope, reason error) error {
+	head := proto.Envelope{ID: env.ID, Kind: proto.KindWriteOK}
+	if reason != nil {
+		head.Err = reason.Error()
+	}
+	if err := c.Send(head); err != nil {
+		return err
+	}
+	if err := c.SendData(env.ID, nil); err != nil {
+		return err
+	}
+	return c.Send(head)
+}
+
+// splitPath separates a client name from the path inside that client, at the
+// first separator.
+//
+// The server needs this in exactly one place: to decide whether a rename's two
+// ends are on the same client. Everything after the first separator belongs to
+// the client's own namespace, where a separator is an ordinary path character
+// and not something the server should read a second time.
+//
+// Backslash counts as a separator as well, so that "win\Documents" — which a
+// Windows user will type — names the same client as "win/Documents". A share
+// name cannot contain one, so it can only ever be a redundant spelling of the
+// boundary.
+func splitPath(path string) (client, rest string) {
+	if i := strings.IndexAny(path, `/\`); i >= 0 {
+		return path[:i], path[i+1:]
+	}
+	return path, ""
 }
 
 // applyBatch indexes one tree batch for the named client.

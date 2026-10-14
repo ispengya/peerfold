@@ -7,12 +7,16 @@ import (
 )
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
 // run dispatches one command line and returns the process exit code, so
 // tests can drive the CLI without spawning a process.
-func run(args []string, stdout, stderr io.Writer) int {
+//
+// stdin is passed in rather than read from the process, for the same reason
+// stdout and stderr are: a command whose input is a stream can only be tested
+// from a stream the test supplies.
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		usage(stdout)
 		return 2
@@ -25,7 +29,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "client":
 		return cmdClient(rest, stdout, stderr)
 	case "ls", "cat", "put", "mkdir", "rm", "mv":
-		return cmdTree(cmd, rest, stdout, stderr)
+		return cmdTree(cmd, rest, stdin, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown command %q\n", cmd)
 		usage(stderr)
