@@ -41,12 +41,30 @@ func TestConfigSaveLoadRoundTrip(t *testing.T) {
 	}
 }
 
-func TestConfigSharesType(t *testing.T) {
-	shares := map[string]string{"Documents": "/home/me/Documents"}
-	got := config.Config{Shares: shares}
+// TestConfigNilSharesRoundTrip pins the nil-Shares contract. Save takes
+// Config by value, so its internal normalization never reaches the caller:
+// the expectation has to be normalized explicitly here.
+func TestConfigNilSharesRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	want := config.Config{Listen: ":7000"}
+	if want.Shares != nil {
+		t.Fatal("this test is only meaningful with nil Shares")
+	}
 
-	if !reflect.DeepEqual(got.Shares, map[string]string{"Documents": "/home/me/Documents"}) {
-		t.Fatalf("Shares = %#v, want the map passed in", got.Shares)
+	if err := config.Save(path, want); err != nil {
+		t.Fatalf("Save(%q): %v", path, err)
+	}
+
+	got, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load(%q): %v", path, err)
+	}
+	if got.Shares == nil {
+		t.Fatal("Load() returned a nil Shares map, want a non-nil empty map")
+	}
+	want.Shares = map[string]string{}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Load() = %+v, want %+v (Shares normalized to an empty map)", got, want)
 	}
 }
 

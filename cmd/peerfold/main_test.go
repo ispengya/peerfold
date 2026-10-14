@@ -42,3 +42,20 @@ func TestRunStubSubcommandSucceeds(t *testing.T) {
 		t.Fatalf("run([ls /nonexistent]) = %d, want 0 from the stub; stderr = %q", code, errOut.String())
 	}
 }
+
+// TestRunDispatchesEveryKnownCommand pins every dispatch arm: a typo in a
+// case label would otherwise still pass every other test, because the usage
+// text alone is enough to satisfy TestRunNoArgsListsCommands.
+func TestRunDispatchesEveryKnownCommand(t *testing.T) {
+	for _, cmd := range []string{"server", "client", "ls", "cat", "put", "mkdir", "rm", "mv"} {
+		var out, errOut bytes.Buffer
+
+		if code := run([]string{cmd}, &out, &errOut); code != 0 {
+			t.Fatalf("run([%s]) = %d, want 0 from the stub; stderr = %q", cmd, code, errOut.String())
+		}
+		if !strings.Contains(errOut.String(), "TODO") {
+			t.Fatalf("run([%s]) stderr = %q, want the pending-work notice — did it fall through to the default arm?",
+				cmd, errOut.String())
+		}
+	}
+}

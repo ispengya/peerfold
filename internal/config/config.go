@@ -7,6 +7,9 @@ import (
 )
 
 // Config is the on-disk configuration for both the server and the client.
+//
+// Shares is normalized to a non-nil map by both Save and Load, so a config
+// round-trips exactly and callers never need a nil check.
 type Config struct {
 	Listen     string            `json:"listen"`
 	Server     string            `json:"server"`
@@ -23,8 +26,11 @@ func Default() Config {
 	}
 }
 
-// Load reads a config file. A missing file reports an error satisfying
-// errors.Is(err, os.ErrNotExist).
+// Load reads a config file verbatim: it merges no defaults, so an omitted
+// key stays at its zero value and Save/Load round-trips exactly. Callers
+// that want defaults start from Default and overlay the loaded values.
+//
+// A missing file reports an error satisfying errors.Is(err, os.ErrNotExist).
 func Load(path string) (Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -43,6 +49,9 @@ func Load(path string) (Config, error) {
 // Save writes the config file, creating its parent directory if needed:
 // DefaultPath lives under a peerfold/ directory that may not exist yet.
 func Save(path string, c Config) error {
+	if c.Shares == nil {
+		c.Shares = map[string]string{}
+	}
 	if dir := filepath.Dir(path); dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
