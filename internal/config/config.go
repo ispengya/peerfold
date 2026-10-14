@@ -8,8 +8,10 @@ import (
 
 // Config is the on-disk configuration for both the server and the client.
 //
-// Shares is normalized to a non-nil map by both Save and Load, so a config
-// round-trips exactly and callers never need a nil check.
+// Save and Load are exact inverses: neither fills in defaults nor normalizes
+// Shares, so Load(Save(c)) equals c field for field. Shares is therefore nil
+// for a config that declares no shares; a caller that needs an initialized
+// map should start from Default.
 type Config struct {
 	Listen     string            `json:"listen"`
 	Server     string            `json:"server"`
@@ -26,9 +28,10 @@ func Default() Config {
 	}
 }
 
-// Load reads a config file verbatim: it merges no defaults, so an omitted
-// key stays at its zero value and Save/Load round-trips exactly. Callers
-// that want defaults start from Default and overlay the loaded values.
+// Load reads a config file verbatim: it merges no defaults and normalizes
+// nothing, so an omitted key stays at its zero value and Save/Load are exact
+// inverses. Callers that want defaults start from Default and overlay the
+// loaded values.
 //
 // A missing file reports an error satisfying errors.Is(err, os.ErrNotExist).
 func Load(path string) (Config, error) {
@@ -40,18 +43,12 @@ func Load(path string) (Config, error) {
 	if err := json.Unmarshal(b, &c); err != nil {
 		return Config{}, err
 	}
-	if c.Shares == nil {
-		c.Shares = map[string]string{}
-	}
 	return c, nil
 }
 
 // Save writes the config file, creating its parent directory if needed:
 // DefaultPath lives under a peerfold/ directory that may not exist yet.
 func Save(path string, c Config) error {
-	if c.Shares == nil {
-		c.Shares = map[string]string{}
-	}
 	if dir := filepath.Dir(path); dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
