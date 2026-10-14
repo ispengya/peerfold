@@ -123,8 +123,9 @@ type RemoveBody struct {
 	Path   string `json:"path"`
 }
 
-// EventBody is one index update pushed from a client. A node whose Kind is
-// node.NodeKindDeleted marks a path that no longer exists.
+// EventBody is one index update pushed from a client. A node whose Kind is the
+// deletion marker (255, defined as node.KindDeleted in Task 3) marks a path that
+// no longer exists.
 type EventBody struct {
 	Nodes []NodeJSON `json:"nodes"`
 }

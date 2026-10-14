@@ -17,11 +17,20 @@ const dataHeaderLen = 8
 // One read lock and one write lock are held. The read side is safe for a
 // single reader; the write side serialises Send and SendData, which is what
 // keeps two concurrent sends from interleaving their frames.
+//
+// A write error is terminal. Once a write has failed, part of a frame may
+// already be on the wire, so every later Send and SendData returns that first
+// error rather than appending another frame behind a truncated one and letting
+// the peer desynchronise silently. Callers must Close the Conn and dial again.
 type Conn struct {
 	rw io.ReadWriteCloser
 
 	rmu sync.Mutex
 	wmu sync.Mutex
+
+	// werr is the first write error, remembered so later writes fail loudly
+	// instead of continuing on a stream whose frame boundaries are lost.
+	werr error
 }
 
 // NewConn wraps rw. The Conn owns rw: Close closes it.
@@ -29,7 +38,9 @@ func NewConn(rw io.ReadWriteCloser) *Conn {
 	return &Conn{rw: rw}
 }
 
-// Send writes env as a control frame.
+// Send writes env as a control frame. Once a write has failed on this Conn,
+// Send reports that first error instead of writing, because the stream's frame
+// boundaries are no longer trustworthy.
 func (c *Conn) Send(env Envelope) error {
 	payload, err := json.Marshal(env)
 	if err != nil {
@@ -37,7 +48,14 @@ func (c *Conn) Send(env Envelope) error {
 	}
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
-	return WriteFrame(c.rw, FrameControl, payload)
+	if c.werr != nil {
+		return fmt.Errorf("proto: write on a broken connection: %w", c.werr)
+	}
+	if err := WriteFrame(c.rw, FrameControl, payload); err != nil {
+		c.werr = err
+		return err
+	}
+	return nil
 }
 
 // Recv reads the next control frame. A data frame in that position is a
@@ -61,14 +79,25 @@ func (c *Conn) Recv() (Envelope, error) {
 
 // SendData writes one chunk of the response stream identified by id. A
 // zero-length chunk ends the stream, and a zero-byte file is exactly one such
-// frame.
+// frame. Chunks must be at most MaxChunk bytes; a larger one is rejected before
+// anything is allocated for it.
 func (c *Conn) SendData(id uint64, chunk []byte) error {
+	if len(chunk) > MaxChunk {
+		return fmt.Errorf("proto: data chunk %d bytes too large (max %d)", len(chunk), MaxChunk)
+	}
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	if c.werr != nil {
+		return fmt.Errorf("proto: write on a broken connection: %w", c.werr)
+	}
 	payload := make([]byte, dataHeaderLen+len(chunk))
 	binary.BigEndian.PutUint64(payload[:dataHeaderLen], id)
 	copy(payload[dataHeaderLen:], chunk)
-	c.wmu.Lock()
-	defer c.wmu.Unlock()
-	return WriteFrame(c.rw, FrameData, payload)
+	if err := WriteFrame(c.rw, FrameData, payload); err != nil {
+		c.werr = err
+		return err
+	}
+	return nil
 }
 
 // RecvData reads the next chunk of the response stream identified by id. The

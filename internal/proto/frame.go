@@ -23,8 +23,14 @@ const (
 // size as much as a limit.
 const MaxPayload = 1 << 20
 
-// frameHeaderLen is one kind byte plus four big-endian payload-length bytes.
+// FrameKind byte plus four payload-length bytes.
 const frameHeaderLen = 5
+
+// MaxChunk is the largest content a data frame can carry. A data frame's
+// payload is an 8-byte stream id followed by the content, so content is capped
+// this much below MaxPayload; a caller streaming a file should slice on this
+// rather than on MaxPayload.
+const MaxChunk = MaxPayload - dataHeaderLen
 
 // WriteFrame writes one frame: a kind byte, the payload length as a big-endian
 // uint32, then the payload bytes.
