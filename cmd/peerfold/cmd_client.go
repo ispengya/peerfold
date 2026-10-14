@@ -1,13 +1,217 @@
 package main
 
 import (
+	"errors"
+	"flag"
 	"fmt"
 	"io"
+	"os"
+	"os/signal"
+	"sort"
+	"strings"
+
+	"peerfold/internal/client"
+	"peerfold/internal/config"
 )
 
-// cmdClient is a stub: it accepts its arguments and reports pending work.
-// Joining a server arrives in Task 6.
+// cmdClient joins a server and shares local directories.
+//
+// The configuration is written before the connection is attempted: "peerfold
+// client --share ... " is meant to feel like one command that joins, so a
+// server that happens to be down must not also discard what the user just
+// declared. Re-running the command later reconnects with the same settings.
 func cmdClient(args []string, stdout, stderr io.Writer) int {
-	fmt.Fprintf(stderr, "TODO: client %v\n", args)
+	fs := flag.NewFlagSet("client", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var (
+		server    = fs.String("server", "", "server address to dial (host:port)")
+		shares    = shareList{}
+		name      = fs.String("name", "", "client name (default: this host's name)")
+		aggregate = fs.Bool("aggregate", false, "ask to be the aggregating client")
+		cfgPath   = fs.String("config", "", "config file (default: the per-user config path)")
+	)
+	fs.Var(&shares, "share", "share a directory as NAME=PATH (repeatable)")
+	fs.Usage = func() {
+		fmt.Fprint(stderr, clientUsage)
+		fs.PrintDefaults()
+	}
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "client: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
+
+	path := *cfgPath
+	if path == "" {
+		p, err := config.DefaultPath()
+		if err != nil {
+			fmt.Fprintf(stderr, "client: locate config: %v\n", err)
+			return 1
+		}
+		path = p
+	}
+
+	cfg, err := loadOrDefault(path)
+	if err != nil {
+		fmt.Fprintf(stderr, "client: read config %s: %v\n", path, err)
+		return 1
+	}
+
+	// A flag that was not given must not erase what the config already holds.
+	if *server != "" {
+		cfg.Server = *server
+	}
+	if *name != "" {
+		cfg.ClientName = *name
+	}
+	if *aggregate {
+		cfg.Aggregate = true
+	}
+	if cfg.Shares == nil {
+		cfg.Shares = map[string]string{}
+	}
+	for _, s := range shares {
+		cfg.Shares[s.Name] = s.Path
+	}
+
+	clientName := cfg.ClientName
+	if clientName == "" {
+		host, err := os.Hostname()
+		if err != nil {
+			fmt.Fprintf(stderr, "client: determine host name: %v\n", err)
+			return 1
+		}
+		clientName = host
+		cfg.ClientName = clientName
+	}
+
+	if cfg.Server == "" {
+		fmt.Fprintln(stderr, "client: no server to dial: pass --server or set one in the config")
+		return 2
+	}
+	if len(cfg.Shares) == 0 {
+		fmt.Fprintln(stderr, "client: no directories to share: pass --share NAME=PATH")
+		return 2
+	}
+
+	if err := config.Save(path, cfg); err != nil {
+		fmt.Fprintf(stderr, "client: save config %s: %v\n", path, err)
+		return 1
+	}
+
+	sh, err := client.NewShares(shareArgs(cfg.Shares), nil)
+	if err != nil {
+		fmt.Fprintf(stderr, "client: %v\n", err)
+		return 1
+	}
+
+	c, err := client.Dial(client.Options{
+		Server:    cfg.Server,
+		Name:      clientName,
+		Shares:    sh,
+		Aggregate: cfg.Aggregate,
+		OnBatch: func(sent int) {
+			fmt.Fprintf(stdout, "shared %d entries\n", sent)
+		},
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "client: %v\n", err)
+		return 1
+	}
+	defer c.Close()
+
+	if err := c.UploadTree(); err != nil {
+		fmt.Fprintf(stderr, "client: %v\n", err)
+		return 1
+	}
+
+	role := "client"
+	if c.Aggregate() {
+		role = "aggregating client"
+	}
+	fmt.Fprintf(stdout, "joined %s as %s (%s)\n", cfg.Server, c.Name(), role)
+
+	// Stay connected: the index belongs to this connection, so exiting would
+	// withdraw the tree that was just published. The connection is what keeps
+	// the share alive, so the process now waits for an interrupt.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+	defer signal.Stop(sig)
+	<-sig
+	fmt.Fprintln(stdout, "disconnected")
 	return 0
 }
+
+// shareArg is one --share NAME=PATH.
+type shareArg struct {
+	Name string
+	Path string
+}
+
+// shareList collects repeated --share flags. flag.Value would let a caller pass
+// a comma-separated list, but a path may contain a comma, so NAME=PATH is the
+// only accepted form.
+type shareList []shareArg
+
+func (s *shareList) String() string {
+	parts := make([]string, 0, len(*s))
+	for _, e := range *s {
+		parts = append(parts, e.Name+"="+e.Path)
+	}
+	return strings.Join(parts, ",")
+}
+
+func (s *shareList) Set(v string) error {
+	name, path, ok := strings.Cut(v, "=")
+	if !ok {
+		return fmt.Errorf("want NAME=PATH, got %q", v)
+	}
+	if name == "" || path == "" {
+		return fmt.Errorf("want NAME=PATH with both parts set, got %q", v)
+	}
+	*s = append(*s, shareArg{Name: name, Path: path})
+	return nil
+}
+
+// shareArgs renders a config's shares as the NAME=PATH form NewShares takes,
+// in a stable order so the error a caller sees does not depend on map
+// iteration order.
+func shareArgs(shares map[string]string) []string {
+	names := make([]string, 0, len(shares))
+	for name := range shares {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		out = append(out, name+"="+shares[name])
+	}
+	return out
+}
+
+// loadOrDefault reads the config, treating a missing file as the defaults
+// rather than an error: the first run of a fresh install has no file yet.
+func loadOrDefault(path string) (config.Config, error) {
+	cfg, err := config.Load(path)
+	if err == nil {
+		return cfg, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return config.Default(), nil
+	}
+	return config.Config{}, err
+}
+
+const clientUsage = `usage: peerfold client [flags]
+
+Joins a server and shares local directories with it. The flags are merged into
+the config file, which is written before the connection is attempted, so a
+server that is down does not discard the shares you just declared.
+
+flags:
+`

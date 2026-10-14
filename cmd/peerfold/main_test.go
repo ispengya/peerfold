@@ -32,9 +32,10 @@ func TestRunNoArgsListsCommands(t *testing.T) {
 	}
 }
 
-// TestRunStubSubcommandSucceeds pins this task's stub behaviour. The
+// TestRunStubSubcommandSucceeds pins the tree commands' stub behaviour. The
 // "missing PATH is an error" assertion belongs to Task 7, which owns the
-// real ls implementation.
+// real ls implementation. client and server are excluded: Task 6 implemented
+// the former and Task 5 the latter, so they are no longer stubs.
 func TestRunStubSubcommandSucceeds(t *testing.T) {
 	var out, errOut bytes.Buffer
 
@@ -46,8 +47,12 @@ func TestRunStubSubcommandSucceeds(t *testing.T) {
 // TestRunDispatchesEveryKnownCommand pins every dispatch arm: a typo in a
 // case label would otherwise still pass every other test, because the usage
 // text alone is enough to satisfy TestRunNoArgsListsCommands.
+//
+// The tree commands are still stubs, so they answer with the pending-work
+// notice. client is dispatched for real, so it is expected to get past the
+// dispatch and fail on its own missing arguments instead.
 func TestRunDispatchesEveryKnownCommand(t *testing.T) {
-	for _, cmd := range []string{"server", "client", "ls", "cat", "put", "mkdir", "rm", "mv"} {
+	for _, cmd := range []string{"ls", "cat", "put", "mkdir", "rm", "mv"} {
 		var out, errOut bytes.Buffer
 
 		if code := run([]string{cmd}, &out, &errOut); code != 0 {
@@ -57,5 +62,14 @@ func TestRunDispatchesEveryKnownCommand(t *testing.T) {
 			t.Fatalf("run([%s]) stderr = %q, want the pending-work notice — did it fall through to the default arm?",
 				cmd, errOut.String())
 		}
+	}
+
+	// client reaches its own implementation, which rejects the missing server.
+	var out, errOut bytes.Buffer
+	if code := run([]string{"client"}, &out, &errOut); code == 0 {
+		t.Fatalf("run([client]) = 0, want non-zero")
+	}
+	if strings.Contains(errOut.String(), "TODO") {
+		t.Fatalf("run([client]) stderr = %q, want the real implementation rather than the stub notice", errOut.String())
 	}
 }
