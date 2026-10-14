@@ -380,3 +380,117 @@ func TestServerAcceptsAfterASilentConnection(t *testing.T) {
 		t.Fatalf("Live() = %v, want [a]: a silent connection must not be registered", live)
 	}
 }
+
+// TestServerIndexesTreeBatchImmediately pins that a batch is applied on arrival
+// rather than accumulated until the upload ends: the tree is meant to grow
+// while the upload runs, which is what lets a client show progress.
+func TestServerIndexesTreeBatchImmediately(t *testing.T) {
+	s, addr := start(t)
+	raw, _ := hello(t, addr, "laptop", proto.RoleClient, false)
+	defer raw.Close()
+	conn := proto.NewConn(raw)
+
+	sendBatch(t, conn, 2, []proto.NodeJSON{
+		{Path: "Documents", Kind: uint8(node.KindDir)},
+	})
+
+	// No TreeDone has been sent, so the batch must already be visible.
+	if _, ok := s.Index().Lookup("laptop", "Documents"); !ok {
+		t.Fatal("a batch is only indexed at the end of the upload; it must be applied on arrival")
+	}
+}
+
+// TestServerTreeDoneKeepsTheConnection pins the difference between ending an
+// upload and ending a connection. The index belongs to the connection, so a
+// server that closed on TreeDone would delete the tree the client just
+// published — after telling it the upload succeeded.
+func TestServerTreeDoneKeepsTheConnection(t *testing.T) {
+	s, addr := start(t)
+	raw, _ := hello(t, addr, "laptop", proto.RoleClient, false)
+	defer raw.Close()
+	conn := proto.NewConn(raw)
+
+	sendBatch(t, conn, 2, []proto.NodeJSON{
+		{Path: "Documents", Kind: uint8(node.KindDir)},
+	})
+	done, err := json.Marshal(proto.TreeDoneBody{Shares: []string{"Documents"}})
+	if err != nil {
+		t.Fatalf("Marshal tree done: %v", err)
+	}
+	if err := conn.Send(proto.Envelope{ID: 3, Kind: proto.KindTreeDone, Body: done}); err != nil {
+		t.Fatalf("Send tree done: %v", err)
+	}
+	ack, err := conn.Recv()
+	if err != nil {
+		t.Fatalf("Recv tree-done ack: %v", err)
+	}
+	if ack.Err != "" {
+		t.Fatalf("tree-done ack carried an error: %q", ack.Err)
+	}
+	if ack.ID != 3 {
+		t.Errorf("ack ID = %d, want 3", ack.ID)
+	}
+
+	// The connection must still work, and the tree must still be there.
+	if _, ok := s.Index().Lookup("laptop", "Documents"); !ok {
+		t.Fatal("the tree was dropped when the upload finished; TreeDone must not close the connection")
+	}
+	if live := s.Registry().Live(); len(live) != 1 || live[0] != "laptop" {
+		t.Fatalf("Live() = %v, want [laptop]", live)
+	}
+
+	// A second upload over the same connection must be accepted, which also
+	// proves the loop is still reading.
+	sendBatch(t, conn, 4, []proto.NodeJSON{
+		{Path: "Documents/second.txt", Kind: uint8(node.KindFile)},
+	})
+	if _, ok := s.Index().Lookup("laptop", "Documents/second.txt"); !ok {
+		t.Fatal("the connection stopped serving after TreeDone")
+	}
+}
+
+// TestServerRejectsTreeUploadFromViewer pins that only a registered client
+// owns index entries: a viewer supplies nothing, so an upload from one must be
+// refused rather than silently indexed under an empty name.
+func TestServerRejectsTreeUploadFromViewer(t *testing.T) {
+	s, addr := start(t)
+	raw, _ := hello(t, addr, "watcher", proto.RoleViewer, false)
+	defer raw.Close()
+	conn := proto.NewConn(raw)
+
+	body, err := json.Marshal(proto.TreeBatchBody{Nodes: []proto.NodeJSON{
+		{Path: "Documents", Kind: uint8(node.KindDir)},
+	}})
+	if err != nil {
+		t.Fatalf("Marshal batch: %v", err)
+	}
+	if err := conn.Send(proto.Envelope{ID: 2, Kind: proto.KindTreeBatch, Body: body}); err != nil {
+		t.Fatalf("Send batch: %v", err)
+	}
+	env, err := conn.Recv()
+	if err != nil {
+		t.Fatalf("Recv: %v", err)
+	}
+	if env.Err == "" {
+		t.Fatalf("a viewer's tree upload was accepted; reply = %+v", env)
+	}
+	if got := s.Index().Len(); got != 0 {
+		t.Errorf("Len() = %d, want 0: a refused upload must index nothing", got)
+	}
+}
+
+func sendBatch(t *testing.T, conn *proto.Conn, id uint64, nodes []proto.NodeJSON) {
+	t.Helper()
+	body, err := json.Marshal(proto.TreeBatchBody{Nodes: nodes})
+	if err != nil {
+		t.Fatalf("Marshal batch: %v", err)
+	}
+	if err := conn.Send(proto.Envelope{ID: id, Kind: proto.KindTreeBatch, Body: body}); err != nil {
+		t.Fatalf("Send batch: %v", err)
+	}
+	// The server acknowledges every batch; consume it so the next read is the
+	// frame the test is actually waiting for.
+	if _, err := conn.Recv(); err != nil {
+		t.Fatalf("Recv batch ack: %v", err)
+	}
+}
