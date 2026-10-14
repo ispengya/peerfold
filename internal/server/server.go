@@ -7,10 +7,15 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"peerfold/internal/index"
 	"peerfold/internal/proto"
 )
+
+// helloTimeout bounds the handshake only. An established connection is not
+// subject to it: an idle supplier is a legitimate state, not a stalled one.
+const helloTimeout = 30 * time.Second
 
 // Server accepts client connections and owns the aggregated index.
 //
@@ -58,14 +63,11 @@ func (s *Server) Index() *index.Index { return s.ix }
 func (s *Server) Registry() *Registry { return s.reg }
 
 // Serve accepts connections until Close is called. Each connection is served on
-// its own goroutine. The error from a listener closed by Close is reported as
-// nil: that is an ordinary shutdown, not a failure.
+// its own goroutine, and Serve returns only after every one of them has exited:
+// it is the drain point that Close deliberately is not.
 func (s *Server) Serve() error {
 	if s.lnErr != nil {
 		return s.lnErr
-	}
-	if s.ln == nil {
-		return errors.New("server: Serve called on a closed server")
 	}
 
 	for {
@@ -101,8 +103,14 @@ func (s *Server) Serve() error {
 	}
 }
 
-// Close stops the listener and every live connection, then waits for the
-// handlers to finish. It is safe to call more than once.
+// Close stops the listener and closes every live connection, which unblocks the
+// handlers parked in a read.
+//
+// Close does not wait for those handlers to finish: it closes, it returns, and
+// Serve is the point that waits. That split is deliberate, because Serve must
+// not block waiting on connections that only Close can unblock. A caller that
+// never observes Serve's return therefore has no drain point, and should treat
+// the registry and index as possibly still settling for a moment afterwards.
 func (s *Server) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -122,8 +130,6 @@ func (s *Server) Close() error {
 	if ln != nil {
 		err = ln.Close()
 	}
-	// Closing the connections is what unblocks handlers parked in a read; the
-	// WaitGroup is only waited on by Serve, so Close must not block on it.
 	for _, c := range conns {
 		c.Close()
 	}
@@ -142,6 +148,12 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	c := proto.NewConn(conn)
 
+	// A peer that connects and never speaks must not pin this goroutine and a
+	// descriptor forever. The deadline covers only the handshake: an idle but
+	// established supplier is a legitimate state, so the steady-state loop
+	// below runs without one.
+	_ = conn.SetReadDeadline(time.Now().Add(helloTimeout))
+
 	env, err := c.Recv()
 	if err != nil {
 		return
@@ -157,10 +169,18 @@ func (s *Server) handleConn(conn net.Conn) {
 		_ = c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindHello, Err: fmt.Sprintf("bad hello: %v", err)})
 		return
 	}
+	_ = conn.SetReadDeadline(time.Time{})
+
+	if hb.Role != proto.RoleClient && hb.Role != proto.RoleViewer {
+		// An unrecognized role must not be quietly treated as a viewer: that
+		// tells a misconfigured client it succeeded while it supplies nothing.
+		_ = c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindHello, Err: fmt.Sprintf("bad hello: unknown role %q", hb.Role)})
+		return
+	}
 
 	// A viewer only asks questions; it supplies nothing, so it is not a
 	// registry entry and owns no index entries.
-	if hb.Role != proto.RoleClient {
+	if hb.Role == proto.RoleViewer {
 		if err := s.replyHello(c, env.ID, hb.Name, false); err != nil {
 			return
 		}
@@ -180,9 +200,13 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 	// From here on the name owns index entries, so every exit path has to drop
 	// them: a client that reconnects must not inherit a stale tree.
+	//
+	// The index is cleared while the name still owns it, before the name is
+	// released. Releasing first would let a successor register in the gap and
+	// have its freshly applied nodes deleted by this handler's cleanup.
 	defer func() {
-		s.reg.Unregister(hb.Name)
 		s.ix.RemoveClient(hb.Name)
+		s.reg.Unregister(hb.Name)
 	}()
 
 	if err := s.replyHello(c, env.ID, hb.Name, aggregate); err != nil {
@@ -210,7 +234,12 @@ func (s *Server) serveLoop(c *proto.Conn) {
 		env, err := c.Recv()
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-				_ = c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: err.Error()})
+				// Recv reports a read failure with no envelope, so there is no
+				// request to correlate an answer with. Send the diagnostic
+				// out of band — an empty Kind and ID mean "this is not the
+				// reply to anything" — and then close, since the framing is
+				// what just failed.
+				_ = c.Send(proto.Envelope{Err: err.Error()})
 			}
 			return
 		}

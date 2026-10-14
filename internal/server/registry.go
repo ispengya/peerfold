@@ -15,6 +15,9 @@ var ErrDuplicateName = errors.New("server: client name already connected")
 // ErrNoSuchClient reports that a name is not currently connected.
 var ErrNoSuchClient = errors.New("server: no such client")
 
+// ErrEmptyName reports a registration attempt with no name.
+var ErrEmptyName = errors.New("server: client name must not be empty")
+
 // Registry tracks which clients are connected and which one supplies the
 // aggregated tree. The zero value is ready to use.
 //
@@ -30,10 +33,17 @@ type Registry struct {
 
 // Register records name as connected and reports whether it may aggregate.
 //
-// It returns ErrDuplicateName if the name is already connected. When
-// aggregate is requested but another name already holds the role, the result is
-// (false, nil): the caller is connected as a plain supplier.
+// It returns ErrDuplicateName if the name is already connected, and
+// ErrEmptyName if name is empty — an empty name would occupy the aggregate
+// gate while AggregateOwner reported no owner, since "" is the value that
+// means "no owner".
+//
+// When aggregate is requested but another name already holds the role, the
+// result is (false, nil): the caller is connected as a plain supplier.
 func (r *Registry) Register(name string, aggregate bool) (bool, error) {
+	if name == "" {
+		return false, ErrEmptyName
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, dup := r.live[name]; dup {

@@ -181,6 +181,84 @@ func TestServerCloseStopsListening(t *testing.T) {
 	}
 }
 
+// Closing the connections is the only thing that unblocks a handler parked in a
+// read, and Serve — not Close — is the drain point. Without the connection
+// close, a handler stays in Recv forever and Serve never returns.
+func TestServerCloseReleasesParkedHandlers(t *testing.T) {
+	s := server.New("127.0.0.1:0")
+	if s.Addr() == nil {
+		t.Fatal("Addr() is nil before Serve")
+	}
+	addr := s.Addr().String()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- s.Serve() }()
+
+	c, env := hello(t, addr, "a", proto.RoleClient, true)
+	if b := helloOKBody(t, env); !b.Aggregate {
+		t.Fatal("the only client was not granted the aggregate role")
+	}
+	_ = c // leave it open: the handler is now parked in Recv
+
+	live := []string{}
+	waitFor(t, "the client to register", func() bool {
+		live = s.Registry().Live()
+		return len(live) == 1
+	})
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("Serve returned %v after Close, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Serve did not return after Close: a handler is still parked in a read")
+	}
+
+	// Serve only returns once the handlers have exited, so by here the client
+	// must be gone from the registry.
+	if live := s.Registry().Live(); len(live) != 0 {
+		t.Fatalf("Live() = %v after Serve returned, want empty", live)
+	}
+}
+
+// An unrecognized role must be refused rather than quietly granted the viewer
+// path, which would tell a misconfigured client it succeeded.
+func TestServerRejectsUnknownRole(t *testing.T) {
+	s, addr := start(t)
+
+	// Each refusal ends the connection, so each role needs its own.
+	for _, role := range []string{"", "Client", "viewer ", "admin"} {
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("Dial for role %q: %v", role, err)
+		}
+		c.SetDeadline(time.Now().Add(15 * time.Second))
+		conn := proto.NewConn(c)
+
+		body, err := json.Marshal(proto.HelloBody{Name: "a", Role: role})
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		if err := conn.Send(proto.Envelope{ID: 1, Kind: proto.KindHello, Body: body}); err != nil {
+			t.Fatalf("Send for role %q: %v", role, err)
+		}
+		env, err := conn.Recv()
+		if err != nil {
+			t.Fatalf("Recv for role %q: %v", role, err)
+		}
+		if env.Err == "" {
+			t.Errorf("role %q was accepted, want a refusal", role)
+		}
+		c.Close()
+	}
+	if live := s.Registry().Live(); len(live) != 0 {
+		t.Fatalf("Live() = %v, want empty: no rejected hello may register", live)
+	}
+}
+
 func TestServerRejectsNonHelloFirstMessage(t *testing.T) {
 	_, addr := start(t)
 	c, err := net.Dial("tcp", addr)
@@ -247,7 +325,8 @@ func TestServerViewerDisconnectIsHarmless(t *testing.T) {
 	vc, _ := hello(t, addr, "v", proto.RoleViewer, false)
 	vc.Close()
 
-	waitFor(t, "the viewer connection to finish", func() bool { return true })
+	// A viewer is never in the registry, so its departure has nothing to
+	// observe; the sleep gives a (wrong) registration time to show up.
 	time.Sleep(50 * time.Millisecond)
 	if live := s.Registry().Live(); len(live) != 1 || live[0] != "a" {
 		t.Fatalf("Live() = %v, want [a]", live)
