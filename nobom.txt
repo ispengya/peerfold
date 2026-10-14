@@ -1,0 +1,4 @@
+Remove a stray commit message file
+
+commitmsg.txt was staged by git add -A in the previous commit. It is not
+part of the tree.
