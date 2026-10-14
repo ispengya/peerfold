@@ -38,6 +38,20 @@ func TestIsUnder(t *testing.T) {
 		{"/mnt/peerfold", "/mnt/peerfoldX", false},
 		{"/mnt/peerfold", "/mnt/other", false},
 		{"/mnt/peerfold/sub", "/mnt/peerfold", false},
+		// A real entry may be named "..foo". It is not an escape, and a test
+		// of the first two bytes gets this wrong.
+		{"/mnt/peerfold", "/mnt/peerfold/..foo", true},
+		{"/mnt/peerfold", "/mnt/peerfold/..foo/bar", true},
+		// filepath.Rel cleans both arguments first, so a ".." that cancels out
+		// is resolved before the comparison and never reaches the ".."
+		// component test. Recording it here keeps that from being mistaken for
+		// an escape that IsUnder is supposed to catch; the path that does
+		// escape has to survive cleaning.
+		{"/mnt/peerfold", "/mnt/peerfold/..foo/../x", true},
+		{"/mnt/peerfold", "/mnt/peerfold/../../../etc/passwd", false},
+		// A trailing separator on the parent is not a different directory.
+		{"/mnt/peerfold/", "/mnt/peerfold/x", true},
+		{"/mnt/peerfold", "/mnt/peerfold/./x", true},
 	}
 	for _, c := range cases {
 		if got := node.IsUnder(c.parent, c.child); got != c.want {

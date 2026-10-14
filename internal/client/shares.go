@@ -40,6 +40,12 @@ func NewShares(pairs []string, exclude []string) (Shares, error) {
 		if name == "" {
 			return Shares{}, fmt.Errorf("client: share %q has an empty name", pair)
 		}
+		if !validName(name) {
+			// The name becomes the first component of every indexed path, so
+			// a separator or a ".." in it would put a path into the index that
+			// no longer means what it says.
+			return Shares{}, fmt.Errorf("client: share name %q must not be %q or contain %q or %q", name, ".", "/", `\`)
+		}
 		if root == "" {
 			return Shares{}, fmt.Errorf("client: share %q has an empty path", pair)
 		}
@@ -51,9 +57,14 @@ func NewShares(pairs []string, exclude []string) (Shares, error) {
 			return Shares{}, fmt.Errorf("client: share %q: resolve %q: %w", name, root, err)
 		}
 		abs = filepath.Clean(abs)
-		info, err := os.Stat(abs)
+		info, err := os.Lstat(abs)
 		if err != nil {
 			return Shares{}, fmt.Errorf("client: share %q: %w", name, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			// Scan walks with WalkDir, which does not follow a symlinked root.
+			// Accepting one would produce a share header with no contents.
+			return Shares{}, fmt.Errorf("client: share %q: %q is a symlink, not a directory", name, abs)
 		}
 		if !info.IsDir() {
 			return Shares{}, fmt.Errorf("client: share %q: %q is not a directory", name, abs)
@@ -94,6 +105,16 @@ func (s Shares) Excluded(abs string) bool {
 		}
 	}
 	return false
+}
+
+// validName reports whether a share name may become the root of the indexed
+// paths. It must be a single ordinary path component: no separators (which
+// would make it look like a nested path), and not "." or "..".
+func validName(name string) bool {
+	if name == "." || name == ".." {
+		return false
+	}
+	return !strings.ContainsAny(name, `/\`)
 }
 
 // DefaultBatch is the batch size used when a caller passes a non-positive one.

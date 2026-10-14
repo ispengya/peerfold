@@ -3,7 +3,10 @@
 // model.
 package node
 
-import "path/filepath"
+import (
+	"path/filepath"
+	"strings"
+)
 
 // Kind classifies a node. The values are part of the wire protocol: they travel
 // inside proto.NodeJSON.Kind, so they must not be renumbered.
@@ -67,9 +70,13 @@ func IsUnder(parent, child string) bool {
 		// Different volumes on Windows, or otherwise incomparable paths.
 		return false
 	}
-	if rel == "." {
-		return true
+	// A relative path escapes the parent when it is "..", or starts with a
+	// ".." component. It is the component that matters, not the first two
+	// bytes: a real entry may legitimately be named "..foo", and treating
+	// that as an escape would both hide it from an exclusion and make a
+	// legitimate file operation look like a traversal attempt.
+	if rel == ".." {
+		return false
 	}
-	// A relative path escaping the parent begins with "..".
-	return len(rel) < 2 || rel[0] != '.' || rel[1] != '.'
+	return !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
