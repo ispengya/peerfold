@@ -69,6 +69,36 @@ func TestChildrenListsOnlyDirectChildren(t *testing.T) {
 	}
 }
 
+// TestChildrenDoesNotMatchASiblingByPrefix pins that a component is compared as
+// a whole component. "Documents/subway" shares the byte prefix "Documents/sub"
+// but is not under "Documents/sub" at all; a raw prefix comparison would let it
+// through, and Remove-by-prefix would have the same shape of bug in the
+// destructive direction.
+func TestChildrenDoesNotMatchASiblingByPrefix(t *testing.T) {
+	var ix index.Index
+	ix.Apply("win", []node.Node{
+		dir("Documents"),
+		dir("Documents/sub"),
+		file("Documents/sub/b.txt", 5),
+		dir("Documents/subway"),
+		file("Documents/subway/c.txt", 6),
+	})
+
+	got, err := ix.Children("win", "Documents")
+	if err != nil {
+		t.Fatalf("Children: %v", err)
+	}
+	want := []string{"Documents/sub", "Documents/subway"}
+	if len(got) != len(want) {
+		t.Fatalf("Children(Documents) = %v, want %v — both siblings are direct children", paths(got), want)
+	}
+	for i := range want {
+		if got[i].Path != want[i] {
+			t.Fatalf("Children(Documents) = %v, want %v", paths(got), want)
+		}
+	}
+}
+
 func TestChildrenOnFileIsNotADirectory(t *testing.T) {
 	ix, _ := tree()
 	if _, err := ix.Children("win", "Documents/a.txt"); err != index.ErrNotDir {

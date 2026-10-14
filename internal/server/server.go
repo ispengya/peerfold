@@ -280,10 +280,51 @@ func (s *Server) serveLoop(name string, c *proto.Conn) {
 			continue
 		}
 
+		if env.Kind == proto.KindList {
+			if err := s.replyList(c, env); err != nil {
+				return
+			}
+			continue
+		}
+
 		if err := c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: "not implemented"}); err != nil {
 			return
 		}
 	}
+}
+
+// replyList answers one listing request.
+//
+// A listing is available to any connection, including a supplier: reading the
+// aggregated tree is not a privileged operation, and the index is keyed by
+// client name rather than by connection, so a client can list its own tree over
+// the same connection it uploads on.
+func (s *Server) replyList(c *proto.Conn, env proto.Envelope) error {
+	var b proto.ListBody
+	if err := json.Unmarshal(env.Body, &b); err != nil {
+		return c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: fmt.Sprintf("bad list request: %v", err)})
+	}
+	nodes, err := s.Query().List(b.Client, b.Path)
+	if err != nil {
+		return c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: err.Error()})
+	}
+	out := make([]proto.NodeJSON, 0, len(nodes))
+	for _, n := range nodes {
+		out = append(out, proto.NodeJSON{
+			Path:  n.Path,
+			Kind:  uint8(n.Kind),
+			Size:  n.Size,
+			Mode:  n.Mode,
+			Mtime: n.Mtime,
+		})
+	}
+	body, err := json.Marshal(proto.ListOKBody{Nodes: out})
+	if err != nil {
+		// A marshal failure is the server's fault, not the request's, so it is
+		// reported as an ordinary error rather than a framing failure.
+		return c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: fmt.Sprintf("encode list reply: %v", err)})
+	}
+	return c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindListOK, Body: body})
 }
 
 // applyBatch indexes one tree batch for the named client.
