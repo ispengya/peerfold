@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"peerfold/internal/index"
+	"peerfold/internal/node"
 	"peerfold/internal/proto"
 )
 
@@ -184,7 +185,9 @@ func (s *Server) handleConn(conn net.Conn) {
 		if err := s.replyHello(c, env.ID, hb.Name, false); err != nil {
 			return
 		}
-		s.serveLoop(c)
+		// A viewer has no name in the registry, so it owns no index entries
+		// and cannot upload a tree.
+		s.serveLoop("", c)
 		return
 	}
 
@@ -212,7 +215,7 @@ func (s *Server) handleConn(conn net.Conn) {
 	if err := s.replyHello(c, env.ID, hb.Name, aggregate); err != nil {
 		return
 	}
-	s.serveLoop(c)
+	s.serveLoop(hb.Name, c)
 }
 
 // replyHello answers a hello with the server's ruling on the aggregate role.
@@ -226,10 +229,12 @@ func (s *Server) replyHello(c *proto.Conn, id uint64, name string, aggregate boo
 
 // serveLoop answers whatever arrives until the peer disconnects or misbehaves.
 //
-// Every kind but hello is unimplemented in this task, and an unknown or
-// malformed frame ends the connection: continuing to read a stream whose
-// framing is in doubt is how a peer desynchronises silently.
-func (s *Server) serveLoop(c *proto.Conn) {
+// A tree upload is indexed batch by batch as it arrives, so the aggregated tree
+// grows during the upload instead of appearing all at once at the end.
+//
+// name is the registered client this connection owns index entries for, or ""
+// for a viewer, which owns none.
+func (s *Server) serveLoop(name string, c *proto.Conn) {
 	for {
 		env, err := c.Recv()
 		if err != nil {
@@ -243,8 +248,65 @@ func (s *Server) serveLoop(c *proto.Conn) {
 			}
 			return
 		}
+
+		if env.Kind == proto.KindTreeBatch {
+			if err := s.applyBatch(name, env); err != nil {
+				_ = c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: err.Error()})
+				return
+			}
+			// Every batch is acknowledged, and the acknowledgement matters:
+			// it is what keeps a client that uploads a large tree from
+			// streaming into a socket nobody is draining, which would wedge
+			// both ends once the buffers fill. It carries no request ID
+			// because it is a flow-control token, not a reply to correlate.
+			if err := c.Send(proto.Envelope{}); err != nil {
+				return
+			}
+			continue
+		}
+
+		// TreeDone closes the upload. Its reply is the acknowledgement the client
+		// waits for, which is what makes "Err == nil" mean the whole tree is
+		// indexed rather than merely written to a socket.
+		//
+		// The loop keeps going: ending the upload is not the same as ending the
+		// connection. A client that disconnects here would lose the very tree it
+		// just published, because the index belongs to the connection and is
+		// dropped when this handler returns.
+		if env.Kind == proto.KindTreeDone {
+			if err := c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind}); err != nil {
+				return
+			}
+			continue
+		}
+
 		if err := c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: "not implemented"}); err != nil {
 			return
 		}
 	}
+}
+
+// applyBatch indexes one tree batch for the named client.
+func (s *Server) applyBatch(name string, env proto.Envelope) error {
+	if name == "" {
+		// Only a registered client owns index entries, so a viewer or an
+		// unregistered connection may not write any.
+		return errors.New("tree upload is only available to a registered client")
+	}
+	var b proto.TreeBatchBody
+	if err := json.Unmarshal(env.Body, &b); err != nil {
+		return fmt.Errorf("bad tree batch: %w", err)
+	}
+	nodes := make([]node.Node, 0, len(b.Nodes))
+	for _, n := range b.Nodes {
+		nodes = append(nodes, node.Node{
+			Path:  n.Path,
+			Kind:  node.Kind(n.Kind),
+			Size:  n.Size,
+			Mode:  n.Mode,
+			Mtime: n.Mtime,
+		})
+	}
+	s.ix.Apply(name, nodes)
+	return nil
 }

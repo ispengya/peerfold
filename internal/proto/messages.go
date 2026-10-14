@@ -65,8 +65,16 @@ type NodeJSON struct {
 	Mtime int64  `json:"mtime"`
 }
 
+// TreeBatchBody carries one batch of a client's scanned tree. A large tree is
+// several of these, and the server indexes each batch as it arrives rather than
+// waiting for the end, so the aggregated tree grows while the upload runs.
+type TreeBatchBody struct {
+	Nodes []NodeJSON `json:"nodes"`
+}
+
 // TreeDoneBody closes a tree upload and lists the share names the client
-// declared.
+// declared. It is the last message of an upload, and the server's reply to it
+// is the upload's acknowledgement.
 type TreeDoneBody struct {
 	Shares []string `json:"shares"`
 }
