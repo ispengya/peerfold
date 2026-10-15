@@ -280,6 +280,87 @@ func TestServerWriteRejectedRequestKeepsTheAnswerShape(t *testing.T) {
 	}
 }
 
+// drainFloor is the shortest wait the drain can produce, used to tell a server
+// that waited for its bound from one that skipped the wait. It sits below the
+// server's drain timeout with room for a slow machine, since the only wrong
+// answer this has to exclude is "no wait at all" — not an exact duration.
+const drainFloor = 3 * time.Second
+
+// TestServerAnswersAContentlessPutAnnouncement pins that a refusal does not wait
+// for content that is never coming.
+//
+// Every refusal in the table above is answered after its content has been read
+// off, because a put's bytes are already on the wire by the time the server looks
+// at the announcement. But the announcement is the only thing on the wire when a
+// requester is refused before it sends any: an empty path is rejected on sight.
+// The server still has to drain the stream it thinks is coming — and a drain with
+// no deadline waits for as long as the requester stays silent, which is for ever.
+// One such request parks this handler, this connection and its write lock, and
+// the whole connection stops answering anything.
+//
+// The request here is a bare announcement with no content and no marker. The
+// server has to give up and answer anyway.
+//
+// The answer only arrives once the drain's bound has expired, so this test also
+// pins that the server waits for it. That is not incidental: a server that
+// answered the announcement without waiting would pass a test that only asked
+// for an answer, and it would be the worse behaviour — it would leave the
+// requester's content on the connection to be read as the next request. The
+// floor is what distinguishes "gave up and answered" from "never waited".
+func TestServerAnswersAContentlessPutAnnouncement(t *testing.T) {
+	_, addr := start(t)
+
+	viewer, _ := hello(t, addr, "me", "viewer", false)
+	defer viewer.Close()
+	conn := proto.NewConn(viewer)
+
+	// Send, not SendAnnounced: this is the bare frame, deliberately without the
+	// content stream that would follow it. The empty path makes the server refuse
+	// it before it ever wants content.
+	//
+	// The path has to be empty. A refusal that is decided later — an unknown
+	// client, say — is answered from a different branch that never drains at all,
+	// and such a request would be answered at once with or without a bound, which
+	// makes it useless as a probe.
+	start := time.Now()
+	env := proto.Envelope{ID: 31, Kind: proto.KindWrite, Body: []byte(`{"client":"win","path":"","mode":"put"}`)}
+	if err := conn.Send(env); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	// The ceiling is generous compared with the server's own drain timeout, on
+	// purpose: this asserts that an answer arrives at all, and the exact value is
+	// the server's business. Without a deadline the answer never comes, which this
+	// turns into a failure rather than a hung test binary.
+	done := make(chan proto.Envelope, 1)
+	go func() {
+		e, err := conn.Recv()
+		if err == nil {
+			done <- e
+		}
+	}()
+
+	select {
+	case got := <-done:
+		if got.ID != 31 {
+			t.Fatalf("answer ID = %d, want 31", got.ID)
+		}
+		if !strings.Contains(got.Err, "path is required") {
+			t.Fatalf("answer = %+v, want the refusal to name the empty path", got)
+		}
+		// The floor. The drain cannot finish before its bound expires, because
+		// nothing is coming, so an answer that arrives sooner means the drain was
+		// skipped and the content it was supposed to absorb is still on the wire.
+		if elapsed := time.Since(start); elapsed < drainFloor {
+			t.Fatalf("answer after %s, want at least %s: "+
+				"the drain did not run, so the requester's content is still unread",
+				elapsed, drainFloor)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("no answer to a contentless put announcement: the drain has no deadline")
+	}
+}
+
 // TestServerRenameIsForwardedWithoutAShareCheck pins the boundary of what this
 // layer decides.
 //

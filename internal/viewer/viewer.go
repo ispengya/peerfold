@@ -23,6 +23,18 @@ const dialTimeout = 10 * time.Second
 // answers would otherwise hang the CLI for ever on a wedged server.
 const callTimeout = 30 * time.Second
 
+// ErrCrossClient reports that a rename named two different clients, which cannot
+// be carried out: two clients share no filesystem, so there is nowhere for the
+// file to move to.
+//
+// It is a sentinel rather than a message because this refusal is made locally,
+// before any frame is sent — unlike the reasons that travel back from an owner,
+// which arrive as strings in an answer's error field and cannot be compared. A
+// caller can therefore test it with errors.Is, and the next plan's mount layer
+// can map it to the cross-device error a filesystem is expected to return for a
+// rename it cannot perform.
+var ErrCrossClient = errors.New("viewer: rename across clients")
+
 // Viewer is a read-only connection to a server.
 //
 // One request is in flight at a time. The protocol has a single connection with
@@ -304,7 +316,7 @@ func (v *Viewer) readContent(id uint64) ([]byte, error) {
 		if err := v.conn.SetReadDeadline(time.Now().Add(callTimeout)); err != nil {
 			return nil, err
 		}
-		chunk, done, err := v.pc.RecvData(id)
+		chunk, done, err := v.pc.RecvDataEvent(id, v.publishEvent)
 		if err != nil {
 			return nil, err
 		}
@@ -441,7 +453,10 @@ func (v *Viewer) Rename(oldPath, newPath string) error {
 		// refusal lived only there, this request would be indistinguishable from
 		// a legitimate rename of two identically spelled paths and would be
 		// carried out. This is the only party that still knows.
-		return fmt.Errorf("viewer: rename %q to %q: the two ends are on different clients (%q and %q): a rename stays inside one client",
+		//
+		// Wrapped rather than formatted: this is the one refusal a caller can
+		// still identify, because it is decided here instead of on the wire.
+		return fmt.Errorf("%w %q to %q: %q and %q", ErrCrossClient,
 			oldPath, newPath, oldClient, newClient)
 	}
 	return v.stream(func() error {
@@ -575,11 +590,27 @@ func (v *Viewer) recvBody(env proto.Envelope, id uint64, what string) ([]byte, e
 		return nil, fmt.Errorf("viewer: %s: %w", what, err)
 	}
 	defer v.conn.SetReadDeadline(time.Time{})
-	body, err := v.pc.RecvBody(id)
-	if err != nil {
-		return nil, fmt.Errorf("viewer: %s: %w", what, err)
+	// RecvBody is not used here because it reads with RecvData, which has nowhere
+	// to put a pushed update and therefore drops one. An update can land between
+	// two chunks of a reply's body just as easily as before its head, and this is
+	// a body read: the same reasoning as the head read above, applied to the
+	// bytes.
+	//
+	// A truncation notice is the other thing this must not drop. Nothing on this
+	// connection puts one on a listing's body today, but the moment something
+	// does, a body read that discards it turns a cut-short listing into a
+	// complete one — the failure this whole design exists to prevent.
+	var body []byte
+	for {
+		chunk, done, err := v.pc.RecvDataEvent(id, v.publishEvent)
+		if err != nil {
+			return nil, fmt.Errorf("viewer: %s: %w", what, err)
+		}
+		if done {
+			return body, nil
+		}
+		body = append(body, chunk...)
 	}
-	return body, nil
 }
 
 // Close drops the connection. A viewer owns nothing on the server, so there is

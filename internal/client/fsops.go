@@ -220,7 +220,30 @@ func (f *FS) replaceAtomically(share, rel string, sink func(io.Writer) error, ve
 		_ = os.Remove(tmp)
 		return fmt.Errorf("client: replacing %q: %w", rel, err)
 	}
+	f.syncDir(filepath.Dir(full))
 	return nil
+}
+
+// syncDir flushes a directory entry to the medium, best effort.
+//
+// Syncing the file's contents is not enough to make the rename durable: the
+// bytes can be on the medium while the directory entry still names the old file,
+// so a crash immediately after a successful put would lose it. The rename itself
+// has to be flushed, and that is done by syncing the directory that holds it.
+//
+// Failure is deliberately not reported. The content is already durable and the
+// rename has already succeeded, so there is nothing to roll back and nothing the
+// caller could do differently; a directory that cannot be opened or synced (some
+// filesystems do not permit it) is not a reason to report a write as failed. The
+// cost of being wrong is a lost name after a power cut, against a successful
+// write reported as an error, which is the worse of the two.
+func (f *FS) syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	_ = d.Close()
 }
 
 // Create makes a new empty file, and refuses if the path is already taken.

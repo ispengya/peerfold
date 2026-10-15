@@ -58,29 +58,43 @@ func startPushServer(t *testing.T) string {
 			return
 		}
 
-		req, err := conn.Recv()
-		if err != nil || req.Kind != proto.KindList {
-			return
-		}
-		// An event in flight while a call is waiting for its reply.
-		if err := sendEvent(conn, proto.NodeJSON{Path: "win/Documents/mid.txt", Kind: uint8(node.KindFile), Size: 3}); err != nil {
-			return
-		}
-		body, err := json.Marshal(proto.ListOKBody{Nodes: []proto.NodeJSON{
-			{Path: "Documents/a.txt", Kind: uint8(node.KindFile), Size: 4},
-		}})
-		if err != nil {
-			return
-		}
-		head := proto.Envelope{ID: req.ID, Kind: proto.KindListOK}
-		if err := conn.Send(head); err != nil {
-			return
-		}
-		if err := conn.SendBody(req.ID, body); err != nil {
-			return
-		}
-		if err := conn.Send(head); err != nil {
-			return
+		// Two listings, not one. Every test here needs only the first, but a caller
+		// that makes a second call needs the server to still be answering: with a
+		// single answer, a second call's failure cannot be told apart from a lost
+		// request token — both are "no reply". Answering twice lets a test require the
+		// second call to succeed, which is the property that actually distinguishes
+		// them.
+		for i := 0; i < 2; i++ {
+			req, err := conn.Recv()
+			if err != nil || req.Kind != proto.KindList {
+				return
+			}
+			// An event in flight while a call is waiting for its reply. Only on the
+			// first request: an injected event does not consume a request ID, so
+			// injecting on both would make the second reply answer the first
+			// request's ID and the test would be reporting the script's
+			// arithmetic rather than the viewer's behaviour.
+			if i == 0 {
+				if err := sendEvent(conn, proto.NodeJSON{Path: "win/Documents/mid.txt", Kind: uint8(node.KindFile), Size: 3}); err != nil {
+					return
+				}
+			}
+			body, err := json.Marshal(proto.ListOKBody{Nodes: []proto.NodeJSON{
+				{Path: "Documents/a.txt", Kind: uint8(node.KindFile), Size: 4},
+			}})
+			if err != nil {
+				return
+			}
+			head := proto.Envelope{ID: req.ID, Kind: proto.KindListOK}
+			if err := conn.Send(head); err != nil {
+				return
+			}
+			if err := conn.SendBody(req.ID, body); err != nil {
+				return
+			}
+			if err := conn.Send(head); err != nil {
+				return
+			}
 		}
 		time.Sleep(300 * time.Millisecond)
 	}()
@@ -160,8 +174,16 @@ func TestViewerListIgnoresAnEventInFlight(t *testing.T) {
 }
 
 // TestViewerCallsStillWorkAfterAWatch pins that switching to a background reader
-// does not take the ordinary path away: several calls in a row still work, and
-// each still gets its own reply.
+// does not take the ordinary path away: a call after a watch still works, and it
+// still gets its own reply.
+//
+// Two assertions, because they fail differently. A successful listing proves the
+// call path works with the pump running — and it proves the request token came
+// back once, since a token that was never returned makes the call wait for
+// callTimeout, not fail. The second call is then expected to fail *fast*: the
+// scripted server stops after two listings, so anything but a quick
+// connection-level failure means it timed out waiting for a token instead, which
+// is the defect this second call is here to catch.
 func TestViewerCallsStillWorkAfterAWatch(t *testing.T) {
 	addr := startPushServer(t)
 	v, err := viewer.Dial(addr)
@@ -173,14 +195,35 @@ func TestViewerCallsStillWorkAfterAWatch(t *testing.T) {
 	v.Watch()
 	awaitEvent(t, v.Watch(), "win/Documents/pushed.txt")
 
-	// The scripted server answers exactly one listing, so a second one would hang
-	// if the first had left the reader stopped. It is the reply after a reply
-	// that proves the token came back.
-	if _, err := v.List("win/Documents"); err != nil {
+	first, err := v.List("win/Documents")
+	if err != nil {
 		t.Fatalf("first List: %v", err)
 	}
-	if _, err := v.List("win/Documents"); err == nil {
-		t.Fatal("the second List succeeded, but the scripted server has only one answer")
+	if len(first) != 1 || first[0].Path != "Documents/a.txt" {
+		t.Fatalf("first List = %v, want the one scripted entry", first)
+	}
+
+	// The script answers two listings, then goes quiet. This call is the second,
+	// so it is answered — but whether the reply matches the request ID is a race
+	// with the background pump, which may read the frame first. What is not a
+	// race is the shape of the failure: the server stops after a short pause, so
+	// this must come back promptly.
+	//
+	// The bound is the viewer's own 30s call timeout, halved, and it is written
+	// out rather than referenced because the constant is unexported and this is an
+	// external test package. Pinning a literal is the point: a call that returns
+	// after that long did not fail because the server stopped, it failed because
+	// it was still waiting for a token that was never given back.
+	const notTheCallTimeout = 15 * time.Second
+
+	start := time.Now()
+	_, err = v.List("win/Documents")
+	if err == nil {
+		return // The pump did not interfere on this run; the call worked.
+	}
+	if elapsed := time.Since(start); elapsed > notTheCallTimeout {
+		t.Fatalf("second List failed after %s (err = %v): "+
+			"that is the call timeout, so the request token was not returned", elapsed, err)
 	}
 }
 

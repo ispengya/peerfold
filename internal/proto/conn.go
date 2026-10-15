@@ -343,7 +343,14 @@ func (c *Conn) sendStreamErrorLocked(id uint64, cause error) {
 	if c.werr != nil {
 		return
 	}
-	_ = WriteFrame(c.rw, FrameControl, payload)
+	if err := WriteFrame(c.rw, FrameControl, payload); err != nil {
+		// Remembered like every other write failure. The first write error is
+		// terminal for this connection, and a notice that failed to reach the
+		// peer is one the peer will never act on — so leaving werr clear would
+		// let the next writer attempt a connection already known to be broken
+		// and report its own unrelated failure instead of this one.
+		c.werr = err
+	}
 }
 
 // SendAnnounced writes a request frame and then, while still holding the write

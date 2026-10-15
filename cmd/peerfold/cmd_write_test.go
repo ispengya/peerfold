@@ -255,6 +255,11 @@ func TestMvCLIRenamesTheFile(t *testing.T) {
 
 // TestMvCLIAcrossClientsFails pins that a cross-client move is refused at the
 // CLI rather than silently becoming a copy.
+//
+// The wording is asserted, not just the exit code. Without the refusal this
+// request degrades into a self-rename the owner accepts — the two paths are
+// stripped of their client names and arrive identical — so a non-zero exit on
+// its own would not say the refusal happened for the right reason.
 func TestMvCLIAcrossClientsFails(t *testing.T) {
 	cfg, _ := cliWriteFixture(t)
 
@@ -263,8 +268,9 @@ func TestMvCLIAcrossClientsFails(t *testing.T) {
 	if code == 0 {
 		t.Fatal("run(mv across clients) = 0, want non-zero")
 	}
-	if errOut.Len() == 0 {
-		t.Fatal("stderr is empty")
+	got := errOut.String()
+	if !strings.Contains(got, "win") || !strings.Contains(got, "linux") {
+		t.Fatalf("stderr = %q, want the cross-client refusal naming both clients", got)
 	}
 }
 

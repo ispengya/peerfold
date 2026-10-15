@@ -164,7 +164,22 @@ func (r *Router) deliver(name string, env proto.Envelope) bool {
 // been read.
 //
 // It reports whether this envelope answered an outstanding request.
-func (r *Router) complete(name string, env proto.Envelope) bool {
+func (r *Router) complete(name string, env proto.Envelope, onEvent func(proto.Envelope)) bool {
+	// A pushed update can land in the middle of an answer, and it is not a
+	// reason to lose it. The owner sends its answer as several frames — a head, a
+	// stream, a closing frame — and its watcher may emit between any two of them.
+	// A body read with nowhere to put an event drops it, and a dropped event is
+	// permanent: nothing rescans, so the index would stay wrong until the client
+	// reconnected. That is the aggregate's only source of truth silently
+	// disagreeing with the supplier's disk.
+	//
+	// The caller supplies the handler because applying an event needs the name it
+	// belongs to and the index to apply it to, and the router has neither.
+	handle := onEvent
+	if handle == nil {
+		handle = func(proto.Envelope) {}
+	}
+
 	r.mu.Lock()
 	link, ok := r.clients[name]
 	if !ok {
@@ -177,8 +192,8 @@ func (r *Router) complete(name string, env proto.Envelope) bool {
 		// still on the wire, so it is read off before control frames can be read
 		// again.
 		r.mu.Unlock()
-		_ = pumpStream(link.conn, env.ID, nil)
-		_, _ = link.conn.Recv()
+		_ = pumpStream(link.conn, env.ID, nil, handle)
+		_, _ = link.conn.RecvEvent(handle)
 		return true
 	}
 	streaming := f.streaming
@@ -194,7 +209,7 @@ func (r *Router) complete(name string, env proto.Envelope) bool {
 	// alternative — reading frames until something looks like a control frame —
 	// would make the frame count depend on the bytes inside a file.
 	var body []byte
-	readErr := pumpStream(link.conn, env.ID, &body)
+	readErr := pumpStream(link.conn, env.ID, &body, handle)
 	if readErr != nil {
 		// The frame is still delivered, with the reading failure attached: a
 		// truncated file and a complete one must not look the same.
@@ -208,7 +223,11 @@ func (r *Router) complete(name string, env proto.Envelope) bool {
 	// the connection at a frame boundary — a part of an answer left unread becomes
 	// the next control frame, and the following request is then parsed out of this
 	// answer's middle.
-	if _, err := link.conn.Recv(); err != nil {
+	//
+	// RecvEvent, not Recv: this is the other place an update can land, and Recv
+	// would skip it into nothing. What is read here is the closing frame either
+	// way — the difference is only what happens to an event that arrives first.
+	if _, err := link.conn.RecvEvent(handle); err != nil {
 		// The connection ended inside the answer. The answer is already complete
 		// and is handed over as such; there is nothing left to read next, so the
 		// serve loop will see the end of the connection on its own.
@@ -231,9 +250,9 @@ func (r *Router) complete(name string, env proto.Envelope) bool {
 // a file that may be far larger than memory. The peer's end marker is what ends
 // the stream, so an answer with no content is an empty stream and its reason
 // travels in the control frame that precedes it.
-func pumpStream(from *proto.Conn, fromID uint64, body *[]byte) error {
+func pumpStream(from *proto.Conn, fromID uint64, body *[]byte, onEvent func(proto.Envelope)) error {
 	for {
-		chunk, done, err := from.RecvData(fromID)
+		chunk, done, err := from.RecvDataEvent(fromID, onEvent)
 		if err != nil {
 			return err
 		}

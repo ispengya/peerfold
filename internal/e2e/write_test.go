@@ -240,11 +240,12 @@ func TestE2ERemoveRefusesANonEmptyDirectory(t *testing.T) {
 // TestE2ERenameAcrossClientsIsRefused pins that a cross-client rename is an error
 // naming the condition, not a copy dressed up as a rename.
 //
-// The refusal is the requester's, and the assertion is on the message rather
-// than on errors.Is: the reason crosses the wire as a string in the answer's
-// error field, so the value the viewer returns is a new error made from that
-// text and no error identity can survive the trip. What has to hold is that the
-// operation is refused and that nothing moved.
+// The refusal is the requester's own, made before any frame is sent, so it keeps
+// its identity: errors.Is works here where it cannot for a reason that came back
+// from an owner. That distinction is the point of viewer.ErrCrossClient, and it
+// is this test's job to hold it — the reason the value exists is that the next
+// plan's mount layer has to map it to the filesystem's own cross-device error,
+// which is impossible from a string.
 func TestE2ERenameAcrossClientsIsRefused(t *testing.T) {
 	_, addr := startServer(t)
 	winRoot := share(t, "Documents", map[string]string{"a.txt": "aaaa"})
@@ -257,8 +258,13 @@ func TestE2ERenameAcrossClientsIsRefused(t *testing.T) {
 	if err == nil {
 		t.Fatal("Rename across clients = nil, want a refusal")
 	}
-	if !strings.Contains(err.Error(), "different clients") {
-		t.Fatalf("Rename across clients = %v, want it to name the cross-client reason", err)
+	if !errors.Is(err, viewer.ErrCrossClient) {
+		t.Fatalf("Rename across clients = %v, want it to be viewer.ErrCrossClient", err)
+	}
+	// The message still has to say what happened: the sentinel is for callers,
+	// and a user reads the text.
+	if !strings.Contains(err.Error(), "win") || !strings.Contains(err.Error(), "linux") {
+		t.Fatalf("Rename across clients = %v, want it to name both clients", err)
 	}
 	// Neither machine may have changed: a refusal must not leave a copy behind
 	// on the far side, and it must not move the original either.
@@ -355,6 +361,64 @@ func TestE2EWritesRefuseAPathThatEscapesTheShare(t *testing.T) {
 	}
 	if _, err := os.Stat(outside); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("a write escaped the share root (err = %v)", err)
+	}
+}
+
+// TestE2ERefusedWritesLeaveTheClientAliveAndInTheTree pins the blast radius of a
+// refusal.
+//
+// A refusal that does not consume the content is not a local failure. The data
+// frames stay queued in front of the client's answer, so the client's read loop
+// reads a data frame where it expects a control frame, exits, and the server
+// withdraws every node that client published — for a mistyped path, a name that
+// already exists, or a path that escapes the share. The three cases below are
+// ordinary user errors, and each is followed by a request that has to still work.
+func TestE2ERefusedWritesLeaveTheClientAliveAndInTheTree(t *testing.T) {
+	_, addr := startServer(t)
+	docsRoot := share(t, "Documents", map[string]string{"keep.txt": "keep"})
+	join(t, addr, "win", "Documents="+docsRoot)
+	v := dialViewer(t, addr)
+
+	cases := []struct {
+		what string
+		do   func() error
+	}{
+		{"an unknown share", func() error {
+			return v.Put("win/NoSuchShare/file.txt", strings.NewReader("data"))
+		}},
+		{"a path that escapes the share", func() error {
+			return v.Put("win/Documents/../escaped.txt", strings.NewReader("data"))
+		}},
+		{"--exclusive on a name that is taken", func() error {
+			return v.PutExclusive("win/Documents/keep.txt", strings.NewReader("data"))
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.what, func(t *testing.T) {
+			if err := tc.do(); err == nil {
+				t.Fatalf("Put with %s = nil, want a refusal", tc.what)
+			}
+			// The client is still connected and still in the tree: the refusal
+			// was about one request, not about this client existing.
+			if _, err := v.List("win/Documents"); err != nil {
+				t.Fatalf("List after a refused put (%s): %v: the refusal cost the client its connection", tc.what, err)
+			}
+			if _, err := v.List(""); err != nil {
+				t.Fatalf("List(\"\") after a refused put (%s): %v", tc.what, err)
+			}
+			// And a write that should work still does, on the same connection.
+			if err := v.Put("win/Documents/after.txt", strings.NewReader("after")); err != nil {
+				t.Fatalf("Put after a refused put (%s): %v: the connection is out of step", tc.what, err)
+			}
+			if got := onDisk(t, docsRoot, "after.txt"); got != "after" {
+				t.Fatalf("after.txt = %q, want %q", got, "after")
+			}
+		})
+	}
+
+	// The file that --exclusive refused must be untouched.
+	if got := onDisk(t, docsRoot, "keep.txt"); got != "keep" {
+		t.Fatalf("keep.txt = %q, want it untouched by the refused exclusive put", got)
 	}
 }
 

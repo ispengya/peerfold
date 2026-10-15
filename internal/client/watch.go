@@ -335,8 +335,18 @@ func (w *watch) handle(ev fsnotify.Event) {
 
 // send hands a batch to emit, ignoring a failure.
 //
-// A failed emit is not retried and is not fatal. The watching client keeps
-// running either way, and the next periodic scan is what repairs the index.
+// A failed emit is not retried and is not fatal: the client keeps running, and
+// the connection is still serving reads and writes. What it is not is repaired.
+// There is no periodic rescan in v1 — the index is seeded once by the upload and
+// then only ever moved by these events — so a batch that fails here leaves the
+// server's tree describing the state before that change, and the change stays
+// invisible until something else touches the same path or the client reconnects.
+// The same is true of an fsnotify overflow, where the kernel drops events because
+// the buffer filled.
+//
+// That is a real limitation rather than a safety net, and it is written down in
+// docs/peerfold-cli.md. The fix is a periodic Scan-and-diff, which this version
+// does not have.
 func (w *watch) send(nodes []node.Node) {
 	if len(nodes) == 0 {
 		return
