@@ -153,6 +153,11 @@ func TestRunDispatchesEveryKnownCommand(t *testing.T) {
 	_ = []string{} // stubs, if any return
 
 	// These reach their real implementations, which reject the missing input.
+	//
+	// `mount` is driven through its own missing-server rejection rather than the
+	// plain-args loop here, because with no arguments it would fall back to the
+	// real config path and a real default mount point; the loop below stays for
+	// the commands whose bare form is safely inert.
 	for _, cmd := range []string{"client", "ls", "cat", "put", "mkdir", "rm", "mv"} {
 		var out, errOut bytes.Buffer
 		if code := runWithEmptyStdin([]string{cmd}, &out, &errOut); code == 0 {
@@ -177,5 +182,17 @@ func TestRunDispatchesEveryKnownCommand(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "usage: peerfold server") {
 		t.Errorf("stderr = %q, want the server usage text: the dispatch arm did not reach cmd_server.go", errOut.String())
+	}
+
+	// `mount` reaches for the network, so it is driven with a server address that
+	// cannot answer rather than with no arguments -- and the point is the code
+	// path, not the failure: a missing dispatch arm would be refused as an unknown
+	// command before it ever dialled.
+	var mOut, mErr bytes.Buffer
+	if code := runWithEmptyStdin([]string{"mount", "--server", "127.0.0.1:1", "--mount", filepath.Join(t.TempDir(), "mp")}, &mOut, &mErr); code == 2 && strings.Contains(mErr.String(), "unknown command") {
+		t.Errorf("runWithEmptyStdin([mount]) = %q, want the command to be dispatched", mErr.String())
+	}
+	if strings.Contains(mErr.String(), "TODO") {
+		t.Errorf("runWithEmptyStdin([mount]) stderr = %q, want the real implementation", mErr.String())
 	}
 }

@@ -10,6 +10,12 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
+// commands are the words this program accepts, in the order usageText lists
+// them. dispatch uses a switch rather than ranging over this, so the two are
+// separate lists; dispatcherKnows reads this one and the usage text, which is
+// what lets a test catch a command that is documented and not implemented.
+var commands = []string{"server", "client", "mount", "ls", "cat", "put", "mkdir", "rm", "mv"}
+
 // run dispatches one command line and returns the process exit code, so
 // tests can drive the CLI without spawning a process.
 //
@@ -23,11 +29,18 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 
 	cmd, rest := args[0], args[1:]
+	return dispatch(cmd, rest, stdin, stdout, stderr)
+}
+
+// dispatch runs one command and returns the process exit code.
+func dispatch(cmd string, rest []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	switch cmd {
 	case "server":
 		return cmdServer(rest, stdout, stderr)
 	case "client":
 		return cmdClient(rest, stdout, stderr)
+	case "mount":
+		return cmdMount(rest, stdout, stderr)
 	case "ls", "cat", "put", "mkdir", "rm", "mv":
 		return cmdTree(cmd, rest, stdin, stdout, stderr)
 	default:
@@ -35,6 +48,16 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		usage(stderr)
 		return 2
 	}
+}
+
+// dispatcherKnows reports whether cmd is one of the words this program accepts.
+func dispatcherKnows(cmd string) bool {
+	for _, c := range commands {
+		if c == cmd {
+			return true
+		}
+	}
+	return false
 }
 
 func usage(w io.Writer) {
@@ -46,6 +69,7 @@ const usageText = `usage: peerfold <command> [args]
 commands:
   server  run the aggregation server
   client  join a server and share local directories
+  mount   mount the federated tree as a directory
   ls      list the aggregated tree
   cat     print a file from the aggregated tree
   put     write stdin to a file in the aggregated tree

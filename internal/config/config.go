@@ -18,13 +18,45 @@ type Config struct {
 	ClientName string            `json:"client_name"`
 	Shares     map[string]string `json:"shares"`
 	Aggregate  bool              `json:"aggregate"`
+
+	// MountPoint is where `peerfold mount` mounts when --mount is not given.
+	// Empty means "the platform's default", which is resolved at mount time
+	// rather than stored: the default is under the user's home directory, and
+	// writing an absolute path into a config file makes the file wrong as soon as
+	// it is copied to another machine.
+	MountPoint string `json:"mount_point"`
+
+	// BufferLimit and BufferTotal are the D3 pair: the read cache for one open
+	// file and for all of them together. Zero means "use the mount package's
+	// default", which is what an omitted key gets.
+	//
+	// They are in the config at all because the right numbers depend on the
+	// machine: a 4 GiB laptop and a 64 GiB workstation should not be told the
+	// same limits by a program that could have asked.
+	BufferLimit int `json:"buffer_limit"`
+	BufferTotal int `json:"buffer_total"`
 }
 
 // Default returns the values used when no config file exists yet.
+//
+// The buffer numbers are the mount package's defaults written down, not a
+// second opinion. They are duplicated rather than imported so that this package
+// stays free of the mount package's dependencies, and the consequence is that
+// changing either one alone leaves the pair disagreeing;
+// TestConfigMountDefaultsAgreeWithTheMount in cmd/peerfold fails when that
+// happens, which is where the pair can be compared without the import.
 func Default() Config {
 	return Config{
 		Listen: ":7000",
 		Shares: map[string]string{},
+
+		// Left empty because it is resolved from the home directory at mount
+		// time: a stored absolute path is wrong as soon as the config is copied
+		// to another machine.
+		MountPoint: "",
+
+		BufferLimit: 64 << 20,
+		BufferTotal: 256 << 20,
 	}
 }
 
