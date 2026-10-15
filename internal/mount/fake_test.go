@@ -77,7 +77,7 @@ type fakeCaller struct {
 
 	// watchCh is created on first use by Watch, so a test can hold the channel
 	// before the core starts watching and drive it afterwards.
-	watchCh chan []node.Node
+	watchCh chan Batch
 }
 
 // fakeCaller implements Caller. Asserted here rather than relied on implicitly
@@ -446,18 +446,19 @@ func (f *fakeCaller) Rename(oldPath, newPath string) error {
 
 // scriptedWatch makes Watch's behaviour controllable, so the reconnect tests
 // can close the channel and assert on what the core does about it.
-func (f *fakeCaller) Watch() <-chan []node.Node {
+func (f *fakeCaller) Watch() <-chan Batch {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.watchCh == nil {
-		f.watchCh = make(chan []node.Node, 16)
+		f.watchCh = make(chan Batch, 16)
 	}
 	return f.watchCh
 }
 
 // emit pushes a change onto the watch channel without blocking for ever, which
-// mirrors the viewer's own non-blocking emit.
-func (f *fakeCaller) emit(nodes ...node.Node) bool {
+// mirrors the viewer's own non-blocking emit. It reports whether the batch was
+// taken, so a test can drive the drop path itself.
+func (f *fakeCaller) emit(seq uint64, nodes ...node.Node) bool {
 	f.mu.Lock()
 	ch := f.watchCh
 	f.mu.Unlock()
@@ -465,11 +466,28 @@ func (f *fakeCaller) emit(nodes ...node.Node) bool {
 		return false
 	}
 	select {
-	case ch <- nodes:
+	case ch <- Batch{Seq: seq, Nodes: nodes}:
 		return true
 	default:
 		return false
 	}
+}
+
+// emitNoSeq pushes a batch with no sequence number, which is what a client that
+// does not number its events produces.
+func (f *fakeCaller) emitNoSeq(nodes ...node.Node) bool {
+	return f.emit(0, nodes...)
+}
+
+// watchForTest installs a watch channel and returns it, so a test can drive the
+// loop and also close the channel itself.
+func (f *fakeCaller) watchForTest() chan Batch {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.watchCh == nil {
+		f.watchCh = make(chan Batch, 16)
+	}
+	return f.watchCh
 }
 
 // dropWatch closes the watch channel, which is how the real viewer reports that

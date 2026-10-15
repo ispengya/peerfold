@@ -103,7 +103,7 @@ func startPushServer(t *testing.T) string {
 }
 
 // awaitEvent waits for a pushed batch containing path, and reports the node.
-func awaitEvent(t *testing.T, ch <-chan []node.Node, path string) node.Node {
+func awaitEvent(t *testing.T, ch <-chan viewer.Event, path string) node.Node {
 	t.Helper()
 	deadline := time.After(5 * time.Second)
 	for {
@@ -112,7 +112,7 @@ func awaitEvent(t *testing.T, ch <-chan []node.Node, path string) node.Node {
 			if !ok {
 				t.Fatalf("the event channel closed while waiting for %s", path)
 			}
-			for _, n := range batch {
+			for _, n := range batch.Nodes {
 				if n.Path == path {
 					return n
 				}
@@ -253,7 +253,7 @@ func TestViewerWatchTwiceSharesOneChannel(t *testing.T) {
 		if !ok {
 			t.Fatal("the shared channel closed")
 		}
-		if len(batch) == 0 {
+		if len(batch.Nodes) == 0 {
 			t.Fatal("an empty batch arrived")
 		}
 	default:

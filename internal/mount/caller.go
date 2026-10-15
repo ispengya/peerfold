@@ -16,6 +16,21 @@ import (
 	"peerfold/internal/node"
 )
 
+// Batch is one pushed index update: a group of nodes that arrived together, and
+// the sequence number the transport gave the group.
+//
+// The sequence number is not part of the filesystem model, which is why it is not
+// a field on node.Node: a node is a file's metadata, and it travels on listings
+// and reads as well as on pushes. A batch is the thing the transport numbers.
+//
+// Seq is zero when the sender does not number its events. Zero therefore means
+// "not numbered" rather than "sequence zero", and a consumer must not read it as
+// a gap (D5).
+type Batch struct {
+	Seq   uint64
+	Nodes []node.Node
+}
+
 // Caller is everything the operation core needs from a peerfold client. It is
 // satisfied by *viewer.Viewer through viewerCaller (host.go); the tests use a
 // fake instead, which is the point: the core has no dependency on the wire.
@@ -25,11 +40,13 @@ import (
 // viewer.stream(), which allows exactly one request in flight.
 //
 // The signatures are deliberately the viewer's own, with one deliberate
-// exception: Watch returns a channel of node slices. The core needs to know
-// when the tree changed so it can invalidate what the kernel has cached, and
-// the viewer already delivers exactly that. A Caller that had no watch would
-// force the core to poll, and a polling core is a core that serves stale
-// attributes for as long as its interval.
+// exception: Watch returns a channel of batches. The core needs to know when the
+// tree changed so it can invalidate what the kernel has cached, and it needs the
+// sequence number so it can tell that the channel dropped something on the way
+// (the viewer's emit is non-blocking by design, so a drop is invisible
+// otherwise). A Caller that had no watch would force the core to poll, and a
+// polling core is a core that serves stale attributes for as long as its
+// interval.
 type Caller interface {
 	// List returns the immediate children of a directory.
 	List(path string) ([]node.Node, error)
@@ -48,7 +65,7 @@ type Caller interface {
 	// Watch returns a channel that is closed when the underlying connection
 	// goes away. The core treats closure as "reconnect or give up", never as
 	// "the tree is now empty".
-	Watch() <-chan []node.Node
+	Watch() <-chan Batch
 }
 
 // errRoot is returned for requests about the mount root, which has no parent
@@ -104,6 +121,41 @@ type Mount struct {
 	files map[uint64]*openFile
 	// cache holds read chunks under the two D3 caps.
 	cache *chunkCache
+
+	// events is what the watch channel has told this mount, keyed by full path.
+	//
+	// It is not a copy of the federation's index and it is not a whole-tree
+	// cache: it holds only the paths that were named by an event, and every other
+	// path still goes to the caller. Its one job is to keep a push that arrived
+	// from being contradicted by a listing the caller answers from its own
+	// (older, for that path) index -- which is what D5's detection makes
+	// survivable, because a listing that disagrees with a push is otherwise
+	// indistinguishable from a listing that is simply right.
+	//
+	// A deleted path is kept here as node.KindDeleted rather than removed, so the
+	// deletion continues to shadow the listing. Without the tombstone, the entry
+	// would be indistinguishable from "never heard of it" and the next listing
+	// would resurrect it.
+	events map[string]node.Node
+
+	// lastSeq is the sequence number of the last numbered batch. A jump means the
+	// transport dropped events, which is what isStale records.
+	lastSeq uint64
+	// isStale reports that events were lost, so the tree cannot be trusted. Task
+	// 11 owns clearing it, by re-watching and invalidating.
+	isStale bool
+	// isDisconnected reports that the watch channel ended. It is not the same as
+	// stale: a closed channel is a known-unknown, while stale is a tree that is
+	// wrong in an unknown way.
+	isDisconnected bool
+	// handed records the paths whose attributes were given to the kernel, so a
+	// later invalidation has something to walk. FUSE has no whole-filesystem
+	// invalidate, which is why the table exists; the cap keeps it bounded.
+	handed map[string]struct{}
+
+	// watchOnce makes startWatch idempotent, and watchDone stops the loop.
+	watchOnce sync.Once
+	watchDone chan struct{}
 }
 
 // New builds the operation core over a caller, which is the layer that actually
@@ -114,6 +166,8 @@ func New(caller Caller, opts Options) *Mount {
 		opts:   opts,
 		files:  map[uint64]*openFile{},
 		cache:  newChunkCache(opts.BufferLimit, opts.BufferTotal),
+		events: map[string]node.Node{},
+		handed: map[string]struct{}{},
 	}
 }
 
@@ -144,6 +198,15 @@ type Options struct {
 	// rather than a constant because a test that wants to check the mode is
 	// honoured needs to change it.
 	RootMode uint32
+
+	// InvalidateTable bounds how many paths are remembered as having been
+	// handed to the kernel. FUSE has no whole-filesystem invalidate, so a
+	// refresh has to walk what was given out; without a cap that set would grow
+	// for the life of the mount. A path evicted from it is not remembered, and
+	// the attr_timeout bounds how long the kernel can act on the stale
+	// attribute -- so the cap trades a bounded amount of staleness for a
+	// bounded amount of memory.
+	InvalidateTable int
 }
 
 // DefaultOptions returns the options a mount uses when the caller sets nothing.
@@ -166,13 +229,17 @@ type Options struct {
 // 1 second for both timeouts: long enough that a walk of a directory does not
 // re-ask for every attribute, short enough that a change made elsewhere is seen
 // in about a second without this process having to be told.
+// 4096 paths in the handed-out table: a working set larger than almost any
+// interactive session's, small enough that the table is a few hundred kilobytes
+// rather than a second copy of the tree.
 func DefaultOptions() Options {
 	return Options{
-		BufferLimit:  64 << 20,
-		BufferTotal:  256 << 20,
-		WriteLimit:   8 << 20,
-		AttrTimeout:  time.Second,
-		EntryTimeout: time.Second,
-		RootMode:     0o755,
+		BufferLimit:     64 << 20,
+		BufferTotal:     256 << 20,
+		WriteLimit:      8 << 20,
+		AttrTimeout:     time.Second,
+		EntryTimeout:    time.Second,
+		RootMode:        0o755,
+		InvalidateTable: 4096,
 	}
 }

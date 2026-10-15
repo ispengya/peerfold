@@ -40,6 +40,22 @@ var ErrCrossClient = errors.New("viewer: rename across clients")
 // One request is in flight at a time. The protocol has a single connection with
 // strictly alternating control and data frames, so a viewer that pipelined two
 // listings could read one reply as the other's; keep the calls sequential.
+// Event is one pushed index update: the batch of nodes, and the sequence number
+// the transport gave it.
+//
+// Seq is what makes a dropped update visible. The channel behind Watch is
+// deliberately non-blocking, so a watcher that stops reading loses updates rather
+// than stalling the reader -- and a lost update leaves no other trace anywhere in
+// the system, because a drop is not an error. Numbering the batches means a
+// consumer can see the hole.
+//
+// Zero means the update arrived unnumbered, which is what a sender that does not
+// number its events produces. It is not a hole.
+type Event struct {
+	Seq   uint64
+	Nodes []node.Node
+}
+
 type Viewer struct {
 	conn net.Conn
 	pc   *proto.Conn
@@ -49,7 +65,12 @@ type Viewer struct {
 	// read, because a reader that held it while waiting would stop the very
 	// hand-off it is waiting for.
 	mu     sync.Mutex
-	events chan []node.Node
+	events chan Event
+	// seq counts the pushes this connection has been handed, so a gap is
+	// observable downstream. It is bumped for every update received, including
+	// ones the channel then refuses, which is what makes the refusal visible
+	// rather than silent.
+	seq uint64
 	// closed says the event channel has been closed. emit and Close both decide
 	// what to do with it under mu, so a batch can never be offered to a channel
 	// that has already been closed — which would be a panic rather than a lost
@@ -654,18 +675,27 @@ func (v *Viewer) recvWithin(d time.Duration) (proto.Envelope, error) {
 
 // emit publishes a batch of updates, and never waits: a watcher that has stopped
 // reading loses updates rather than breaking the connection.
+//
+// The sequence number is bumped for every batch that arrives, including one the
+// channel refuses. That is the whole mechanism: the enqueue is what fails, so a
+// counter bumped only on success would make a drop indistinguishable from a quiet
+// period. Bumping first and dropping under the same lock means the next batch
+// that does get through carries a number that reveals the hole.
 func (v *Viewer) emit(nodes []node.Node) {
 	// The whole decision is made under the lock — whether there is a channel, and
 	// whether it is still open — because the send itself is non-blocking and so
 	// holding the lock here cannot wait on a caller.
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	v.seq++
 	if v.events == nil || v.closed {
 		return
 	}
 	select {
-	case v.events <- nodes:
+	case v.events <- Event{Seq: v.seq, Nodes: nodes}:
 	default:
+		// Refused, and the counter has already moved on, so the next accepted
+		// batch is numbered one past the gap.
 	}
 }
 
@@ -715,7 +745,7 @@ func isTimeout(err error) bool {
 func (v *Viewer) startPump() {
 	v.startReader.Do(func() {
 		v.mu.Lock()
-		v.events = make(chan []node.Node, 64)
+		v.events = make(chan Event, 64)
 		v.connToken = make(chan struct{}, 1)
 		v.connToken <- struct{}{}
 		v.reader = true
@@ -738,7 +768,7 @@ func (v *Viewer) startPump() {
 // The read is bounded by readWindow, which is what lets the connection go: a
 // call cannot take it until this read returns, so a read parked for as long as
 // the tree is quiet would hold every call up until the tree changed.
-func (v *Viewer) pump(events chan []node.Node) {
+func (v *Viewer) pump(events chan Event) {
 	defer func() {
 		// The connection is gone, so every later call has to fail rather than
 		// wait for a reply nobody is left to read.
@@ -770,12 +800,44 @@ func (v *Viewer) pump(events chan []node.Node) {
 }
 
 // publishEvent decodes one pushed update and hands it to whoever is watching.
+//
+// A push that carries no sequence number is passed through as zero rather than
+// being numbered here: the number has to come from the sender for a gap to mean
+// anything, and inventing one for an unnumbered sender would turn its quiet
+// periods into reported losses.
 func (v *Viewer) publishEvent(env proto.Envelope) {
 	var b proto.EventBody
 	if json.Unmarshal(env.Body, &b) != nil {
 		return
 	}
-	v.emit(nodeJSONToNodes(b.Nodes))
+	nodes := nodeJSONToNodes(b.Nodes)
+	if b.Seq != 0 {
+		// The sender numbered it, so the number it chose is carried through: it
+		// is the sender's view of its own stream, and renumbering would erase the
+		// gaps it is reporting.
+		v.emitSeq(b.Seq, nodes)
+		return
+	}
+	v.emit(nodes)
+}
+
+// emitSeq publishes a batch carrying a sequence number chosen by the sender,
+// rather than one this connection assigned.
+func (v *Viewer) emitSeq(seq uint64, nodes []node.Node) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	// The local counter still advances past the sender's number, so a batch this
+	// connection assigns later cannot collide with one the sender numbered.
+	if seq > v.seq {
+		v.seq = seq
+	}
+	if v.events == nil || v.closed {
+		return
+	}
+	select {
+	case v.events <- Event{Seq: seq, Nodes: nodes}:
+	default:
+	}
 }
 
 // nodeJSONToNodes converts a pushed update's wire nodes to the tree's model.
@@ -808,8 +870,10 @@ func nodeJSONToNodes(in []proto.NodeJSON) []node.Node {
 // The channel is buffered and a push never waits for a reader, so a caller that
 // stops reading loses updates rather than breaking the connection. That is the
 // intended trade: a viewer that needs the tree always has List, and a listing
-// taken after an update has already been applied cannot be stale.
-func (v *Viewer) Watch() <-chan []node.Node {
+// taken after an update has already been applied cannot be stale. What the drop
+// does leave is a hole in the sequence numbers, which is how a consumer can tell
+// that it happened.
+func (v *Viewer) Watch() <-chan Event {
 	v.startPump()
 	v.mu.Lock()
 	defer v.mu.Unlock()

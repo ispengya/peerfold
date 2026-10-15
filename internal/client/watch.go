@@ -31,18 +31,25 @@ import (
 // is either up, in which case the next change gets through, or down, in which
 // case nothing will.
 func (c *Client) Watch() (io.Closer, error) {
+	// seq numbers the batches this client sends. It advances on every attempted
+	// send rather than every successful one, so a batch that fails to send leaves
+	// a hole: the next batch carries the number after the gap. Nothing below
+	// retries or reports a failed push -- a change that could not be sent is
+	// dropped by design -- so the hole is the only trace it leaves, and without it
+	// the aggregated tree would describe the state before that change with no way
+	// for anyone to know.
+	var seq uint64
 	return Watch(c.shares, func(nodes []node.Node) error {
-		body, err := json.Marshal(proto.EventBody{Nodes: toNodeJSON(nodes)})
+		body, err := json.Marshal(proto.EventBody{Seq: seq, Nodes: toNodeJSON(nodes)})
 		if err != nil {
 			return fmt.Errorf("client: encode event: %w", err)
 		}
+		seq++
 		// Sent without a waiter, because an index update is not a question and
 		// the server sends nothing back for it. Registering a waiter would leave
 		// one entry in the waiting map for every change, for ever.
-		if _, err := c.send(proto.KindEvent, body, false); err != nil {
-			return err
-		}
-		return nil
+		_, err = c.send(proto.KindEvent, body, false)
+		return err
 	})
 }
 

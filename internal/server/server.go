@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -75,9 +76,31 @@ type Server struct {
 	// is pushed to. It is separate from conns because conns is all peers and
 	// this is only the ones that want to be told.
 	watchers map[*proto.Conn]struct{}
-	closing  bool
-	closed   bool
-	wg       sync.WaitGroup
+	// watchFails counts each watcher's consecutive send timeouts, so retirement
+	// is based on a streak rather than on a single slow moment. It is keyed
+	// separately from watchers because it has to survive individual failures,
+	// and it is cleared both on a successful send and when a watcher leaves.
+	watchFails map[*proto.Conn]int
+	closing    bool
+	closed     bool
+	wg         sync.WaitGroup
+
+	// broadcastTimeout bounds one push to one watcher. It is a field rather than
+	// the constant so a test can drive the timeout path without waiting five
+	// seconds per attempt; New sets it to DefaultEventBroadcastTimeout.
+	broadcastTimeout time.Duration
+
+	// fanout counts the per-watcher send attempts broadcast has started and not yet
+	// finished, including the bookkeeping each one does on the way out.
+	//
+	// It is not bookkeeping of its own: it is what lets a test observe the outcome of
+	// a broadcast deterministically. broadcast returns as soon as it has spawned the
+	// goroutines -- it must, or one slow watcher would hold up the reporting client
+	// -- so without a join there is nothing to wait on, and a test that polled the
+	// counters would race them rather than wait for them. Done is deferred before the
+	// state change runs and therefore fires after it, so a join fences the whole
+	// attempt rather than just the send.
+	fanout sync.WaitGroup
 }
 
 // New returns a Server listening on listen. A listen failure is remembered and
@@ -85,11 +108,13 @@ type Server struct {
 // startup error; Addr is nil in that case.
 func New(listen string) *Server {
 	s := &Server{
-		ix:       &index.Index{},
-		reg:      &Registry{},
-		conns:    make(map[net.Conn]struct{}),
-		watchers: make(map[*proto.Conn]struct{}),
-		router:   &Router{clients: make(map[string]*clientLink)},
+		ix:               &index.Index{},
+		reg:              &Registry{},
+		conns:            make(map[net.Conn]struct{}),
+		watchers:         make(map[*proto.Conn]struct{}),
+		watchFails:       make(map[*proto.Conn]int),
+		router:           &Router{clients: make(map[string]*clientLink)},
+		broadcastTimeout: DefaultEventBroadcastTimeout,
 	}
 	s.ln, s.lnErr = net.Listen("tcp", listen)
 	return s
@@ -448,13 +473,27 @@ func (s *Server) serveLoop(name string, c *proto.Conn) {
 	}
 }
 
-// eventBroadcastTimeout bounds one push to one watcher.
+// DefaultEventBroadcastTimeout bounds one push to one watcher.
 //
 // A viewer that has stopped reading fills its socket buffer, and an unbounded
 // write to it would block here for ever. The bound turns one viewer's
 // misbehaviour into that viewer's own problem: it is dropped and the change is
 // still delivered to everyone else.
-const eventBroadcastTimeout = 5 * time.Second
+//
+// It is exported, and Server.broadcastTimeout carries the value actually used,
+// because a test of the timeout path cannot wait 15 seconds for three of them.
+const DefaultEventBroadcastTimeout = 5 * time.Second
+
+// watchFailThreshold is how many consecutive send timeouts retire a watcher.
+//
+// One is not enough -- a scheduling hiccup or a momentarily busy socket is not a
+// client that has gone away, and dropping it on the first timeout silently and
+// permanently stops its updates while leaving its connection serving reads, so it
+// goes on being answered from a tree that has stopped changing. Three in a row is
+// a pattern rather than a hiccup. The count is of *consecutive* failures: any
+// successful send resets it, so a watcher that stumbles occasionally is never
+// retired.
+const watchFailThreshold = 3
 
 // applyEvent folds a client's change report into the index and pushes it to
 // every watcher.
@@ -574,12 +613,50 @@ func (s *Server) broadcast(env proto.Envelope) {
 	s.mu.Unlock()
 
 	for _, c := range targets {
+		s.fanout.Add(1)
 		go func(c *proto.Conn) {
-			if err := c.SendWithin(env, eventBroadcastTimeout); err != nil {
-				s.mu.Lock()
-				delete(s.watchers, c)
-				s.mu.Unlock()
+			// The deferred Done runs last, after the state change below has been
+			// applied -- so a caller that joins on the wait group has fenced the
+			// whole attempt and can read the result of it. Returning early on a
+			// successful send is expressed as a flag rather than as a return,
+			// because a return would run the other defers first and let the join
+			// complete before the counter was cleared.
+			defer s.fanout.Done()
+			sent := c.SendWithin(env, s.broadcastTimeout) == nil
+
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if sent {
+				// A watcher that answered is a watcher that is keeping up, so the
+				// count of consecutive failures goes back to zero. Without this
+				// reset the count would be a total rather than a streak, and a
+				// connection that hiccuped once an hour would be dropped after
+				// three hours of otherwise perfect service.
+				delete(s.watchFails, c)
+				return
 			}
+			// One failure is a scheduling hiccup: the watcher's socket may simply
+			// have been busy for a moment, and a client that is briefly slow is
+			// not a client that has gone away. Removing it on the first failure
+			// -- which this did -- silently and permanently stopped its updates
+			// while leaving the connection serving List and Read, so the watcher
+			// kept being answered from a tree that had stopped changing and had
+			// no way to tell.
+			s.watchFails[c]++
+			if s.watchFails[c] < watchFailThreshold {
+				return
+			}
+			// Three in a row is a pattern rather than a hiccup. The removal is
+			// still not free: the watcher keeps its connection and its List and
+			// Read, so it goes on being served from a tree that will now drift
+			// without bound. Logging it is the minimum -- and peerfold's own
+			// mount layer notices the silence for itself, because the sequence
+			// numbers stop advancing (mount.watchLoop).
+			log.Printf("server: dropping watcher after %d consecutive send "+
+				"timeouts; it keeps its connection but will receive no further "+
+				"updates", s.watchFails[c])
+			delete(s.watchFails, c)
+			delete(s.watchers, c)
 		}(c)
 	}
 }
@@ -593,6 +670,7 @@ func (s *Server) watch(c *proto.Conn) (unwatch func()) {
 	return func() {
 		s.mu.Lock()
 		delete(s.watchers, c)
+		delete(s.watchFails, c)
 		s.mu.Unlock()
 	}
 }

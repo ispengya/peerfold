@@ -89,6 +89,14 @@ func SplitParent(p string) (parent, base string, err error) {
 // own view, and a second copy of it in this process would need its own
 // invalidation, which is the machinery D5 exists to bound. What the kernel
 // caches is tracked separately and narrowly: see the inode table in watch.go.
+//
+// One narrow exception, and its bound is the point: a path that a *push* has
+// named is answered from that push rather than from a listing. That is not
+// caching the tree, it is recording what this mount was told, and it is what
+// keeps a listing from contradicting a change that has already been applied. The
+// table holds exactly the paths that were named by an event -- never a directory
+// listing -- so a cold path still costs the same one List, and a walk of a
+// directory it has never heard about is unaffected.
 func (m *Mount) lookup(p string) (node.Node, int) {
 	cleaned, err := Clean(p)
 	if err != nil {
@@ -99,6 +107,18 @@ func (m *Mount) lookup(p string) (node.Node, int) {
 		// server has no entry for it, so listing its parent is impossible.
 		// Its mode comes from the options because there is nothing to read.
 		return node.Node{Path: "/", Kind: node.KindDir, Mode: m.opts.RootMode}, 0
+	}
+	if n, ok := m.eventFor(cleaned); ok {
+		if n.Kind == node.KindDeleted {
+			// The tombstone shadows whatever a listing would say. A listing is
+			// answered from the caller's index, which for this path is older
+			// than the push that removed it, so the push wins.
+			return node.Node{}, -ENOENT
+		}
+		if n.Kind == node.KindSymlink {
+			return node.Node{}, -ELOOP
+		}
+		return n, 0
 	}
 	parent, base, err := SplitParent(cleaned)
 	if err != nil {

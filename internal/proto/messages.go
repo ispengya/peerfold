@@ -165,6 +165,17 @@ type RemoveBody struct {
 // EventBody is one index update pushed from a client. A node whose Kind is the
 // deletion marker (255; node.KindDeleted, added in Task 3) marks a path that no
 // longer exists.
+//
+// Seq is a per-connection monotonic counter, stamped by the sender as each batch
+// is enqueued. The mount layer uses it to notice that events were lost: the
+// transport is allowed to drop an event when a consumer is slow (viewer.emit does
+// exactly that, deliberately), and a drop is not an error anywhere else in the
+// system, so without a counter a stale tree is invisible.
+//
+// It is omitempty so that a sender which does not number its events produces the
+// same bytes as before this field existed. Zero means "not numbered" rather than
+// "sequence zero", so an older peer's events are not read as a gap of one.
 type EventBody struct {
+	Seq   uint64     `json:"seq,omitempty"`
 	Nodes []NodeJSON `json:"nodes"`
 }

@@ -228,7 +228,7 @@ func TestE2EViewerReceivesPushedUpdates(t *testing.T) {
 			if !ok {
 				t.Fatal("the event channel closed unexpectedly")
 			}
-			for _, n := range batch {
+			for _, n := range batch.Nodes {
 				// Fully qualified here, unlike a listing: the push names the
 				// client because the viewer may be watching several of them.
 				if n.Path == "win/Documents/pushed.txt" && n.Kind == node.KindFile && n.Size == 5 {
@@ -264,7 +264,7 @@ func TestE2EViewerSeesAPushedDeletion(t *testing.T) {
 			if !ok {
 				t.Fatal("the event channel closed unexpectedly")
 			}
-			for _, n := range batch {
+			for _, n := range batch.Nodes {
 				if n.Path == "win/Documents/doomed.txt" && n.Kind == node.KindDeleted {
 					return
 				}
@@ -417,14 +417,14 @@ func TestE2EChangesReachEveryViewer(t *testing.T) {
 // It is how a poll-based wait is used against a channel: the events stay on the
 // channel until they are read, so a batch that arrived between two polls is
 // still found.
-func drainedFrom(ch <-chan []node.Node, path string) bool {
+func drainedFrom(ch <-chan viewer.Event, path string) bool {
 	for {
 		select {
 		case batch, ok := <-ch:
 			if !ok {
 				return false
 			}
-			for _, n := range batch {
+			for _, n := range batch.Nodes {
 				if n.Path == path {
 					return true
 				}
