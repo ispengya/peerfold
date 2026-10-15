@@ -360,9 +360,14 @@ func TestFakeListMirrorsTheIndex(t *testing.T) {
 }
 
 // newTestMount builds a Mount over a fresh fake, with the root present.
+//
+// It goes through New rather than filling the struct directly, so the tests get
+// exactly what production gets: an initialised handle table and a real cache.
+// A hand-built Mount would leave cache nil, and closeHandle would then panic on
+// a nil pointer -- a test-only failure that says nothing about production.
 func newTestMount(t *testing.T) *Mount {
 	t.Helper()
 	f := newFakeCaller()
 	f.addDir("/")
-	return &Mount{caller: f, opts: DefaultOptions()}
+	return New(f, DefaultOptions())
 }

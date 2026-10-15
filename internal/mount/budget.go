@@ -1,6 +1,9 @@
 package mount
 
-import "container/list"
+import (
+	"container/list"
+	"sync"
+)
 
 // chunkSize is the unit a ranged read is broken into.
 //
@@ -54,6 +57,20 @@ type chunkCache struct {
 	// index locates a key in order, so a hit can move it to the back without
 	// scanning the list.
 	index map[chunkKey]*list.Element
+
+	// mu guards everything above.
+	//
+	// cgofuse calls the filesystem's methods from several threads at once, so
+	// two Read calls on different handles can reach this cache in parallel. The
+	// lock is here rather than in the caller because the cache's own eviction
+	// accounting is what a race would corrupt: two concurrent puts can each
+	// observe the total as within the cap and each add, leaving the cache
+	// permanently over its bound with no later operation to notice.
+	//
+	// A plain mutex rather than a read-write one, because a get mutates the
+	// recency order: even reads are writes as far as this structure is
+	// concerned.
+	mu sync.Mutex
 }
 
 func newChunkCache(perOpen, global int) *chunkCache {
@@ -72,8 +89,12 @@ func newChunkCache(perOpen, global int) *chunkCache {
 // The slice is returned as stored, without copying: the caller is the read path,
 // which copies out of it into the caller's buffer. Handing back the cached slice
 // is what makes a hit cheap, and it is safe because nothing writes to a cached
-// chunk in place — a chunk is immutable once read from the owner.
+// chunk in place — a chunk is immutable once read from the owner. The lock is
+// released before the caller touches those bytes, which is sound precisely
+// because no one ever mutates them.
 func (c *chunkCache) get(fh uint64, chunk int64) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	k := chunkKey{fh, chunk}
 	data, ok := c.items[k]
 	if !ok {
@@ -93,6 +114,8 @@ func (c *chunkCache) get(fh uint64, chunk int64) ([]byte, bool) {
 // same bytes, and replacing would throw away the position the existing entry has
 // in the eviction order.
 func (c *chunkCache) put(fh uint64, chunk int64, data []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if len(data) > c.global {
 		// Larger than the entire budget: caching it would evict everything
 		// else and still not fit, so serve it and forget it.
@@ -123,7 +146,9 @@ func (c *chunkCache) evictOpen(fh uint64) {
 // evictGlobal trims the whole cache to the global cap, evicting across handles
 // oldest-first. This is what keeps N concurrent opens bounded.
 func (c *chunkCache) evictGlobal() {
-	for c.total() > c.global {
+	// totalLocked, not total: this runs with mu held, and the exported wrapper
+	// would take the same mutex again and self-deadlock.
+	for c.totalLocked() > c.global {
 		el := c.order.Front()
 		if el == nil {
 			return
@@ -164,6 +189,16 @@ func (c *chunkCache) removeElement(el *list.Element) {
 // file is released, so that an idle file's cache does not occupy the budget
 // that the global cap is supposed to be protecting.
 func (c *chunkCache) dropOpen(fh uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.dropOpenLocked(fh)
+}
+
+// dropOpenLocked is dropOpen without the lock. It exists so that a caller that
+// already holds the Mount's lock can release a handle's memory while acquiring
+// only one lock at a time, which is what keeps the lock order from ever being a
+// question. See the comment on Mount.mu.
+func (c *chunkCache) dropOpenLocked(fh uint64) {
 	for el := c.order.Front(); el != nil; {
 		next := el.Next()
 		if el.Value.(chunkKey).fh == fh {
@@ -177,6 +212,12 @@ func (c *chunkCache) dropOpen(fh uint64) {
 // total is the cached bytes across every handle, which is the number the global
 // cap bounds.
 func (c *chunkCache) total() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.totalLocked()
+}
+
+func (c *chunkCache) totalLocked() int {
 	n := 0
 	for _, b := range c.bytes {
 		n += b
@@ -186,4 +227,8 @@ func (c *chunkCache) total() int {
 
 // openTotal is the cached bytes for one handle, which is the number the
 // per-open cap bounds.
-func (c *chunkCache) openTotal(fh uint64) int { return c.bytes[fh] }
+func (c *chunkCache) openTotal(fh uint64) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.bytes[fh]
+}
