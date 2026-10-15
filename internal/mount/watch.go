@@ -9,25 +9,40 @@ import (
 // startWatch begins consuming the caller's event channel, applying each batch to
 // this mount's event table.
 //
-// It is idempotent, because the reconnect path in Task 11 can reach it more than
-// once and a second consumer would apply every event twice.
+// It is idempotent: a second call while a loop is already running does nothing, so
+// a path that starts the watch twice does not get two consumers applying every
+// event twice. It is deliberately *not* guarded by a sync.Once, because a
+// reconnect has to be able to start a second loop -- on the new caller's channel,
+// after stopWatch has retired the first -- and a Once by definition never runs
+// again. The nil check is the idempotence.
 //
 // The loop is the reason the core needs the mount's lock at all for the event
 // table: cgofuse calls the filesystem's methods from several threads while this
 // goroutine applies pushes, so both touch the table and both take m.mu. Nothing
-// here calls the caller, which is what keeps the lock free of wire waits.
+// here holds that lock across a channel receive.
 func (m *Mount) startWatch() {
-	m.watchOnce.Do(func() {
-		m.mu.Lock()
-		done := make(chan struct{})
-		m.watchDone = done
+	m.mu.Lock()
+	if m.watchDone != nil {
 		m.mu.Unlock()
-		go m.watchLoop(done)
-	})
+		return
+	}
+	done := make(chan struct{})
+	exited := make(chan struct{})
+	m.watchDone = done
+	m.watchExited = exited
+	m.mu.Unlock()
+	go m.watchLoop(done, exited)
 }
 
-// stopWatch stops the loop, if one is running. It is safe to call before
-// startWatch and safe to call twice.
+// stopWatch stops the loop if one is running, and waits for it to finish. It is
+// safe to call before startWatch and safe to call twice.
+//
+// Waiting is not tidiness. A reconnect replaces the caller, and a loop still
+// running when that happened would go on receiving batches from the *old*
+// caller's channel and merging them into a table that is now meant to describe
+// the new one. Making the old loop finish before the swap removes the race
+// outright; the loop is watched from the supervisor's own goroutine, so the wait
+// is on a loop that only ever exits.
 //
 // It does not close the caller's channel: that channel is the caller's, and
 // closing it from here would be this layer reaching into the transport's
@@ -35,10 +50,16 @@ func (m *Mount) startWatch() {
 func (m *Mount) stopWatch() {
 	m.mu.Lock()
 	done := m.watchDone
+	exited := m.watchExited
 	m.watchDone = nil
+	m.watchExited = nil
 	m.mu.Unlock()
-	if done != nil {
-		close(done)
+	if done == nil {
+		return
+	}
+	close(done)
+	if exited != nil {
+		<-exited
 	}
 }
 
@@ -51,8 +72,23 @@ func (m *Mount) stopWatch() {
 // after stopWatch had returned. Once the mount has been stopped its view must not
 // move again, so the check is what makes that a guarantee rather than a
 // likelihood.
-func (m *Mount) watchLoop(done chan struct{}) {
-	ch := m.caller.Watch()
+//
+// There is deliberately no check here that the caller has not been replaced. Such
+// a check looks like the obvious guard against a batch from the dead connection,
+// and it used to be one -- but it is unreachable, and the mutation run is what
+// proved it. stopWatch waits for this function to return before adopt replaces the
+// caller, so by the time the caller can differ the loop is already gone; and any
+// batch the loop did apply on the way out is wiped by adopt's clear, which happens
+// after the wait. Both are needed for the guarantee, and the wait is the one that
+// carries it. Keeping the guard would be keeping a branch neither reachable nor
+// tested, and a reader would have to reconstruct this argument to find that out.
+//
+// exited is closed on every return, including this function's own closes. It is
+// how stopWatch knows the loop it stopped has actually stopped, which is what
+// makes the argument above hold rather than being merely probable.
+func (m *Mount) watchLoop(done chan struct{}, exited chan struct{}) {
+	defer close(exited)
+	ch := m.call().Watch()
 	for {
 		select {
 		case <-done:
@@ -69,7 +105,9 @@ func (m *Mount) watchLoop(done chan struct{}) {
 				return
 			}
 			// A batch that was already in flight when the mount was stopped is
-			// dropped. This is the case the select cannot decide on its own.
+			// dropped. This is the case the select cannot decide on its own, and
+			// with adopt's wait it is the only case left: by the time the caller
+			// has been replaced, this loop has returned.
 			select {
 			case <-done:
 				return
@@ -168,9 +206,19 @@ func (m *Mount) setDisconnected(v bool) {
 // A path that is already recorded is a no-op apart from the eviction check, and
 // the table is keyed by path rather than by handle: invalidation walks paths, and
 // the same path handed out through five handles is one path to invalidate.
-func (m *Mount) noteInode(_ uint64, p string) {
+func (m *Mount) noteInode(fh uint64, p string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.noteInodeLocked(fh, p)
+}
+
+// noteInodeLocked is noteInode for a caller that already holds m.mu.
+//
+// A separate method rather than an unlocked function with a different name,
+// because the two are the same decision: the lock is not part of what it records,
+// and a caller that took it by accident should get a name that says so rather than
+// a deadlock.
+func (m *Mount) noteInodeLocked(_ uint64, p string) {
 	m.handed[p] = struct{}{}
 	if len(m.handed) <= m.opts.InvalidateTable {
 		return

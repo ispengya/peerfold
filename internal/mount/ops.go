@@ -120,6 +120,11 @@ func (m *Mount) Getattr(path string, st *Stat, fh uint64) int {
 	}
 	m.mu.Unlock()
 	*st = statFor(n)
+	// The kernel now holds this path's attributes. Recording it is what gives a
+	// later reconnect something to invalidate: without it the kernel's cached
+	// mode and size for every path the user has looked at would survive the whole
+	// outage, and the mount's own answers would be the fresher of the two.
+	m.noteInode(fh, n.Path)
 	return 0
 }
 
@@ -149,7 +154,7 @@ func (m *Mount) Readdir(path string, fill func(name string, st *Stat, off int64)
 	if n.Kind != node.KindDir {
 		return -ENOTDIR
 	}
-	children, err := m.caller.List(path)
+	children, err := m.call().List(path)
 	if err != nil {
 		return errnoFor(err)
 	}
@@ -172,6 +177,12 @@ func (m *Mount) Readdir(path string, fill func(name string, st *Stat, off int64)
 			// a regular file with a plausible size would be lying twice.
 			st.Mode |= modeSymlink
 		}
+		// The kernel is being handed this child's name and attributes, so the
+		// child is recorded as handed out. A listing is where the kernel learns
+		// about paths it will go on to stat, and invalidating only what was
+		// explicitly statted would leave every name discovered through a listing
+		// cached across the whole outage.
+		m.noteInode(fh, c.Path)
 		if !fill(stdpath.Base(c.Path), &st, 0) {
 			// The callback returns false when the kernel's buffer is full. That
 			// is not an error and the rest of the listing is not lost: the kernel
@@ -179,6 +190,7 @@ func (m *Mount) Readdir(path string, fill func(name string, st *Stat, off int64)
 			return 0
 		}
 	}
+	m.noteInode(fh, n.Path)
 	return 0
 }
 
@@ -188,9 +200,20 @@ func (m *Mount) Readdir(path string, fill func(name string, st *Stat, off int64)
 // exist is told ENOENT rather than handed numbers. The numbers themselves do not
 // depend on the path: they describe one federation, and every point in the mount
 // sees the same one.
+//
+// A disconnected mount still answers, and that is deliberate rather than an
+// oversight. The figures are constants; there is no wire call to fail, and no
+// answer here can be stale in a way that matters. The alternative was worse:
+// cgofuse's fsstat callback has no way to report an error, so a tool that statfs'es
+// a mount point before it does anything else would be told the numbers are fine
+// and then get EIO from the first real operation -- which is the honest order.
+// This is the one operation that does not go through lookup(), because it is the
+// only one with nothing to look up.
 func (m *Mount) Statfs(path string, st *Statfs) int {
-	if _, code := m.lookup(path); code != 0 {
-		return code
+	if !m.offline() {
+		if _, code := m.lookup(path); code != 0 {
+			return code
+		}
 	}
 	const block = 4096
 	*st = Statfs{
@@ -252,6 +275,10 @@ func (m *Mount) Open(path string, mode int) (uint64, int) {
 	// allows them.
 	h.readOnly = mode != OReadWrite
 	m.mu.Unlock()
+	// The kernel has an open handle on this path and will read its attributes
+	// from here. Recording it is what makes a later reconnect able to tell the
+	// kernel to drop them.
+	m.noteInode(fh, n.Path)
 	return fh, 0
 }
 
@@ -275,7 +302,9 @@ func (m *Mount) Opendir(path string) (uint64, int) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.newHandleLocked(cleaned, node.KindDir), 0
+	fh := m.newHandleLocked(cleaned, node.KindDir)
+	m.noteInodeLocked(fh, n.Path)
+	return fh, 0
 }
 
 // Read places the file's bytes at off into buf and returns how many were placed.
@@ -348,7 +377,7 @@ func (m *Mount) Read(path string, buf []byte, off int64, fh uint64) int {
 
 		chunk, ok := m.cache.get(fh, chunkIdx)
 		if !ok {
-			data, err := m.caller.Read(t.path, chunkOff, chunkSize)
+			data, err := m.call().Read(t.path, chunkOff, chunkSize)
 			if err != nil {
 				// A partial read is returned rather than discarded. Throwing
 				// away the bytes already in the buffer would make a large file
@@ -450,6 +479,9 @@ func (m *Mount) readTarget(path string, fh uint64) (readSnapshot, int) {
 // directory is EISDIR, because a writable handle on a directory would have to
 // answer writes that have no meaning.
 func (m *Mount) Create(path string, mode uint32) (uint64, int) {
+	if m.offline() {
+		return 0, -EIO
+	}
 	cleaned, err := Clean(path)
 	if err != nil {
 		return 0, -EINVAL
@@ -512,6 +544,15 @@ func (m *Mount) Write(path string, buf []byte, off int64, fh uint64) int {
 		// record: an editor looping on a zero-length write must not cause an
 		// upload per call.
 		return 0
+	}
+	if m.offline() {
+		// A write with a handle could be recorded locally and refused later, but
+		// refusing it now is the honest answer: the content cannot reach the
+		// owner while the connection is gone, and a write that appears to
+		// succeed and is then dropped at disconnect is the silent-loss failure
+		// the whole flush table exists to prevent. The empty-write case above
+		// stays a success because it writes nothing.
+		return -EIO
 	}
 
 	m.mu.Lock()
@@ -636,7 +677,7 @@ func (m *Mount) readPath(path string) ([]byte, int64, error) {
 	var out []byte
 	var off int64
 	for {
-		chunk, err := m.caller.Read(path, off, chunkSize)
+		chunk, err := m.call().Read(path, off, chunkSize)
 		if err != nil {
 			if len(out) > 0 {
 				// A partial read is worth more than none: it is at least the
@@ -808,6 +849,9 @@ func (m *Mount) Release(path string, fh uint64) int {
 // non-zero; ELOOP is more informative, and it is the same answer the rest of the
 // mount gives for a symlink.
 func (m *Mount) Mkdir(path string, mode uint32) int {
+	if m.offline() {
+		return -EIO
+	}
 	cleaned, err := Clean(path)
 	if err != nil {
 		return -EINVAL
@@ -826,7 +870,7 @@ func (m *Mount) Mkdir(path string, mode uint32) int {
 	} else if code != -ENOENT {
 		return code
 	}
-	if err := m.caller.Mkdir(cleaned); err != nil {
+	if err := m.call().Mkdir(cleaned); err != nil {
 		return errnoFor(err)
 	}
 	return 0
@@ -850,7 +894,7 @@ func (m *Mount) kindAt(cleaned string) (node.Kind, bool) {
 	if err != nil {
 		return 0, false
 	}
-	children, err := m.caller.List(parent)
+	children, err := m.call().List(parent)
 	if err != nil {
 		return 0, false
 	}
@@ -882,6 +926,9 @@ func (m *Mount) dropHandlesFor(path string) {
 // content and the name is about to disappear, so removing it first would drop the
 // write entirely.
 func (m *Mount) Unlink(path string) int {
+	if m.offline() {
+		return -EIO
+	}
 	cleaned, err := Clean(path)
 	if err != nil {
 		return -EINVAL
@@ -901,7 +948,7 @@ func (m *Mount) Unlink(path string) int {
 	if code := m.flushPath(cleaned); code != 0 {
 		return code
 	}
-	if err := m.caller.Remove(cleaned); err != nil {
+	if err := m.call().Remove(cleaned); err != nil {
 		return errnoFor(err)
 	}
 	m.mu.Lock()
@@ -918,6 +965,9 @@ func (m *Mount) Unlink(path string) int {
 // gets the truth from the layer that has it. The proactive check exists so the
 // common case does not cost a round trip.
 func (m *Mount) Rmdir(path string) int {
+	if m.offline() {
+		return -EIO
+	}
 	cleaned, err := Clean(path)
 	if err != nil {
 		return -EINVAL
@@ -934,14 +984,14 @@ func (m *Mount) Rmdir(path string) int {
 	if n.Kind != node.KindDir {
 		return -ENOTDIR
 	}
-	children, err := m.caller.List(cleaned)
+	children, err := m.call().List(cleaned)
 	if err != nil {
 		return errnoFor(err)
 	}
 	if len(children) > 0 {
 		return -ENOTEMPTY
 	}
-	if err := m.caller.Remove(cleaned); err != nil {
+	if err := m.call().Remove(cleaned); err != nil {
 		return errnoFor(err)
 	}
 	return 0
@@ -960,6 +1010,9 @@ func (m *Mount) Rmdir(path string) int {
 // a handle that kept the old target bytes would write them back over the
 // replacement on its next flush.
 func (m *Mount) Rename(oldPath, newPath string) int {
+	if m.offline() {
+		return -EIO
+	}
 	oldClean, err := Clean(oldPath)
 	if err != nil {
 		return -EINVAL
@@ -993,7 +1046,7 @@ func (m *Mount) Rename(oldPath, newPath string) int {
 	if code := m.flushPath(newClean); code != 0 {
 		return code
 	}
-	if err := m.caller.Rename(oldClean, newClean); err != nil {
+	if err := m.call().Rename(oldClean, newClean); err != nil {
 		return errnoFor(err)
 	}
 

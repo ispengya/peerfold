@@ -95,6 +95,12 @@ func (e errStr) Error() string { return string(e) }
 type Mount struct {
 	// caller is the only way this package reaches the federation. It is an
 	// interface so the tests can drive the core without a wire.
+	//
+	// It is replaced by a reconnect, and that replacement happens on the
+	// supervisor's goroutine while cgofuse is calling this package's methods from
+	// several threads of its own. Every read of it therefore goes through call(),
+	// which takes the lock: reading the field directly would be a data race, and
+	// it is one this machine cannot detect, because there is no -race here.
 	caller Caller
 
 	// opts holds the tunables. Everything with a default is filled in by
@@ -153,9 +159,30 @@ type Mount struct {
 	// invalidate, which is why the table exists; the cap keeps it bounded.
 	handed map[string]struct{}
 
-	// watchOnce makes startWatch idempotent, and watchDone stops the loop.
-	watchOnce sync.Once
-	watchDone chan struct{}
+	// watchDone and watchExited are the running watch loop: watchDone stops it and
+	// watchExited is closed as it leaves, so a reconnect can wait for the loop
+	// reading the old caller to be gone before it replaces that caller.
+	//
+	// They are set and cleared as a pair by startWatch and stopWatch rather than
+	// guarded by a sync.Once. A Once would be wrong here: a reconnect has to be
+	// able to start a *second* loop, on the new caller's channel, and a Once by
+	// definition never runs again. Idempotence comes from the nil check instead.
+	watchDone   chan struct{}
+	watchExited chan struct{}
+
+	// onGiveUp is called when the supervisor stops retrying, to unmount. It is
+	// nil until the host adapter sets it, which is why every call is guarded.
+	onGiveUp func()
+	// onDiscard is told the path of every dirty handle dropped at disconnect.
+	//
+	// It exists because a discarded edit is otherwise invisible: the write
+	// reported success, the mount is still there, and the content is gone. The
+	// host adapter logs it. It is called once per path.
+	onDiscard func(string)
+	// invalidatePath asks the host to drop the kernel's cached attributes for one
+	// path. FUSE has no whole-filesystem invalidate, so a refresh walks the
+	// handed-out table and calls this per path.
+	invalidatePath func(string)
 }
 
 // New builds the operation core over a caller, which is the layer that actually
@@ -207,6 +234,23 @@ type Options struct {
 	// attribute -- so the cap trades a bounded amount of staleness for a
 	// bounded amount of memory.
 	InvalidateTable int
+
+	// ReconnectMin and ReconnectMax bound the supervisor's backoff. The first
+	// retry happens after ReconnectMin and each later one doubles, up to
+	// ReconnectMax.
+	//
+	// The growth matters more than either number: an owner that is down for a
+	// moment comes back after one short wait, while an owner that is gone for an
+	// hour is not retried a thousand times. The two are fields rather than
+	// constants so the tests can drive the whole schedule in milliseconds.
+	ReconnectMin time.Duration
+	ReconnectMax time.Duration
+
+	// GiveUpAfter is how long a mount will keep trying before it unmounts
+	// itself. A mount whose owner is gone must stop being a mount: leaving it up
+	// means every program that touches the path blocks until its own timeout,
+	// repeatedly, with no end.
+	GiveUpAfter time.Duration
 }
 
 // DefaultOptions returns the options a mount uses when the caller sets nothing.
@@ -232,6 +276,12 @@ type Options struct {
 // 4096 paths in the handed-out table: a working set larger than almost any
 // interactive session's, small enough that the table is a few hundred kilobytes
 // rather than a second copy of the tree.
+//
+// 1 second, 30 seconds and 2 minutes for the reconnect schedule: one second is
+// long enough that a brief network hiccup is ridden out without a thundering
+// herd of immediate reopen attempts, 30 seconds is short enough that a peer
+// coming back is noticed within half a minute, and two minutes is long enough
+// that a genuinely transient outage does not cost the user their mount.
 func DefaultOptions() Options {
 	return Options{
 		BufferLimit:     64 << 20,
@@ -241,5 +291,21 @@ func DefaultOptions() Options {
 		EntryTimeout:    time.Second,
 		RootMode:        0o755,
 		InvalidateTable: 4096,
+		ReconnectMin:    time.Second,
+		ReconnectMax:    30 * time.Second,
+		GiveUpAfter:     2 * time.Minute,
 	}
+}
+
+// call returns the current caller, under the lock.
+//
+// Every use of the caller goes through this rather than reading the field,
+// because a reconnect replaces the field from the supervisor's goroutine while
+// other threads are in the middle of operations. Taking the lock is what makes
+// the swap safe; the alternative, an atomic holding an interface, buys nothing
+// here because the lock is already held around the surrounding state changes.
+func (m *Mount) call() Caller {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.caller
 }

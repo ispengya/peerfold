@@ -172,7 +172,7 @@ func TestDeletedEntryIsNotResurrectedByAListing(t *testing.T) {
 	}, "the deletion was not applied")
 
 	// Listing the parent must not put it back.
-	children, err := m.caller.List("/")
+	children, err := m.call().List("/")
 	if err != nil {
 		t.Fatalf("List = %v", err)
 	}
@@ -343,7 +343,16 @@ func TestWatchClosureMarksDisconnected(t *testing.T) {
 }
 
 // Closing the channel is the transport saying "no more updates", which is not the
-// same as "the tree is empty". The index must survive it.
+// same as "the tree is empty". Nothing is thrown away when the closure is noticed,
+// and the tree is readable again the moment a caller is installed.
+//
+// The lookup itself cannot succeed while the mount is offline, and that is Task
+// 11's contract rather than something this test can evade: offline is EIO for
+// every path, because a program that is told ENOENT concludes the file was
+// deleted and may act destructively on that conclusion. So "the index survived"
+// is asserted the only way it can honestly be asserted -- by reconnecting and
+// finding the tree still there -- rather than by demanding an answer the mount
+// must not give.
 func TestWatchClosureKeepsTheIndex(t *testing.T) {
 	m := newTestMount(t)
 	f := fakeOf(t, m)
@@ -354,8 +363,17 @@ func TestWatchClosureKeepsTheIndex(t *testing.T) {
 	f.dropWatch()
 	waitFor(t, 2*time.Second, func() bool { return m.disconnected() },
 		"the closure was not noticed")
+
+	// The proof that nothing was emptied: while offline the mount refuses to
+	// answer at all, and once a caller is back the same path resolves.
+	if _, code := m.lookup("/a.txt"); code != -EIO {
+		t.Errorf("lookup while offline = %d, want -EIO (%d); a lookup must not "+
+			"answer from an index it knows may be stale", code, -EIO)
+	}
+	m.adopt(f)
 	if _, code := m.lookup("/a.txt"); code != 0 {
-		t.Error("a closed watch channel emptied the index")
+		t.Error("a closed watch channel emptied the index: /a.txt is gone after " +
+			"the mount came back, though the caller never stopped having it")
 	}
 }
 

@@ -97,10 +97,38 @@ func SplitParent(p string) (parent, base string, err error) {
 // table holds exactly the paths that were named by an event -- never a directory
 // listing -- so a cold path still costs the same one List, and a walk of a
 // directory it has never heard about is unaffected.
+//
+// A disconnected mount answers EIO here rather than refusing each caller
+// separately, because almost every operation resolves a path before it does
+// anything else: Getattr, Readdir, Open, Opendir, Read, Create, Mkdir, Unlink,
+// Rmdir, Rename and the path form of Truncate all arrive through this function.
+// The exceptions are the ones that must still work with no connection -- Release
+// has to free its handle, and the flush table has to be able to answer -- and
+// those are guarded where they actually do damage.
 func (m *Mount) lookup(p string) (node.Node, int) {
 	cleaned, err := Clean(p)
 	if err != nil {
 		return node.Node{}, -EINVAL
+	}
+	if m.offline() {
+		// EIO and never ENOENT, and before the root case as well as before the
+		// caller. A program that sees ENOENT concludes the file was deleted and
+		// may act destructively on that conclusion -- dropping its own copy, or
+		// writing a new one over the owner's. EIO makes it retry, which is the
+		// correct response to a connection that is coming back.
+		//
+		// The root is refused too. It costs nothing to synthesise, but a mount
+		// that answers *some* paths while the connection is gone forces every
+		// program above it to invent a rule for which answers to trust -- and the
+		// rule it would invent is "a successful getattr means the file is there",
+		// which is false for the root and true for nothing else. Refusing
+		// everything is a rule a caller can act on. The root's attributes are
+		// refreshed along with every other path once the supervisor reconnects.
+		//
+		// The check is also before the event table, deliberately: a path the last
+		// connection named is exactly the kind of stale answer a caller must not
+		// act on while the tree is known to be wrong.
+		return node.Node{}, -EIO
 	}
 	if cleaned == "/" {
 		// The root is synthesised, not listed: no client owns it and the
@@ -124,7 +152,7 @@ func (m *Mount) lookup(p string) (node.Node, int) {
 	if err != nil {
 		return node.Node{}, -EINVAL
 	}
-	children, err := m.caller.List(parent)
+	children, err := m.call().List(parent)
 	if err != nil {
 		// The parent could not be listed, and that error is the diagnosis, so
 		// it is passed through rather than flattened. See the comment above for

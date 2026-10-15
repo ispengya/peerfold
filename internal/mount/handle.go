@@ -156,6 +156,12 @@ func (m *Mount) closeHandle(fh uint64) {
 // A failed upload leaves the handle dirty for the same reason: the write did not
 // land, and clearing the flag would discard the only copy of the content.
 //
+// A disconnected mount fails the upload with EIO. It is checked before anything
+// else, so no round trip is attempted -- and it must be a *failure* rather than a
+// silent success, because the caller is usually Release and a flush that claimed
+// success while dropping the content is exactly the lost save this package
+// exists to prevent.
+//
 // An unknown handle is a success, not an error. cgofuse can deliver Fsync or
 // Flush for a handle the kernel has already released, and refusing would turn a
 // harmless race into an input/output error on a save.
@@ -166,10 +172,19 @@ func (m *Mount) flush(fh uint64) int {
 		m.mu.Unlock()
 		return 0
 	}
+	if m.isDisconnected {
+		// The clean-handle case returned above, so this only ever refuses a
+		// flush that really had content to send. That keeps the "an unknown or
+		// clean handle is a success" promise intact: Release still frees the
+		// handle, and a mount with nothing outstanding still unmounts cleanly.
+		m.mu.Unlock()
+		return -EIO
+	}
 	path, body, version := h.path, h.content(), h.version
+	c := m.caller
 	m.mu.Unlock()
 
-	if err := m.caller.Put(path, bytes.NewReader(body)); err != nil {
+	if err := c.Put(path, bytes.NewReader(body)); err != nil {
 		return errnoFor(err)
 	}
 

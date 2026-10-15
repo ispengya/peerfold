@@ -225,9 +225,13 @@ func (f *fakeCaller) addContent(p string, body []byte) {
 // it calls the viewer, so asserting it back is the honest route.
 func fakeOf(t *testing.T, m *Mount) *fakeCaller {
 	t.Helper()
-	f, ok := m.caller.(*fakeCaller)
+	// Through call(), not the field: a reconnect replaces the field, and a test
+	// that reached in directly would either miss the new caller or race the
+	// supervisor that installed it.
+	c := m.call()
+	f, ok := c.(*fakeCaller)
 	if !ok {
-		t.Fatalf("the mount's caller is %T, not the test double", m.caller)
+		t.Fatalf("the mount's caller is %T, not the test double", c)
 	}
 	return f
 }
