@@ -127,9 +127,19 @@ v1 核心（第一份计划）已经把整条链路做通了：星型拓扑、�
 
 不占盘符、不落在驱动器根、两平台形态一致（不用维护两套）。
 
+**Windows 侧已实测确认可行（2026-10-15，本机非提权进程）**：目录挂载**成功**，
+WinFsp **自动创建**挂载目录、进程消失时**自动删除**。
+
+**§十六 记录了这次实测的完整过程，以及一个必须写进代码的坑**：
+**不能预先创建挂载目录** —— 预先创建会让 WinFsp 报 `mount point in use`，
+`Mount()` 立刻返回 `false`。我一开始正是因此以为"目录挂载需要提权"，那是错的。
+
 **为什么不用盘符**：那是唯一的备选，好处是它**不是任何目录的孩子** —— 遍历
 `C:\` 永远不会撞上它。但代价是平台差异：Windows 与 Linux 的挂载点形态会分叉，
 而收益只覆盖"遍历那个盘"这一种情形。我选择一致性。
+
+**盘符方案已实测可用、且是本方案的已知回退**（非提权下挂 `P:` 成功、能列目录）：
+如果目录挂载在某个环境上仍然不行，**降级成盘符是一个不需要改设计的选择**。
 
 **必须同时成立的硬条件**：挂载点**不能在任何共享目录里面**。所以：
 - 默认落点在任何共享之外
@@ -828,3 +838,91 @@ Windows 上是纯 Go，不需要 C 工具链）。
 
 **所以：批准这份设计，我就开始写实施计划。** 计划的第一个任务组按 D7 走
 **Windows**（本机能端到端验证），Linux 同步写成但测试标注为待外部验证。
+
+## 十六、Windows 挂载实测记录（2026-10-15，本机，非提权进程）
+
+这一节是**实证**，不是推断。它是本文里唯一一段"我真的把它挂起来了"的记录。
+写在这里是因为它推翻了我自己的一个结论，并且暴露了两个必须写进代码的约束。
+
+### 做了什么
+
+用一个临时的 cgofuse 探针（`CGO_ENABLED=0 GOOS=windows`，纯 Go 路径）实现一个
+最小的内存文件系统，然后**真挂载**到一个目录，从**另一个进程**观察，
+最后杀掉进程退出。
+
+### 结果
+
+```
+PROBE start, mnt=...\pf-hb-dir exists=false
+calling Mount...
+The service mprobe has been started.
+heartbeat  ×7                    ← 进程活着，Mount() 在跑主循环
+（外部观察）挂载点 exists=True     ← WinFsp 自动创建了目录
+（外部 FileInfo）Length=12        ← 元数据通了
+（杀掉进程后）exists=False        ← 目录被自动删除
+```
+
+**结论**：
+1. **目录挂载成功，且不需要提权**
+2. **WinFsp 自己创建挂载目录**（对应官方 FAQ："the directory is created and later
+   deleted when the file system goes away"）
+3. **进程退出时目录被自动清除** —— 用 `FILE_FLAG_DELETE_ON_CLOSE` 实现，所以
+   **不会留下"挂载点还在但文件系统没了"的尸体**
+
+### 我走错的路（必须记下来，因为它会误导实现者）
+
+我一开始**预先创建了挂载目录**，然后看到：
+
+```
+Cannot create WinFsp-FUSE file system: mount point in use.
+```
+
+我据此刻意去找"提权"的解释，还查了 WinFsp 的服务架构文档 —— **全错了**。
+真正的原因是：**WinFsp 要自己创建那个目录，你预先建好就等于占用了它。**
+改掉"预先创建"这一步之后，挂载立刻成功。
+
+**这两条必须写进计划**：
+- **绝对不要预先创建挂载目录**（Linux 与 Windows 在这里的语义**相反**：
+  Linux 要目录**已存在**，Windows 要目录**不存在**）—— 这必须由平台壳处理，
+  可移植核里不能有"先 Mkdir 挂载点"这个动作
+- **`Mount()` 会阻塞**，它是主循环。所以**持有挂载的进程不能对挂载点做文件 IO**
+  （我在同一个进程里 `os.ReadDir` 直接卡死，一行输出都没有）。挂载进程必须
+  "粘住"，读写只能来自别的进程 —— 这对端到端测试的写法有直接影响
+
+### 仍然没通的（如实记录）
+
+**探针自己的读路径是错的**：外部 `FileInfo` 能拿到 `Length=12`，但读内容报
+`Incorrect function`，`dir /b` 也列不出条目。原因是我随手写的 `Read`/`Readdir`
+的**返回值语义搞错了** —— cgofuse 的 `Read` 返回**读到的字节数**，
+`Readdir` 要用 `fill` 回调且返回 0。这是实现细节，不影响上面的结论，
+**但它说明"能挂上"和"能正确读写"是两件事**，后者要真做才知道。
+
+### 接口已经精确提取（计划里直接引用，不用再猜）
+
+`fuse.FileSystemInterface` 有 **33 个方法**，而且 **`FileSystemBase` 是空结构体**
+（**没有默认实现**），所以**全都要实现** —— 不用的可以返回 `-ENOSYS`。
+关键方法签名：
+
+```go
+Getattr(path string, stat *fuse.Stat_t, fh uint64) int
+Readdir(path string, fill func(name string, stat *fuse.Stat_t, ofst int64) bool, ofst int64, fh uint64) int
+Open(path string, flags int) (int, uint64)
+Read(path string, buff []byte, ofst int64, fh uint64) int
+Write(path string, buff []byte, ofst int64, fh uint64) int
+Flush(path string, fh uint64) int
+Fsync(path string, datasync bool, fh uint64) int
+Release(path string, fh uint64) int
+Truncate(path string, size int64, fh uint64) int
+Rename(oldpath string, newpath string) int
+Mkdir(path string, mode uint32) int
+Unlink(path string) int
+Rmdir(path string) int
+Statfs(path string, stat *fuse.Statfs_t) int
+```
+
+`FileSystemHost` 的可用钩子：`Mount`、`Unmount`、`Notify`（**这是 D5 的内核
+失效接口**）、`SetCapReaddirPlus`、`SetCapCaseInsensitive`、`SetCapDeleteAccess`、
+`SetCapOpenTrunc`、`SetDirectIO`、`SetUseIno`。
+
+errno 常量（实测值）：`ENOENT=2 EIO=5 EACCES=13 EPERM=1 EXDEV=18 EEXIST=17
+ENOTDIR=20 EISDIR=21 EINVAL=22 ENOSPC=28 ENOTEMPTY=41 ELOOP=114`。
