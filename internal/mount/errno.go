@@ -11,13 +11,14 @@ import (
 // The errno values cgofuse uses on both platforms. They are declared here
 // rather than taken from syscall, because syscall's values are
 // platform-specific and the core must build everywhere. The values are
-// measured against the cgofuse package: EPERM=1 ENOENT=2 EIO=5 EACCES=13
-// EEXIST=17 EXDEV=18 ENOTDIR=20 EISDIR=21 EINVAL=22 ENOSPC=28 ENOSYS=38
-// ENOTEMPTY=41 ELOOP=114.
+// measured against the cgofuse package: EPERM=1 ENOENT=2 EIO=5 EBADF=9
+// EACCES=13 EEXIST=17 EXDEV=18 ENOTDIR=20 EISDIR=21 EINVAL=22 ENOSPC=28
+// ENOSYS=38 ENOTEMPTY=41 ELOOP=114.
 const (
 	EPERM     = 1
 	ENOENT    = 2
 	EIO       = 5
+	EBADF     = 9
 	EACCES    = 13
 	EEXIST    = 17
 	EXDEV     = 18

@@ -209,7 +209,11 @@ func (m *Mount) Statfs(path string, st *Statfs) int {
 // library; host.go passes through whatever the platform gave it. Only the write
 // bit is ever read.
 const (
-	OReadOnly  = 0
+	// OReadOnly is a read-only open. It is zero, so a handle whose mode was
+	// never set reads as read-only rather than accidentally writable.
+	OReadOnly = 0
+
+	// OReadWrite is what cgofuse passes for a writable open.
 	OReadWrite = 2
 )
 
@@ -232,12 +236,22 @@ func (m *Mount) Open(path string, mode int) (uint64, int) {
 		return 0, -EISDIR
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	fh := m.newHandleLocked(cleaned, n.Kind)
-	// The size is seeded from the index so a read of a file that is never
-	// written still knows where the end is without asking the owner.
 	h, _ := m.files[fh]
+	// The size is seeded from the index so a read of a file that is never written
+	// still knows where the end is without asking the owner. contentSize records
+	// the same number as the pre-modification length, which is what the truncate
+	// path needs to decide whether the buffer holds the file.
 	h.size = n.Size
+	h.contentSize = n.Size
+	// Anything that is not the read-write open is treated as read-only. O_WRONLY
+	// is a separate flag value in POSIX, so testing for equality with OReadOnly
+	// would classify a write-only open as read-write, and testing for equality
+	// with OReadWrite would classify it as read-only -- both wrong. The only
+	// question the mount asks is whether writes are allowed, and only OReadWrite
+	// allows them.
+	h.readOnly = mode != OReadWrite
+	m.mu.Unlock()
 	return fh, 0
 }
 
@@ -399,9 +413,9 @@ func (m *Mount) readTarget(path string, fh uint64) (readSnapshot, int) {
 	m.mu.Lock()
 	if h, ok := m.files[fh]; ok {
 		t := readSnapshot{path: h.path, kind: h.kind, size: h.size}
-		if h.dirty {
+		if !h.isClean() {
 			// Materialising now, under the lock, is what keeps the bytes
-			// consistent with the dirty flag that selected this branch. It costs
+			// consistent with the dirty state that selected this branch. It costs
 			// a copy of a buffer already bounded by the write limit, and it is
 			// the same buffer the flush will send.
 			t.content = h.content()
@@ -420,4 +434,364 @@ func (m *Mount) readTarget(path string, fh uint64) (readSnapshot, int) {
 		return readSnapshot{}, code
 	}
 	return readSnapshot{path: cleaned, kind: n.Kind, size: n.Size}, 0
+}
+
+// ---------------------------------------------------------------- the write path
+
+// Create opens a path for writing, making a handle whether or not the file
+// already exists.
+//
+// It is the read-write open, so an existing file is opened rather than refused:
+// cgofuse calls Create for O_CREAT on a path that may already be there, and
+// answering EEXIST would break every ordinary save. The handle starts empty and
+// clean, which is what a freshly opened file is.
+//
+// A symlink at the path is refused with ELOOP, the same as everywhere else. A
+// directory is EISDIR, because a writable handle on a directory would have to
+// answer writes that have no meaning.
+func (m *Mount) Create(path string, mode uint32) (uint64, int) {
+	cleaned, err := Clean(path)
+	if err != nil {
+		return 0, -EINVAL
+	}
+	// The parent lookup enforces the shape of the path: a missing parent is
+	// ENOENT and a parent that is a file is ENOTDIR. It runs first so a refused
+	// create leaves no handle behind, and the base name is not used here because
+	// Create allows the name to be taken or free.
+	if _, _, code := m.lookupParent(cleaned); code != 0 {
+		return 0, code
+	}
+	// The whole path is then resolved, because lookupParent sees only the parent:
+	// a symlink or a directory at the *leaf* is invisible to it. This is the same
+	// call the open and read paths make, so the refusals agree.
+	//
+	// The lookup cannot move after the lock. It lists through the caller, and
+	// holding the mount's lock while waiting on the wire is the deadlock this
+	// package avoids everywhere else.
+	existing, lookupCode := m.lookup(cleaned)
+	if lookupCode == -ELOOP {
+		return 0, -ELOOP
+	}
+	if lookupCode == 0 && existing.Kind == node.KindDir {
+		return 0, -EISDIR
+	}
+	if lookupCode == 0 && existing.Kind == node.KindDir {
+		return 0, -EISDIR
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	fh := m.newHandleLocked(cleaned, node.KindFile)
+	h, _ := m.files[fh]
+	if lookupCode == 0 {
+		// The file is already there. The index's size is recorded as both the
+		// current length and the pre-modification length, so a later truncation
+		// can tell whether this handle's buffer actually holds the file.
+		h.size = existing.Size
+		h.contentSize = existing.Size
+	}
+	return fh, 0
+}
+
+// Write records a write on a handle and returns how many bytes it took.
+//
+// A write to a path with no handle -- which cgofuse can deliver after a
+// connection was replaced -- is applied through a temporary handle that is
+// flushed and released straight away, so the write still lands. It is not
+// recorded anywhere afterwards, because there is no handle to record it on.
+//
+// A handle opened read-only is refused with EBADF rather than being silently
+// allowed to write. The kernel enforces this itself, but the mount is where the
+// mode is known, and honouring it makes the read-only open mean something.
+func (m *Mount) Write(path string, buf []byte, off int64, fh uint64) int {
+	if off < 0 {
+		return -EINVAL
+	}
+	if len(buf) == 0 {
+		// The kernel issues these. A success, not an error, and nothing to
+		// record: an editor looping on a zero-length write must not cause an
+		// upload per call.
+		return 0
+	}
+
+	m.mu.Lock()
+	h, ok := m.files[fh]
+	if !ok {
+		m.mu.Unlock()
+		return m.writeThroughPath(path, buf, off)
+	}
+	if h.readOnly {
+		m.mu.Unlock()
+		return -EBADF
+	}
+	// The handle records a write as a status, where zero means it was taken. The
+	// interface this method implements wants a byte count instead, so the two are
+	// converted here rather than making the handle carry both meanings: a handle
+	// status of zero and a byte count of zero are different answers, and a caller
+	// that confused them would report every successful write as a no-op.
+	code := h.write(off, buf)
+	m.mu.Unlock()
+	if code != 0 {
+		return code
+	}
+	return len(buf)
+}
+
+// writeThroughPath applies one write with no open handle to record it on.
+//
+// The handle is loaded with the owner's current content first. Without that the
+// write would be the whole of the file as far as the upload is concerned, and a
+// one-byte write at the end of a large file would replace it with one byte. The
+// load reads the whole file, so this path is expensive; the kernel normally
+// pairs a write with an earlier open, and this exists so that it cannot silently
+// corrupt a file when it does not.
+func (m *Mount) writeThroughPath(path string, buf []byte, off int64) int {
+	cleaned, err := Clean(path)
+	if err != nil {
+		return -EINVAL
+	}
+	n, code := m.lookup(cleaned)
+	if code != 0 {
+		return code
+	}
+	if n.Kind == node.KindDir {
+		return -EISDIR
+	}
+
+	m.mu.Lock()
+	fh := m.newHandleLocked(cleaned, n.Kind)
+	h, _ := m.files[fh]
+	h.size = n.Size
+	h.contentSize = n.Size
+	m.mu.Unlock()
+
+	if err := m.loadContent(h); err != nil {
+		m.mu.Lock()
+		m.closeHandle(fh)
+		m.mu.Unlock()
+		return errnoFor(err)
+	}
+
+	m.mu.Lock()
+	code = h.write(off, buf)
+	m.mu.Unlock()
+
+	if code != 0 {
+		m.mu.Lock()
+		m.closeHandle(fh)
+		m.mu.Unlock()
+		return code
+	}
+	flushed := m.flush(fh)
+	m.mu.Lock()
+	m.closeHandle(fh)
+	m.mu.Unlock()
+	if flushed != 0 {
+		return flushed
+	}
+	return len(buf)
+}
+
+// loadContent fills a handle's buffer with the owner's current content, so that
+// a partial write does not become the whole file.
+//
+// It is what makes Read-modify-Write correct in the two path-form operations: a
+// write of one byte at the end of a large file must upload the whole file with
+// that byte changed, not the one byte.
+//
+// A file the index believed was empty is allowed to be non-empty on the owner,
+// which is what a stale index looks like; that is trusted and seeded.
+//
+// Any other failure leaves the buffer empty, which would make the write that
+// follows replace the file with itself. An error from a caller that answered at
+// least partly is treated as a success for that reason: the partial content is
+// closer to the truth than zeros. A caller that failed outright is reported, so
+// the caller of this function can refuse the operation rather than destroy the
+// file.
+func (m *Mount) loadContent(h *openFile) error {
+	body, _, err := m.readPath(h.path)
+	if err != nil && len(body) == 0 {
+		return err
+	}
+	if len(body) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	h.writes[0] = append([]byte(nil), body...)
+	h.size = int64(len(body))
+	m.mu.Unlock()
+	// Filling the buffer from the owner is not a mutation, so it does not mark
+	// the handle dirty. The write or truncation that follows does.
+	return nil
+}
+
+// readPath reads a whole file from the owner, without holding the mount's lock.
+//
+// The chunk size bounds each wire request, so a large file is a sequence of
+// bounded reads rather than one unbounded allocation on the far side. n is always
+// positive: the wire's Read treats a negative count as "to the end" and a zero
+// count as an empty result rather than an error, so forwarding -1 would work by
+// accident and forwarding 0 would silently return nothing.
+func (m *Mount) readPath(path string) ([]byte, int64, error) {
+	var out []byte
+	var off int64
+	for {
+		chunk, err := m.caller.Read(path, off, chunkSize)
+		if err != nil {
+			if len(out) > 0 {
+				// A partial read is worth more than none: it is at least the
+				// file's beginning.
+				return out, int64(len(out)), nil
+			}
+			return nil, 0, err
+		}
+		if len(chunk) == 0 {
+			return out, int64(len(out)), nil
+		}
+		out = append(out, chunk...)
+		off += int64(len(chunk))
+		if len(chunk) < chunkSize {
+			return out, int64(len(out)), nil
+		}
+	}
+}
+
+// Truncate sets the file's length.
+//
+// Through a handle it is a content mutation and the handle stays dirty until a
+// flush, because the new length is content. Without a handle the file's current
+// bytes are read first and the result is uploaded straight away -- truncating a
+// file to zero on a path must actually empty it, and truncating it to a length
+// below its size must actually cut it.
+func (m *Mount) Truncate(path string, size int64, fh uint64) int {
+	if size < 0 {
+		return -EINVAL
+	}
+
+	m.mu.Lock()
+	h, ok := m.files[fh]
+	if ok {
+		clean := h.isClean()
+		m.mu.Unlock()
+
+		if clean {
+			// A handle that has never held this file's content is loaded first.
+			// Truncation means "this content, of this length", and cutting a
+			// buffer that never had the file in it would keep the length and lose
+			// the bytes.
+			//
+			// It is loaded unconditionally rather than only when the index claims
+			// a non-zero size. The index is the same source the handle's size came
+			// from, so trusting it here would let one stale "this file is empty"
+			// shorten a non-empty file -- the silent-loss failure. Reading an
+			// empty file costs one round trip and changes nothing.
+			//
+			// The load happens outside the mount's lock: reading a large file
+			// while holding it would stop every other operation for the length of
+			// the read, including the ones that would notice a dead connection.
+			if err := m.loadContent(h); err != nil {
+				return errnoFor(err)
+			}
+		}
+
+		m.mu.Lock()
+		n := h.truncateTo(size)
+		m.mu.Unlock()
+		return n
+	}
+	m.mu.Unlock()
+
+	cleaned, err := Clean(path)
+	if err != nil {
+		return -EINVAL
+	}
+	n, code := m.lookup(cleaned)
+	if code != 0 {
+		return code
+	}
+	if n.Kind == node.KindDir {
+		return -EISDIR
+	}
+
+	m.mu.Lock()
+	tmp := m.newHandleLocked(cleaned, n.Kind)
+	th, _ := m.files[tmp]
+	th.size = n.Size
+	th.contentSize = n.Size
+	m.mu.Unlock()
+
+	if err := m.loadContent(th); err != nil {
+		m.mu.Lock()
+		m.closeHandle(tmp)
+		m.mu.Unlock()
+		return errnoFor(err)
+	}
+
+	m.mu.Lock()
+	res := th.truncateTo(size)
+	m.mu.Unlock()
+
+	if res < 0 {
+		m.mu.Lock()
+		m.closeHandle(tmp)
+		m.mu.Unlock()
+		return res
+	}
+	code = m.flush(tmp)
+	m.mu.Lock()
+	m.closeHandle(tmp)
+	m.mu.Unlock()
+	if code != 0 {
+		return code
+	}
+	return 0
+}
+
+// Fsync flushes the handle before returning.
+//
+// This is the entry that makes the difference between a save that survives a
+// power loss and one that reports success having written nothing. Both forms
+// flush: the mount cannot write content without also writing metadata, so
+// treating datasync as "content may wait" would be a lie.
+func (m *Mount) Fsync(path string, datasync bool, fh uint64) int {
+	return m.flush(fh)
+}
+
+// Flush uploads the handle's accumulated writes.
+//
+// cgofuse calls it on close() of a file descriptor even when the descriptor
+// stays open elsewhere, so it is not the last chance -- but it is a chance, and
+// it is cheap when the handle is clean.
+func (m *Mount) Flush(path string, fh uint64) int {
+	return m.flush(fh)
+}
+
+// Release uploads the handle's writes and then forgets the handle.
+//
+// The handle is freed even when the upload fails. Leaving it in the table would
+// leak it for the life of the mount, and the kernel has already finished with
+// the descriptor, so a later write could arrive for a handle it believes is
+// gone. The failure is still reported, because the content did not land.
+func (m *Mount) Release(path string, fh uint64) int {
+	code := m.flush(fh)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	h, ok := m.files[fh]
+	if !ok {
+		// Already released, or never known. Idempotent, per cgofuse.
+		return code
+	}
+	blocked := ""
+	if !h.isClean() {
+		blocked = h.path
+	}
+	m.closeHandle(fh)
+	if code == 0 && blocked != "" {
+		// The flush nominally succeeded but the handle was mutated while the
+		// upload was in flight, so its content is not on the owner. Saying so is
+		// the difference between a lost save and a reported one.
+		return -EIO
+	}
+	return code
 }

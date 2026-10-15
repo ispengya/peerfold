@@ -1,6 +1,8 @@
 package mount
 
 import (
+	"bytes"
+
 	"peerfold/internal/node"
 )
 
@@ -16,6 +18,20 @@ type openFile struct {
 	fh   uint64
 	kind node.Kind
 	size int64
+	// readOnly records the mode the handle was opened with. cgofuse passes it at
+	// open time and the kernel enforces it there too, but the mount is where the
+	// mode is known, and a write to a read-only handle is refused with EBADF
+	// rather than being allowed to quietly modify a file the caller only opened
+	// to read.
+	readOnly bool
+	// contentSize is the size the index reported when the handle was opened.
+	//
+	// It is kept separately from size because size is a mutable record of the
+	// content's current length, and the two answer different questions: size says
+	// how long the handle's bytes are now, while contentSize says how long the
+	// file was before this handle touched it. The truncate path needs the second
+	// to know whether the handle's buffer actually holds the file.
+	contentSize int64
 	// writeLimit is copied from the Mount's options when the handle is opened,
 	// not read from them later. A handle's cap is a property of the handle: if
 	// it were read live, changing the option would change the cap of files
@@ -38,6 +54,54 @@ type openFile struct {
 	// the whole file, so a write far into a large file costs that file's size in
 	// one allocation. See the note on heldBytes.
 	writes map[int64][]byte
+
+	// version counts mutations of this handle: every write, every truncation.
+	//
+	// It exists so a flush can tell whether the content it uploaded is still the
+	// content the handle holds. A flush cannot hold the mount's lock across a
+	// whole-file upload -- that is a wire round trip of up to the call timeout --
+	// so writes can arrive while the upload is in flight. Without a version, the
+	// flush would clear the dirty flag on return and silently discard exactly
+	// those writes, which is the lost-update bug this field prevents.
+	version uint64
+
+	// dirtyVersion is the handle's version as of the last successful flush. The
+	// handle is clean exactly when version == dirtyVersion.
+	dirtyVersion uint64
+}
+
+// markDirty records that the handle's content changed.
+//
+// Every mutation bumps the version, which is what makes "is this handle clean"
+// answerable without a separate flag that could drift out of step with the
+// content: the flag and the version are set together, in one place.
+func (o *openFile) markDirty() {
+	o.version++
+	o.dirty = true
+}
+
+// isClean reports whether the handle's content is already on the owner.
+//
+// It is derived rather than stored, so it cannot disagree with the version that
+// a flush compares. Setting o.dirty = false by hand, anywhere, would reintroduce
+// the disagreement this avoids.
+func (o *openFile) isClean() bool {
+	return o.version == o.dirtyVersion
+}
+
+// markFlushed records that the given version has reached the owner.
+//
+// It refuses to clear the flag when the handle has moved on, which is the whole
+// point: the upload that just finished carried an older body, so the handle is
+// still dirty and a later flush must run. Returning false says the handle
+// changed under the flush.
+func (o *openFile) markFlushed(v uint64) bool {
+	if o.version != v {
+		return false
+	}
+	o.dirtyVersion = v
+	o.dirty = false
+	return true
 }
 
 // newHandleLocked allocates a handle for a path and records it in the table.
@@ -76,6 +140,99 @@ func (m *Mount) closeHandle(fh uint64) {
 	m.cache.dropOpenLocked(fh)
 }
 
+// flush uploads one handle's whole buffer and marks it clean.
+//
+// It is idempotent, because Fsync, Flush and Release can all arrive for one
+// handle and three whole-file uploads of a 40 MB file is a real cost.
+//
+// The mount's lock is NOT held across the upload. A Put is a wire round trip of
+// up to the call timeout, and holding the lock across it would stop every other
+// operation -- including the ones that would notice the connection is gone. The
+// cost of releasing it is that writes can land while the upload is in flight, so
+// the handle's version is captured with the content and compared afterwards: if
+// it moved, the upload carried an older body and the handle stays dirty. Without
+// that comparison the clear would discard exactly those writes, silently.
+//
+// A failed upload leaves the handle dirty for the same reason: the write did not
+// land, and clearing the flag would discard the only copy of the content.
+//
+// An unknown handle is a success, not an error. cgofuse can deliver Fsync or
+// Flush for a handle the kernel has already released, and refusing would turn a
+// harmless race into an input/output error on a save.
+func (m *Mount) flush(fh uint64) int {
+	m.mu.Lock()
+	h, ok := m.files[fh]
+	if !ok || h.isClean() {
+		m.mu.Unlock()
+		return 0
+	}
+	path, body, version := h.path, h.content(), h.version
+	m.mu.Unlock()
+
+	if err := m.caller.Put(path, bytes.NewReader(body)); err != nil {
+		return errnoFor(err)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// The handle is looked up again rather than reused: it can have been released
+	// and reallocated while the upload was in flight, and marking a different
+	// handle clean would be worse than doing nothing.
+	if h2, ok := m.files[fh]; ok {
+		h2.markFlushed(version)
+	}
+	return 0
+}
+
+// flushPath uploads every dirty handle whose path is this one.
+//
+// It exists for the operations that replace or remove a path: a rename or an
+// unlink has to get the content out before the name it was opened under
+// disappears, and more than one handle can be open on the same path.
+func (m *Mount) flushPath(path string) int {
+	m.mu.Lock()
+	fhs := make([]uint64, 0, len(m.files))
+	for fh, h := range m.files {
+		if h.path == path && !h.isClean() {
+			fhs = append(fhs, fh)
+		}
+	}
+	m.mu.Unlock()
+
+	code := 0
+	for _, fh := range fhs {
+		if c := m.flush(fh); c != 0 && code == 0 {
+			code = c
+		}
+	}
+	return code
+}
+
+// flushAll uploads every dirty handle, and reports how many could not be.
+//
+// It is what an unmount or a lost connection runs. A count is returned rather
+// than a bare errno because losing a connection can leave several handles with
+// content that never landed, and the caller has to put that in the log: silence
+// here is a save that vanished.
+func (m *Mount) flushAll() int {
+	m.mu.Lock()
+	fhs := make([]uint64, 0, len(m.files))
+	for fh, h := range m.files {
+		if !h.isClean() {
+			fhs = append(fhs, fh)
+		}
+	}
+	m.mu.Unlock()
+
+	failed := 0
+	for _, fh := range fhs {
+		if m.flush(fh) != 0 {
+			failed++
+		}
+	}
+	return failed
+}
+
 // write records a write at off. It returns 0 or -ENOSPC; it never truncates.
 //
 // The refusal is the point of the function. The wire carries whole files, so
@@ -95,7 +252,7 @@ func (o *openFile) write(off int64, data []byte) int {
 	if end := off + int64(len(data)); end > o.size {
 		o.size = end
 	}
-	o.dirty = true
+	o.markDirty()
 	return 0
 }
 
@@ -238,7 +395,7 @@ func (o *openFile) truncateTo(size int64) int {
 			o.writes[off] = keep
 		}
 	}
-	o.dirty = true
+	o.markDirty()
 	return 0
 }
 

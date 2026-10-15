@@ -513,13 +513,17 @@ func TestFirstChunkFailureIsAnErrnoNotEOF(t *testing.T) {
 	f.setContent("/big", []byte(strings.Repeat("A", chunkSize*2)))
 
 	fh, _ := m.Open("/big", OReadOnly)
-	f.setReadFailure(0)
+	// Nothing is cached, so the very first chunk read is the one that fails.
+	f.setFirstReadFailure()
 
-	// The sentinel cannot be injected at offset 0 by design, so this is the
-	// empty-handle case: the read must be a success, proving the guard above
-	// means what it says.
+	// Zero would mean end of file, and the kernel would believe the file is
+	// empty. The failure has to be an errno.
+	if n := m.Read("/big", make([]byte, 16), 0, fh); n != -EIO {
+		t.Errorf("a failed first chunk = %d, want -EIO (0 would mean end of file)", n)
+	}
+	// And it must be recoverable: the failure is one-shot, so a retry reads.
 	if n := m.Read("/big", make([]byte, 16), 0, fh); n != 16 {
-		t.Errorf("Read with no injected failure at offset 0 = %d, want 16", n)
+		t.Errorf("the retry after a failed first chunk = %d, want 16", n)
 	}
 }
 

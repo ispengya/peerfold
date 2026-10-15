@@ -3,6 +3,7 @@ package mount
 import (
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 
@@ -53,6 +54,26 @@ type fakeCaller struct {
 	// fail. Tests for the failure *mapping* use listErr, which fails resolution;
 	// this exists for tests of the partial-read behaviour.
 	readErrAt int64
+
+	// readErrFirst makes the next read of any offset fail, once. It is the
+	// trigger for the "the very first chunk failed" case, which readErrAt cannot
+	// express because offset 0 is reserved: the mount resolves a path before it
+	// reads, so a failure at offset 0 would land in resolution.
+	readErrFirst bool
+
+	// putErr, when set, makes every Put fail after being recorded. A failed
+	// upload must leave the handle dirty, and the only way to tell a flush that
+	// failed from one that never ran is to record the attempt and then fail.
+	putErr error
+	// puts records the body of every successful Put, so a test can assert how
+	// many whole-file uploads a sequence caused and what each carried.
+	puts [][]byte
+
+	// onPut, when set, runs inside Put after the body has been read and before
+	// the content is stored. It is the hook a test uses to land a write while an
+	// upload is in flight, which is the window the version tracking exists for.
+	// It must not take the fake's own lock: Put is called with it released.
+	onPut func()
 
 	// watchCh is created on first use by Watch, so a test can hold the channel
 	// before the core starts watching and drive it afterwards.
@@ -111,13 +132,18 @@ func (f *fakeCaller) addSymlink(p string) {
 	f.nodes[p] = node.Node{Path: p, Kind: node.KindSymlink, Mode: 1 << 27}
 }
 
-// readErrSentinel reports the error a read starting at off should fail with.
+// readErrSentinel reports the error a read should fail with, or nil.
 //
-// The trigger is readErrAt == 0 meaning "off is set", because an offset of 0 is
-// never itself the sentinel: a failure injected at offset 0 would make the
-// fixture's own setup reads fail. Requiring a non-zero trigger offset therefore
-// costs nothing and removes a way for a test to silently do nothing.
+// Two triggers are supported. readErrAt names a chunk offset; readErrFirst makes
+// the *first* read of any offset fail. The first-read form exists because offset
+// 0 is not usable as a sentinel: the mount resolves a path before it reads, and
+// the resolution is a List call, so a failure attached to offset 0 would land in
+// resolution instead of in the read under test.
 func (f *fakeCaller) readErrSentinel(off int64) error {
+	if f.readErrFirst {
+		f.readErrFirst = false
+		return errInjectedRead
+	}
 	if f.readErrAt == 0 || f.readErrAt != off {
 		return nil
 	}
@@ -135,6 +161,13 @@ func (f *fakeCaller) setReadFailure(off int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.readErrAt = off
+}
+
+// setFirstReadFailure makes the next read of any offset fail, once.
+func (f *fakeCaller) setFirstReadFailure() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.readErrFirst = true
 }
 
 // setContent replaces a file's bytes without recording a call.
@@ -257,10 +290,9 @@ func (f *fakeCaller) childrenLocked(dir string) []node.Node {
 func (f *fakeCaller) Read(path string, off int64, n int) ([]byte, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, "Read "+path)
-	// The injected failure is checked and cleared under the same lock as the call
-	// log, so a test that sets it cannot race the read that observes it. Clearing
-	// would be wrong for a retry test, so it is not cleared: the same chunk fails
-	// every time, which is what a genuinely broken link does.
+	// The injected failure is checked under the same lock as the call log, so a
+	// test that sets it cannot race the read that observes it. It is not cleared
+	// on use: the same chunk fails every time, which is what a broken link does.
 	failWith := f.readErrSentinel(off)
 	f.mu.Unlock()
 	if failWith != nil {
@@ -269,20 +301,9 @@ func (f *fakeCaller) Read(path string, off int64, n int) ([]byte, error) {
 	if _, ok := f.nodes[path]; !ok {
 		return nil, errNotFound
 	}
-	// The offset must be a chunk boundary and the request must not span more than
-	// one chunk, because that is the contract the mount's read loop relies on: it
-	// has a fixed chunkSize and translates between the caller's offset and a
-	// chunk index. A fake that served arbitrary ranges would accept an
-	// accidentally unaligned request and answer it, hiding exactly the arithmetic
-	// error this contract is meant to catch.
 	if off < 0 {
-		return nil, errStr("mount: negative offset")
-	}
-	if off%chunkSize != 0 {
-		return nil, errStr("fake: read offset is not a chunk boundary")
-	}
-	if n > chunkSize {
-		return nil, errStr("fake: read spans more than one chunk")
+		// The wire treats a negative offset as zero; the mount never asks for one.
+		off = 0
 	}
 	body := f.data[path]
 	if off >= int64(len(body)) {
@@ -302,12 +323,63 @@ func (f *fakeCaller) Put(path string, r io.Reader) error {
 	if err != nil {
 		return err
 	}
+
+	f.mu.Lock()
+	f.calls = append(f.calls, "Put "+path)
+	// The failure is captured and the lock released before the hook runs: a test
+	// that lands a write from inside the hook has to be able to take the mount's
+	// lock, and holding this one across the hook would deadlock against it.
+	failWith := f.putErr
+	hook := f.onPut
+	f.mu.Unlock()
+
+	if hook != nil {
+		hook()
+	}
+
+	if failWith != nil {
+		return failWith
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls = append(f.calls, "Put "+path)
 	f.data[path] = body
 	f.nodes[path] = node.Node{Path: path, Kind: node.KindFile, Size: int64(len(body)), Mode: 0o644}
+	f.puts = append(f.puts, append([]byte(nil), body...))
 	return nil
+}
+
+// setPutFailure makes every subsequent Put fail. See putErr for why the call is
+// still logged.
+func (f *fakeCaller) setPutFailure(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.putErr = err
+}
+
+// putCount is how many Put calls reached the caller, successful or not.
+func (f *fakeCaller) putCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, "Put ") {
+			n++
+		}
+	}
+	return n
+}
+
+// putBodies is the content of every successful Put, in order, so a test can
+// assert both how many uploads happened and what each carried.
+func (f *fakeCaller) putBodies() [][]byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out [][]byte
+	for _, b := range f.puts {
+		out = append(out, append([]byte(nil), b...))
+	}
+	return out
 }
 
 func (f *fakeCaller) Mkdir(path string) error {
