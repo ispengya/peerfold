@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"peerfold/internal/errtoken"
 	"peerfold/internal/node"
 )
 
@@ -77,14 +78,16 @@ func (f *FS) ReadAt(share, rel string, off int64, n int) ([]byte, os.FileInfo, e
 	fh, err := os.Open(full)
 	if err != nil {
 		// os.Open's error already satisfies os.ErrNotExist for a missing
-		// path, so it is passed through rather than flattened into a string.
-		return nil, nil, err
+		// path, so it is passed through to the token classifier rather than
+		// flattened into a string: the classifier keeps that property and adds
+		// the category the mount layer reads.
+		return nil, nil, tokenForOSError(err)
 	}
 	defer fh.Close()
 
 	info, err := fh.Stat()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, tokenForOSError(err)
 	}
 	if info.IsDir() {
 		// Reading a directory is not "a file with no bytes"; it is a
@@ -254,7 +257,10 @@ func (f *FS) Create(share, rel string) error {
 	}
 	fh, err := os.OpenFile(full, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
-		return err
+		// O_EXCL is what makes this the "already exists" case, so the
+		// classifier sees os.ErrExist and the mount layer learns ENOTEMPTY
+		// rather than having to guess from the OS's own wording.
+		return tokenForOSError(err)
 	}
 	return fh.Close()
 }
@@ -305,6 +311,50 @@ func (f *FS) removeIfPresent(share, rel string) {
 	_ = os.Remove(full)
 }
 
+// tokenForOSError classifies an operating-system error into one of the
+// categories the mount layer distinguishes, and prefixes it with the stable
+// token for that category. An error it cannot classify is returned unchanged,
+// because errnoFor already turns an unrecognised error into EIO — and EIO is
+// the honest answer for a failure whose category is not known.
+//
+// This is the producing side of the token convention; internal/mount/errno.go
+// is the reading side. It lives here, in the filesystem layer, because this is
+// the nearest point at which the category is still knowable. Above it the error
+// becomes a string on the wire, and the text of that string is localized: the
+// same missing file reads "no such file or directory" on Linux and "The system
+// cannot find the file specified" on Windows.
+//
+// The classification uses Go's portable error sentinels rather than errno
+// numbers, and the reason is measured rather than assumed. On Windows the raw
+// errno for a non-empty directory is 145 and for an existing name is 183, and
+// Go maps both of them onto os.ErrExist; on Linux they are ENOTEMPTY (39) and
+// EEXIST (17), which Go also maps onto os.ErrExist. So os.ErrExist means "a
+// name already owns this path", which covers both "already exists" and "is not
+// empty", and it is the same test on both platforms. syscall.ENOTEMPTY and
+// syscall.EEXIST are deliberately not used to tell those apart: on Windows they
+// hold unix-style values that no real Windows errno equals, so neither ever
+// matches.
+//
+// errnoFor's token table has one category for "not empty" and none for "already
+// exists" on its own, so an ErrExist is reported as ENOTEMPTY. That is the
+// safer of the two: telling a caller "this directory still has contents" when
+// the truth was "this name is taken" makes it stop and look, while the reverse
+// would invite it to replace something.
+func tokenForOSError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, os.ErrPermission):
+		return errtoken.With(errtoken.Permission, err)
+	case errors.Is(err, os.ErrNotExist):
+		return errtoken.With(errtoken.NotFound, err)
+	case errors.Is(err, os.ErrExist):
+		return errtoken.With(errtoken.NotEmpty, err)
+	default:
+		return err
+	}
+}
+
 // Mkdir makes a new directory, and refuses if the name is already taken.
 //
 // Mkdir rather than MkdirAll: creating the parents as a side effect would let a
@@ -314,7 +364,7 @@ func (f *FS) Mkdir(share, rel string) error {
 	if err != nil {
 		return err
 	}
-	return os.Mkdir(full, 0o755)
+	return tokenForOSError(os.Mkdir(full, 0o755))
 }
 
 // Rename moves a path within one share.
@@ -330,7 +380,7 @@ func (f *FS) Rename(share, oldRel, newRel string) error {
 	if err != nil {
 		return err
 	}
-	return os.Rename(oldFull, newFull)
+	return tokenForOSError(os.Rename(oldFull, newFull))
 }
 
 // Remove deletes one file or one empty directory.
@@ -344,18 +394,24 @@ func (f *FS) Remove(share, rel string) error {
 	}
 	info, err := os.Lstat(full)
 	if err != nil {
-		return err
+		return tokenForOSError(err)
 	}
 	if info.IsDir() {
 		// os.Remove refuses a non-empty directory on its own, and this keeps
 		// that behaviour explicit rather than relying on it silently.
 		entries, err := os.ReadDir(full)
 		if err != nil {
-			return err
+			return tokenForOSError(err)
 		}
 		if len(entries) > 0 {
-			return fmt.Errorf("client: %q is not empty: refusing to remove a directory with %d entry(ies)", rel, len(entries))
+			// The category is known here without asking the operating system,
+			// so the token is applied directly rather than through the
+			// classifier. It is the same token the classifier derives from
+			// os.ErrExist, which is what os.Remove reports for this case on
+			// both platforms.
+			return errtoken.With(errtoken.NotEmpty,
+				fmt.Errorf("client: %q is not empty: refusing to remove a directory with %d entry(ies)", rel, len(entries)))
 		}
 	}
-	return os.Remove(full)
+	return tokenForOSError(os.Remove(full))
 }
