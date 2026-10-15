@@ -182,7 +182,13 @@ type Mount struct {
 	// invalidatePath asks the host to drop the kernel's cached attributes for one
 	// path. FUSE has no whole-filesystem invalidate, so a refresh walks the
 	// handed-out table and calls this per path.
-	invalidatePath func(string)
+	//
+	// It reports whether the kernel accepted the request. A refusal is not an
+	// error the mount can act on -- the remaining paths still have to be
+	// invalidated and the reconnect has already happened -- but a run of them is
+	// worth hearing about, because the alternative is a kernel serving attributes
+	// the mount knows to be wrong. See invalidateAll.
+	invalidatePath func(string) bool
 }
 
 // New builds the operation core over a caller, which is the layer that actually

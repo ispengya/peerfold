@@ -765,10 +765,11 @@ func TestReconnectInvalidatesEveryHandedOutPath(t *testing.T) {
 	var mu sync.Mutex
 	seen := map[string]int{}
 	m.mu.Lock()
-	m.invalidatePath = func(p string) {
+	m.invalidatePath = func(p string) bool {
 		mu.Lock()
 		seen[p]++
 		mu.Unlock()
+		return true
 	}
 	m.mu.Unlock()
 
@@ -808,12 +809,13 @@ func TestInvalidationCoversReleasedPaths(t *testing.T) {
 	var mu sync.Mutex
 	seen := 0
 	m.mu.Lock()
-	m.invalidatePath = func(p string) {
+	m.invalidatePath = func(p string) bool {
 		if p == "/a.txt" {
 			mu.Lock()
 			seen++
 			mu.Unlock()
 		}
+		return true
 	}
 	m.mu.Unlock()
 
@@ -841,7 +843,7 @@ func TestInvalidateAllWalksABoundedTable(t *testing.T) {
 	var mu sync.Mutex
 	n := 0
 	m.mu.Lock()
-	m.invalidatePath = func(string) { mu.Lock(); n++; mu.Unlock() }
+	m.invalidatePath = func(string) bool { mu.Lock(); n++; mu.Unlock(); return true }
 	m.mu.Unlock()
 
 	m.invalidateAll()

@@ -10,10 +10,18 @@ import (
 
 // The errno values cgofuse uses on both platforms. They are declared here
 // rather than taken from syscall, because syscall's values are
-// platform-specific and the core must build everywhere. The values are
-// measured against the cgofuse package: EPERM=1 ENOENT=2 EIO=5 EBADF=9
-// EACCES=13 EEXIST=17 EXDEV=18 ENOTDIR=20 EISDIR=21 EINVAL=22 ENOSPC=28
-// ENOSYS=38 ENOTEMPTY=41 ELOOP=114.
+// platform-specific and the core must build everywhere.
+//
+// "Both platforms" is not a figure of speech: cgofuse ships its own table, and
+// it is the same one on Windows and on Linux. The cgo build redefines errno in
+// C to these numbers and the pure-Go Windows build declares them in Go, so
+// ENOSYS is 40 on both, not the 38 an uname(1) would suggest. The values were
+// read out of the library (fsop_cgo.go and fsop_nocgo_windows.go) and are pinned
+// there by TestErrnosMatchCgofuse, because every one of these numbers is handed
+// back to the kernel through cgofuse and a wrong one is a wrong error.
+//
+// EPERM=1 ENOENT=2 EIO=5 EBADF=9 EACCES=13 EEXIST=17 EXDEV=18 ENOTDIR=20
+// EISDIR=21 EINVAL=22 ENOSPC=28 ENOSYS=40 ENOTEMPTY=41 ENOATTR=120 ELOOP=114.
 const (
 	EPERM     = 1
 	ENOENT    = 2
@@ -26,9 +34,15 @@ const (
 	EISDIR    = 21
 	EINVAL    = 22
 	ENOSPC    = 28
-	ENOSYS    = 38
+	ENOSYS    = 40
 	ENOTEMPTY = 41
 	ELOOP     = 114
+	// ENOATTR is what a getxattr for a missing attribute must return. It is
+	// cgofuse's name for ENODATA on every platform it builds for, and 120 is its
+	// value on both -- the same 120 that a Linux kernel would call something else
+	// entirely, which is why this number is copied from the library rather than
+	// from experience.
+	ENOATTR = 120
 )
 
 // Error tokens come from internal/errtoken, which both this package and the

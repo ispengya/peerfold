@@ -2,6 +2,7 @@ package mount
 
 import (
 	"bytes"
+	"log"
 
 	"peerfold/internal/node"
 )
@@ -246,6 +247,32 @@ func (m *Mount) flushAll() int {
 		}
 	}
 	return failed
+}
+
+// flushAllHandles is flushAll for the unmount path, and it is the version that
+// says what was lost.
+//
+// An unmount is a chance to save rather than a crash, so every dirty handle gets
+// one final attempt. flushAll reports a count, which is the right shape for a
+// caller that wants to decide something; this caller wants to tell the user, so it
+// reports each failure by handle instead. Silence here would be an edit that
+// vanished with no record of it.
+func (m *Mount) flushAllHandles() {
+	m.mu.Lock()
+	fhs := make([]uint64, 0, len(m.files))
+	for fh, h := range m.files {
+		if !h.isClean() {
+			fhs = append(fhs, fh)
+		}
+	}
+	m.mu.Unlock()
+
+	for _, fh := range fhs {
+		if code := m.flush(fh); code != 0 {
+			log.Printf("mount: flushing handle %d on unmount failed (%d); the "+
+				"owner did not accept the last write", fh, code)
+		}
+	}
 }
 
 // write records a write at off. It returns 0 or -ENOSPC; it never truncates.

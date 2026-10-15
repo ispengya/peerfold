@@ -234,15 +234,25 @@ func (m *Mount) discardDirtyOnDisconnect() {
 func (m *Mount) invalidateAll() {
 	paths := m.handedOut()
 	hook := m.invalidateHook()
+	refused := 0
 	for _, p := range paths {
-		if hook != nil {
-			hook(p)
+		if hook != nil && !hook(p) {
+			refused++
 		}
+	}
+	// A refusal means the kernel may go on serving the cached attributes this
+	// call exists to remove. It is logged rather than returned because there is
+	// no caller to return it to, and it is logged as a total rather than per path
+	// because a reconnect invalidates thousands of paths at once.
+	if refused > 0 {
+		log.Printf("mount: the kernel refused %d of %d attribute invalidations; "+
+			"those paths may stay stale until their cache times out",
+			refused, len(paths))
 	}
 }
 
 // invalidateHook reads the invalidate callback under the lock.
-func (m *Mount) invalidateHook() func(string) {
+func (m *Mount) invalidateHook() func(string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.invalidatePath
