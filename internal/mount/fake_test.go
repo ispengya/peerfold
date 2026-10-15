@@ -424,9 +424,14 @@ func (f *fakeCaller) Rename(oldPath, newPath string) error {
 	if _, ok := f.nodes[oldPath]; !ok {
 		return errNotFound
 	}
-	if _, ok := f.nodes[newPath]; ok {
-		return errNotEmpty
-	}
+	// An existing target is replaced, not refused. This mirrors os.Rename, which
+	// the client uses: a rename onto an existing name overwrites it, and that is
+	// the whole point of the editor pattern the mount is built around -- a
+	// temporary file is renamed over the original. A fake that refused it would
+	// make the mount's most important rename case untestable, and would have the
+	// fake disagreeing with the thing it stands in for.
+	delete(f.nodes, newPath)
+	delete(f.data, newPath)
 	if n, ok := f.nodes[oldPath]; ok {
 		delete(f.nodes, oldPath)
 		n.Path = newPath
@@ -476,6 +481,21 @@ func (f *fakeCaller) dropWatch() {
 	if ch != nil {
 		close(ch)
 	}
+}
+
+// callIndex reports the position of the first call whose text is exactly want, or
+// -1. It exists so a test can assert *ordering* rather than mere occurrence:
+// "the flush happened" and "the flush happened before the removal" are different
+// claims, and only the second one is the contract.
+func (f *fakeCaller) callIndex(want string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, c := range f.calls {
+		if c == want {
+			return i
+		}
+	}
+	return -1
 }
 
 func (f *fakeCaller) callLog() []string {

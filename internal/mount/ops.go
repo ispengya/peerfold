@@ -795,3 +795,237 @@ func (m *Mount) Release(path string, fh uint64) int {
 	}
 	return code
 }
+
+// ---------------------------------------------------------------- the namespace
+
+// Mkdir creates a directory.
+//
+// The name must not already be there, and the answer for that is EEXIST whether
+// the name is held by a file or by another directory: the caller's mistake is the
+// same in both cases, and POSIX mkdir says EEXIST for both.
+//
+// A symlink at the name is also a refusal, as ELOOP rather than EEXIST. Both are
+// non-zero; ELOOP is more informative, and it is the same answer the rest of the
+// mount gives for a symlink.
+func (m *Mount) Mkdir(path string, mode uint32) int {
+	cleaned, err := Clean(path)
+	if err != nil {
+		return -EINVAL
+	}
+	// The parent lookup enforces the shape: a missing parent is ENOENT and a
+	// parent that is a file is ENOTDIR.
+	if _, _, code := m.lookupParent(cleaned); code != 0 {
+		return code
+	}
+	// The whole path is resolved to find out whether the name is taken.
+	// lookupParent sees only the parent, so it cannot answer that.
+	if _, code := m.lookup(cleaned); code == 0 {
+		return -EEXIST
+	} else if code == -ELOOP {
+		return -ELOOP
+	} else if code != -ENOENT {
+		return code
+	}
+	if err := m.caller.Mkdir(cleaned); err != nil {
+		return errnoFor(err)
+	}
+	return 0
+}
+
+// kindAt reports the kind of whatever is at a path, including a symlink.
+//
+// It exists because lookup refuses symlinks with ELOOP, and unlink and rename
+// have to be able to see one: removing or moving a link is safe, and it is the
+// only way to get rid of one through the mount. Without this, a symlink would be
+// permanently undeletable, and every "rm link" would report a loop.
+//
+// A missing parent or a path deeper than an existing file is reported as absent,
+// which is the same narrower-than-POSIX answer lookup gives and the same one the
+// index gives.
+func (m *Mount) kindAt(cleaned string) (node.Kind, bool) {
+	if cleaned == "/" {
+		return node.KindDir, true
+	}
+	parent, base, err := SplitParent(cleaned)
+	if err != nil {
+		return 0, false
+	}
+	children, err := m.caller.List(parent)
+	if err != nil {
+		return 0, false
+	}
+	if c, ok := childNamed(children, base); ok {
+		return c.Kind, true
+	}
+	return 0, false
+}
+
+// dropHandlesFor forgets every handle on a path and releases its cached chunks.
+//
+// The caller must hold m.mu. It is what stops a later flush from recreating a
+// name the user just removed.
+func (m *Mount) dropHandlesFor(path string) {
+	for fh, h := range m.files {
+		if h.path == path {
+			m.closeHandle(fh)
+		}
+	}
+}
+
+// Unlink removes a file or a symlink.
+//
+// A directory is refused: some programs call unlink on one, and success would
+// make them believe it is gone. The mount reports EISDIR, which is also what the
+// read path uses for a directory.
+//
+// A dirty open on the path is flushed first. The handle is the only copy of the
+// content and the name is about to disappear, so removing it first would drop the
+// write entirely.
+func (m *Mount) Unlink(path string) int {
+	cleaned, err := Clean(path)
+	if err != nil {
+		return -EINVAL
+	}
+	if cleaned == "/" {
+		return -EPERM
+	}
+	// The kind is read through kindAt rather than lookup, so that a symlink is
+	// visible instead of being refused with ELOOP.
+	kind, present := m.kindAt(cleaned)
+	if !present {
+		return -ENOENT
+	}
+	if kind == node.KindDir {
+		return -EISDIR
+	}
+	if code := m.flushPath(cleaned); code != 0 {
+		return code
+	}
+	if err := m.caller.Remove(cleaned); err != nil {
+		return errnoFor(err)
+	}
+	m.mu.Lock()
+	m.dropHandlesFor(cleaned)
+	m.mu.Unlock()
+	return 0
+}
+
+// Rmdir removes an empty directory.
+//
+// The emptiness check is the index's, not the owner's, so a directory that grew
+// on the owner since the last scan can be reported as empty and then refused by
+// the owner. That refusal is passed through rather than flattened: the caller
+// gets the truth from the layer that has it. The proactive check exists so the
+// common case does not cost a round trip.
+func (m *Mount) Rmdir(path string) int {
+	cleaned, err := Clean(path)
+	if err != nil {
+		return -EINVAL
+	}
+	// The root has no parent, so there is nothing to remove it from. This has to
+	// come before the lookup, because lookup("/") succeeds by construction.
+	if cleaned == "/" {
+		return -EPERM
+	}
+	n, code := m.lookup(cleaned)
+	if code != 0 {
+		return code
+	}
+	if n.Kind != node.KindDir {
+		return -ENOTDIR
+	}
+	children, err := m.caller.List(cleaned)
+	if err != nil {
+		return errnoFor(err)
+	}
+	if len(children) > 0 {
+		return -ENOTEMPTY
+	}
+	if err := m.caller.Remove(cleaned); err != nil {
+		return errnoFor(err)
+	}
+	return 0
+}
+
+// Rename moves a name.
+//
+// The source's dirty handles are flushed before the owner is asked to move
+// anything. This is the editor pattern -- write a temporary file, fsync it, rename
+// it over the original, often without releasing it first -- and skipping the flush
+// leaves the content in memory while the name moves, so the save appears to
+// succeed and the file is unchanged (D10).
+//
+// Handles still open on the source follow the new name, and handles on the target
+// are updated too, because the target's name now refers to the source's content:
+// a handle that kept the old target bytes would write them back over the
+// replacement on its next flush.
+func (m *Mount) Rename(oldPath, newPath string) int {
+	oldClean, err := Clean(oldPath)
+	if err != nil {
+		return -EINVAL
+	}
+	newClean, err := Clean(newPath)
+	if err != nil {
+		return -EINVAL
+	}
+	// Neither the root nor a path onto the root has a meaning. The source check
+	// cannot rely on lookup, which succeeds for the root by construction.
+	if oldClean == "/" || newClean == "/" {
+		return -EPERM
+	}
+	if oldClean == newClean {
+		// A move onto itself. POSIX says this is a success and leaves the file
+		// alone, so nothing is done and nothing is reported.
+		return 0
+	}
+	if _, present := m.kindAt(oldClean); !present {
+		return -ENOENT
+	}
+	if _, _, code := m.lookupParent(newClean); code != 0 {
+		return code
+	}
+	// The source's content has to reach the owner before the name does. The
+	// target is flushed as well: its bytes are about to be replaced, and a handle
+	// still holding them would put them back.
+	if code := m.flushPath(oldClean); code != 0 {
+		return code
+	}
+	if code := m.flushPath(newClean); code != 0 {
+		return code
+	}
+	if err := m.caller.Rename(oldClean, newClean); err != nil {
+		return errnoFor(err)
+	}
+
+	// Both paths' handles are updated in one lock acquisition, so a concurrent
+	// reader never sees half of the move.
+	//
+	// A handle on the source keeps its buffer: it holds the very bytes the source
+	// name now carries. A handle on the target loses its buffer, because the file
+	// it described has just been replaced -- the target's own writes were flushed
+	// above, so nothing is lost by discarding them locally, and keeping them would
+	// put the old content back on the next flush. Its cached chunks go with the
+	// buffer for the same reason: they are the replaced file's bytes.
+	//
+	// The target handle is left clean rather than marked dirty, so a later read
+	// fetches the new file from the owner instead of materialising an empty
+	// buffer.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, h := range m.files {
+		switch h.path {
+		case oldClean:
+			h.path = newClean
+			m.cache.dropOpenLocked(h.fh)
+		case newClean:
+			h.path = newClean
+			h.writes = map[int64][]byte{}
+			h.size = 0
+			h.contentSize = 0
+			h.dirtyVersion = h.version
+			h.dirty = false
+			m.cache.dropOpenLocked(h.fh)
+		}
+	}
+	return 0
+}
