@@ -42,6 +42,18 @@ type fakeCaller struct {
 	listErr     error
 	listErrPath string
 
+	// readErrAt makes every read of a chunk starting at that offset fail with
+	// errInjectedReadFailure.
+	//
+	// It is a sentinel rather than an injectable error because the fake cannot
+	// tell a chunk read from the resolution calls the mount makes first: with one
+	// error value assigned to every offset, the mount fails while resolving the
+	// path and never reaches the read under test. A test written that way passes
+	// whether or not the read path maps anything, which is a test that cannot
+	// fail. Tests for the failure *mapping* use listErr, which fails resolution;
+	// this exists for tests of the partial-read behaviour.
+	readErrAt int64
+
 	// watchCh is created on first use by Watch, so a test can hold the channel
 	// before the core starts watching and drive it afterwards.
 	watchCh chan []node.Node
@@ -97,6 +109,67 @@ func (f *fakeCaller) addSymlink(p string) {
 	// core branches on Kind and a fake that set only one of the two would let
 	// a bug in either path go unnoticed.
 	f.nodes[p] = node.Node{Path: p, Kind: node.KindSymlink, Mode: 1 << 27}
+}
+
+// readErrSentinel reports the error a read starting at off should fail with.
+//
+// The trigger is readErrAt == 0 meaning "off is set", because an offset of 0 is
+// never itself the sentinel: a failure injected at offset 0 would make the
+// fixture's own setup reads fail. Requiring a non-zero trigger offset therefore
+// costs nothing and removes a way for a test to silently do nothing.
+func (f *fakeCaller) readErrSentinel(off int64) error {
+	if f.readErrAt == 0 || f.readErrAt != off {
+		return nil
+	}
+	return errInjectedRead
+}
+
+// errInjectedRead is the failure errInjectedReadAt makes a chunk read return. It
+// is not a token the mount knows, so errnoFor maps it to EIO, which is the same
+// answer a broken connection gets.
+var errInjectedRead = errors.New("test: injected read failure")
+
+// setReadFailure makes the chunk read starting at off fail. See readErrAt for why
+// only one offset is named.
+func (f *fakeCaller) setReadFailure(off int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.readErrAt = off
+}
+
+// setContent replaces a file's bytes without recording a call.
+//
+// It is separate from addContent so the two halves of a fixture can be stated
+// separately: a size the *index* claims, and the bytes the *owner* actually has.
+// Those differing is what a stale index looks like, and one helper that always
+// made them agree could not express it.
+func (f *fakeCaller) setContent(p string, body []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.data[p] = append([]byte(nil), body...)
+	if n, ok := f.nodes[p]; ok {
+		n.Size = int64(len(body))
+		f.nodes[p] = n
+	}
+}
+
+// newHandleForTest allocates a handle the way the production callers do, taking
+// the mount's lock. It exists so the handle tests keep working after newHandle
+// was renamed to make its locking contract explicit, rather than leaving those
+// tests reaching into fields directly.
+func (m *Mount) newHandleForTest(path string, kind node.Kind) uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.newHandleLocked(path, kind)
+}
+
+// setCacheForTest swaps the mount's read cache, so a test can size the two caps
+// without rebuilding the mount. The content tests need a cache small enough that
+// chunk boundaries are reachable.
+func (m *Mount) setCacheForTest(c *chunkCache) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cache = c
 }
 
 // addContent sets a file's bytes without recording a call, for tests that want
@@ -184,16 +257,34 @@ func (f *fakeCaller) childrenLocked(dir string) []node.Node {
 func (f *fakeCaller) Read(path string, off int64, n int) ([]byte, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, "Read "+path)
+	// The injected failure is checked and cleared under the same lock as the call
+	// log, so a test that sets it cannot race the read that observes it. Clearing
+	// would be wrong for a retry test, so it is not cleared: the same chunk fails
+	// every time, which is what a genuinely broken link does.
+	failWith := f.readErrSentinel(off)
 	f.mu.Unlock()
+	if failWith != nil {
+		return nil, failWith
+	}
 	if _, ok := f.nodes[path]; !ok {
 		return nil, errNotFound
 	}
-	body := f.data[path]
+	// The offset must be a chunk boundary and the request must not span more than
+	// one chunk, because that is the contract the mount's read loop relies on: it
+	// has a fixed chunkSize and translates between the caller's offset and a
+	// chunk index. A fake that served arbitrary ranges would accept an
+	// accidentally unaligned request and answer it, hiding exactly the arithmetic
+	// error this contract is meant to catch.
 	if off < 0 {
-		// A negative offset is out of range. n < 0 is the one that means "to
-		// the end"; off does not carry that meaning, so it is refused.
 		return nil, errStr("mount: negative offset")
 	}
+	if off%chunkSize != 0 {
+		return nil, errStr("fake: read offset is not a chunk boundary")
+	}
+	if n > chunkSize {
+		return nil, errStr("fake: read spans more than one chunk")
+	}
+	body := f.data[path]
 	if off >= int64(len(body)) {
 		// Matches viewer.Viewer: a read at or past the end is empty, not an
 		// error.

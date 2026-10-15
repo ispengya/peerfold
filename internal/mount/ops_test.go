@@ -121,7 +121,7 @@ func TestGetattrUsesDirtyHandleSize(t *testing.T) {
 	m := newTestMount(t)
 	fakeOf(t, m).addFile("/a.txt", 10)
 
-	fh := m.newHandle("/a.txt", node.KindFile)
+	fh := m.newHandleForTest("/a.txt", node.KindFile)
 	h, _ := m.handle(fh)
 	if code := h.write(0, []byte("0123456789abcdef")); code != 0 {
 		t.Fatalf("write = %d", code)
@@ -153,7 +153,7 @@ func TestGetattrIgnoresCleanHandleSize(t *testing.T) {
 	m := newTestMount(t)
 	fakeOf(t, m).addFile("/a.txt", 10)
 
-	fh := m.newHandle("/a.txt", node.KindFile)
+	fh := m.newHandleForTest("/a.txt", node.KindFile)
 	h, _ := m.handle(fh)
 	h.size = 9999 // seeded, but not dirty
 

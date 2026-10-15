@@ -204,3 +204,220 @@ func (m *Mount) Statfs(path string, st *Statfs) int {
 	}
 	return 0
 }
+
+// cgofuse's open flags. The core declares them because it does not import the
+// library; host.go passes through whatever the platform gave it. Only the write
+// bit is ever read.
+const (
+	OReadOnly  = 0
+	OReadWrite = 2
+)
+
+// Open opens one file and returns a handle.
+//
+// A directory is EISDIR rather than being opened: Opendir is the other path, and
+// a file handle on a directory would have to answer reads that have no meaning.
+// The check is on the resolved kind, so a symlink is refused earlier, by lookup,
+// with ELOOP.
+func (m *Mount) Open(path string, mode int) (uint64, int) {
+	cleaned, err := Clean(path)
+	if err != nil {
+		return 0, -EINVAL
+	}
+	n, code := m.lookup(cleaned)
+	if code != 0 {
+		return 0, code
+	}
+	if n.Kind == node.KindDir {
+		return 0, -EISDIR
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	fh := m.newHandleLocked(cleaned, n.Kind)
+	// The size is seeded from the index so a read of a file that is never
+	// written still knows where the end is without asking the owner.
+	h, _ := m.files[fh]
+	h.size = n.Size
+	return fh, 0
+}
+
+// Opendir opens one directory and returns a handle.
+//
+// The handle is what ties a Read or Readdir to the path it was opened for. The
+// core does not keep per-directory state yet -- the listing is fetched afresh
+// each time -- but the handle is still allocated so that a released directory is
+// tracked the same way a released file is.
+func (m *Mount) Opendir(path string) (uint64, int) {
+	cleaned, err := Clean(path)
+	if err != nil {
+		return 0, -EINVAL
+	}
+	n, code := m.lookup(cleaned)
+	if code != 0 {
+		return 0, code
+	}
+	if n.Kind != node.KindDir {
+		return 0, -ENOTDIR
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.newHandleLocked(cleaned, node.KindDir), 0
+}
+
+// Read places the file's bytes at off into buf and returns how many were placed.
+//
+// The return is a byte count the way cgofuse wants, not a Go error: zero means
+// end of file and a negative value is an errno. That is why the count and the
+// error share one int, and why a caller must not treat a small positive value as
+// a failure.
+//
+// The wire is asked in chunkSize blocks with a positive count every time. The
+// caller's remaining length cannot be forwarded as-is because the wire's own Read
+// treats a negative n as "to the end" and a zero n as an empty slice rather than
+// an error, so forwarding would either return nothing or return everything for
+// the common request of a large range.
+func (m *Mount) Read(path string, buf []byte, off int64, fh uint64) int {
+	if off < 0 {
+		return -EINVAL
+	}
+	if len(buf) == 0 {
+		// The kernel does issue these. An empty success, not an error.
+		return 0
+	}
+
+	// The handle is consulted under the lock, and everything needed is copied
+	// out there. The lock is released before any wire call: a read can take tens
+	// of seconds, and holding the mount's lock for that would block every other
+	// operation, including the ones that would notice a dead connection.
+	t, code := m.readTarget(path, fh)
+	if code != 0 {
+		return code
+	}
+
+	// A directory has no bytes. This is the read path's own check rather than
+	// relying on Open's, because a handle obtained from Opendir reaches here
+	// legitimately and the kernel can also read a path it never opened.
+	if t.kind == node.KindDir {
+		return -EISDIR
+	}
+
+	// A dirty handle answers from the snapshot taken under the lock. This is not
+	// an optimisation: the owner's copy is the *old* file, so a program that
+	// wrote and read back would otherwise see its own write vanish. The
+	// whole-file buffer is what the wire will eventually carry, so serving reads
+	// from it is the same data.
+	//
+	// The snapshot is used rather than re-reading the handle, which is what makes
+	// the decision above consistent with the answer here. Re-looking it up would
+	// discard the dirty flag this branch was chosen from, and a read that raced a
+	// flush would then serve zeros from the clean path.
+	if t.content != nil {
+		if off >= int64(len(t.content)) {
+			return 0
+		}
+		return copy(buf, t.content[off:])
+	}
+
+	// A clean handle knows the size it was opened with. A read that starts at or
+	// past it is end of file, and that answer must not depend on asking the
+	// owner, because a stale index that claims more than the owner has would
+	// otherwise turn a legitimate read into a wire failure.
+	if t.size > 0 && off >= t.size {
+		return 0
+	}
+
+	total := 0
+	for total < len(buf) {
+		pos := off + int64(total)
+		chunkIdx := pos / chunkSize
+		chunkOff := chunkIdx * chunkSize
+
+		chunk, ok := m.cache.get(fh, chunkIdx)
+		if !ok {
+			data, err := m.caller.Read(t.path, chunkOff, chunkSize)
+			if err != nil {
+				// A partial read is returned rather than discarded. Throwing
+				// away the bytes already in the buffer would make a large file
+				// unreadable over a flaky link, because the retry starts from
+				// scratch and hits the same failure.
+				if total > 0 {
+					return total
+				}
+				return errnoFor(err)
+			}
+			// The count asked for is always chunkSize, so the slice is already
+			// bounded; trimming is belt and braces so the cache can never hold a
+			// chunk larger than the unit the caps are expressed in.
+			if len(data) > chunkSize {
+				data = data[:chunkSize]
+			}
+			chunk = data
+			m.cache.put(fh, chunkIdx, chunk)
+		}
+		if len(chunk) == 0 {
+			break // end of file
+		}
+		within := pos - chunkOff
+		if within >= int64(len(chunk)) {
+			break // the chunk does not reach the offset, so the file ends here
+		}
+		total += copy(buf[total:], chunk[within:])
+		if len(chunk) < chunkSize {
+			break // a short chunk means the file ended
+		}
+		// No "buffer is full" check belongs here. Each iteration advances the
+		// position by a whole chunk because a full-size chunk always moves
+		// total to at least the next boundary, so the only way to return to the
+		// same leftover bytes is a short chunk -- caught above. A guard was
+		// written here and then removed, because no input could make it fire and
+		// a line no test can reach is a line no test can defend.
+	}
+	return total
+}
+
+// readSnapshot is what a read needs to know about the thing it is reading,
+// captured under one lock so the answer cannot change between the decision and
+// the use.
+type readSnapshot struct {
+	path string
+	kind node.Kind
+	size int64
+	// content is the handle's whole buffer when the handle is dirty, and nil
+	// otherwise. Nil rather than an empty slice on purpose: an empty file is a
+	// legitimate dirty state, so "has content" cannot be tested by length.
+	content []byte
+}
+
+// readTarget resolves what a read should use, and captures the handle's state in
+// the same lock acquisition.
+//
+// An unknown handle is what cgofuse passes when the kernel read a path it never
+// opened, so the path is resolved directly for that case. The resolution is what
+// makes a read of a path that does not exist ENOENT rather than a silent empty
+// success.
+func (m *Mount) readTarget(path string, fh uint64) (readSnapshot, int) {
+	m.mu.Lock()
+	if h, ok := m.files[fh]; ok {
+		t := readSnapshot{path: h.path, kind: h.kind, size: h.size}
+		if h.dirty {
+			// Materialising now, under the lock, is what keeps the bytes
+			// consistent with the dirty flag that selected this branch. It costs
+			// a copy of a buffer already bounded by the write limit, and it is
+			// the same buffer the flush will send.
+			t.content = h.content()
+		}
+		m.mu.Unlock()
+		return t, 0
+	}
+	m.mu.Unlock()
+
+	cleaned, err := Clean(path)
+	if err != nil {
+		return readSnapshot{}, -EINVAL
+	}
+	n, code := m.lookup(cleaned)
+	if code != 0 {
+		return readSnapshot{}, code
+	}
+	return readSnapshot{path: cleaned, kind: n.Kind, size: n.Size}, 0
+}

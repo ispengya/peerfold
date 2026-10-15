@@ -9,8 +9,8 @@ import (
 
 func TestHandleAllocationAndLookup(t *testing.T) {
 	m := newTestMount(t)
-	a := m.newHandle("/a.txt", node.KindFile)
-	b := m.newHandle("/b.txt", node.KindFile)
+	a := m.newHandleForTest("/a.txt", node.KindFile)
+	b := m.newHandleForTest("/b.txt", node.KindFile)
 	if a == b {
 		t.Fatal("two handles share a number")
 	}
@@ -26,14 +26,14 @@ func TestHandleAllocationAndLookup(t *testing.T) {
 	}
 	// A closed handle must not be handed out again while the process runs,
 	// because the kernel may still hold the old number.
-	if c := m.newHandle("/c.txt", node.KindFile); c == a {
+	if c := m.newHandleForTest("/c.txt", node.KindFile); c == a {
 		t.Error("handle number was recycled")
 	}
 }
 
 func TestWriteInsideAndBeyondCurrentSize(t *testing.T) {
 	m := newTestMount(t)
-	fh := m.newHandle("/f", node.KindFile)
+	fh := m.newHandleForTest("/f", node.KindFile)
 	h, _ := m.handle(fh)
 
 	if code := h.write(0, []byte("hello")); code != 0 {
@@ -56,7 +56,7 @@ func TestWriteInsideAndBeyondCurrentSize(t *testing.T) {
 
 func TestWriteOverwritesInPlace(t *testing.T) {
 	m := newTestMount(t)
-	fh := m.newHandle("/f", node.KindFile)
+	fh := m.newHandleForTest("/f", node.KindFile)
 	h, _ := m.handle(fh)
 	h.write(0, []byte("hello"))
 	h.write(1, []byte("EY"))
@@ -71,7 +71,7 @@ func TestWriteOverwritesInPlace(t *testing.T) {
 func TestWriteOverLimitIsRefused(t *testing.T) {
 	m := newTestMount(t)
 	m.opts.WriteLimit = 8
-	fh := m.newHandle("/f", node.KindFile)
+	fh := m.newHandleForTest("/f", node.KindFile)
 	h, _ := m.handle(fh)
 	if code := h.write(0, []byte("12345678")); code != 0 {
 		t.Fatalf("exactly at the limit should succeed, got %d", code)
@@ -87,7 +87,7 @@ func TestWriteOverLimitIsRefused(t *testing.T) {
 
 func TestTruncateShrinksAndGrows(t *testing.T) {
 	m := newTestMount(t)
-	fh := m.newHandle("/f", node.KindFile)
+	fh := m.newHandleForTest("/f", node.KindFile)
 	h, _ := m.handle(fh)
 	h.write(0, []byte("hello world"))
 	if code := h.truncateTo(5); code != 0 {
@@ -109,7 +109,7 @@ func TestTruncateShrinksAndGrows(t *testing.T) {
 
 func TestSeededSizeSurvivesNoWrites(t *testing.T) {
 	m := newTestMount(t)
-	fh := m.newHandle("/f", node.KindFile)
+	fh := m.newHandleForTest("/f", node.KindFile)
 	h, _ := m.handle(fh)
 	h.size = 100
 	if h.dirty {
@@ -128,7 +128,7 @@ func TestSeededSizeSurvivesNoWrites(t *testing.T) {
 func TestWriteLimitCountsHeldBytesNotCumulativeBytes(t *testing.T) {
 	m := newTestMount(t)
 	m.opts.WriteLimit = 8
-	fh := m.newHandle("/f", node.KindFile)
+	fh := m.newHandleForTest("/f", node.KindFile)
 	h, _ := m.handle(fh)
 
 	if code := h.write(0, []byte("12345678")); code != 0 {
@@ -157,7 +157,7 @@ func TestWriteLimitCountsHeldBytesNotCumulativeBytes(t *testing.T) {
 // be a data-corruption bug rather than a performance choice.
 func TestWriteCopiesItsArgument(t *testing.T) {
 	m := newTestMount(t)
-	fh := m.newHandle("/f", node.KindFile)
+	fh := m.newHandleForTest("/f", node.KindFile)
 	h, _ := m.handle(fh)
 
 	buf := []byte("hello")
@@ -176,7 +176,7 @@ func TestWriteCopiesItsArgument(t *testing.T) {
 // higher offset. This pins that.
 func TestOverlappingWritesComposeByOffset(t *testing.T) {
 	m := newTestMount(t)
-	fh := m.newHandle("/f", node.KindFile)
+	fh := m.newHandleForTest("/f", node.KindFile)
 	h, _ := m.handle(fh)
 
 	h.write(0, []byte("abcdef"))
@@ -196,7 +196,7 @@ func TestOverlappingWritesComposeByOffset(t *testing.T) {
 
 func TestTruncateRefusesNegative(t *testing.T) {
 	m := newTestMount(t)
-	fh := m.newHandle("/f", node.KindFile)
+	fh := m.newHandleForTest("/f", node.KindFile)
 	h, _ := m.handle(fh)
 	if code := h.truncateTo(-1); code != -EINVAL {
 		t.Errorf("truncateTo(-1) = %d, want -EINVAL", code)
@@ -205,7 +205,7 @@ func TestTruncateRefusesNegative(t *testing.T) {
 
 func TestWriteRefusesNegativeOffset(t *testing.T) {
 	m := newTestMount(t)
-	fh := m.newHandle("/f", node.KindFile)
+	fh := m.newHandleForTest("/f", node.KindFile)
 	h, _ := m.handle(fh)
 	if code := h.write(-1, []byte("x")); code != -EINVAL {
 		t.Errorf("write at a negative offset = %d, want -EINVAL", code)
@@ -218,7 +218,7 @@ func TestWriteRefusesNegativeOffset(t *testing.T) {
 func TestRefusedWriteChangesNothing(t *testing.T) {
 	m := newTestMount(t)
 	m.opts.WriteLimit = 4
-	fh := m.newHandle("/f", node.KindFile)
+	fh := m.newHandleForTest("/f", node.KindFile)
 	h, _ := m.handle(fh)
 
 	if code := h.write(0, []byte("abcd")); code != 0 {
@@ -245,7 +245,7 @@ func TestRefusedWriteChangesNothing(t *testing.T) {
 
 func TestHandleStoresItsPathAndKind(t *testing.T) {
 	m := newTestMount(t)
-	fh := m.newHandle("/中文/文件.txt", node.KindFile)
+	fh := m.newHandleForTest("/中文/文件.txt", node.KindFile)
 	h, ok := m.handle(fh)
 	if !ok {
 		t.Fatal("handle not found")
@@ -267,7 +267,7 @@ func TestHandleStoresItsPathAndKind(t *testing.T) {
 func TestWriteLimitIsCapturedAtOpenTime(t *testing.T) {
 	m := newTestMount(t)
 	m.opts.WriteLimit = 4
-	fh := m.newHandle("/f", node.KindFile)
+	fh := m.newHandleForTest("/f", node.KindFile)
 	h, _ := m.handle(fh)
 
 	m.opts.WriteLimit = 1 << 20 // raised after the open
@@ -292,7 +292,7 @@ func TestWriteLimitIsCapturedAtOpenTime(t *testing.T) {
 // chunks nothing can read any more.
 func TestCloseHandleReleasesItsCache(t *testing.T) {
 	m := newTestMount(t)
-	fh := m.newHandle("/f", node.KindFile)
+	fh := m.newHandleForTest("/f", node.KindFile)
 	m.cache.put(fh, 0, []byte("cached"))
 	if m.cache.total() == 0 {
 		t.Fatal("the cache did not accept the chunk, so this test proves nothing")
@@ -341,7 +341,7 @@ func TestSpliceMatchesAReferenceByteSlice(t *testing.T) {
 	}
 
 	m := newTestMount(t)
-	fh := m.newHandle("/f", node.KindFile)
+	fh := m.newHandleForTest("/f", node.KindFile)
 	h, _ := m.handle(fh)
 
 	var ref []byte
@@ -407,7 +407,7 @@ func TestSpliceMatchesAReferenceByteSlice(t *testing.T) {
 // comparison above, because it is the exact shape that used to lose bytes.
 func TestWriteInsideArunSplitsAndPreservesBothTails(t *testing.T) {
 	m := newTestMount(t)
-	fh := m.newHandle("/f", node.KindFile)
+	fh := m.newHandleForTest("/f", node.KindFile)
 	h, _ := m.handle(fh)
 
 	h.write(0, []byte("abcdef"))
@@ -430,7 +430,7 @@ func TestWriteInsideArunSplitsAndPreservesBothTails(t *testing.T) {
 // overlapping: nothing is overwritten and nothing is lost.
 func TestAdjacentWritesDoNotOverwrite(t *testing.T) {
 	m := newTestMount(t)
-	fh := m.newHandle("/f", node.KindFile)
+	fh := m.newHandleForTest("/f", node.KindFile)
 	h, _ := m.handle(fh)
 
 	h.write(0, []byte("abc"))
@@ -449,7 +449,7 @@ func TestAdjacentWritesDoNotOverwrite(t *testing.T) {
 // not what truncation means.
 func TestTruncateClipsIntervalsAndAccounting(t *testing.T) {
 	m := newTestMount(t)
-	fh := m.newHandle("/f", node.KindFile)
+	fh := m.newHandleForTest("/f", node.KindFile)
 	h, _ := m.handle(fh)
 
 	h.write(0, []byte("abcdefghij")) // one interval, 0..10

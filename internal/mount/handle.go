@@ -40,10 +40,12 @@ type openFile struct {
 	writes map[int64][]byte
 }
 
-// newHandle allocates a handle for a path.
+// newHandleLocked allocates a handle for a path and records it in the table.
 //
-// The caller is expected to hold Mount.mu.
-func (m *Mount) newHandle(path string, kind node.Kind) uint64 {
+// The name says what the contract is: the caller must hold Mount.mu. It is not
+// exported and every caller is in this package, so a compile error is the only
+// enforcement available, and the name is what a reader has to go on.
+func (m *Mount) newHandleLocked(path string, kind node.Kind) uint64 {
 	m.nextFh++
 	fh := m.nextFh
 	m.files[fh] = &openFile{
