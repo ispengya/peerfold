@@ -171,6 +171,22 @@ func (c *Client) Name() string { return c.name }
 // one, which is what lets it serve other clients' trees too.
 func (c *Client) Aggregate() bool { return c.aggregate }
 
+// Err reports why the read loop stopped, or nil while it is running.
+//
+// It exists because the loop's failure is otherwise invisible from outside this
+// package: the connection dies, the server withdraws every node this client
+// published, and a caller that only holds the *Client has nothing to look at.
+// A long-running process that cannot report its own death is worse than one that
+// crashes, because it looks healthy.
+func (c *Client) Err() error { return c.loopFailure() }
+
+// Done is closed when the read loop has stopped, so a caller can wait on the
+// connection ending instead of polling Err.
+//
+// It is loopEnded, not done: done means the caller closed this client, which is
+// the one exit that is not a failure.
+func (c *Client) Done() <-chan struct{} { return c.loopEnded }
+
 // SetOnBatch registers a callback for upload progress, called with the number of
 // nodes sent so far.
 func (c *Client) SetOnBatch(f func(int)) {
@@ -582,6 +598,18 @@ func (c *Client) servePut(env proto.Envelope) error {
 			if done {
 				return nil
 			}
+			// Re-armed per accepted chunk, not once for the whole transfer. The
+			// loop's deadline was set before this request arrived, with
+			// idleTimeout as its bound, so without this a transfer that takes
+			// longer than that — a large file over a slow link, which is healthy
+			// the whole time — would fail part-way through. What the deadline is
+			// for is a peer that has stopped talking, so what it should measure is
+			// the gap between two chunks, not the length of the transfer. The
+			// server bounds a forwarded chunk the same way, for the same reason.
+			if err := c.conn.SetReadDeadline(time.Now().Add(ackTimeout)); err != nil {
+				streamErr = err
+				return nil
+			}
 			if _, err := w.Write(chunk); err != nil {
 				return err
 			}
@@ -598,6 +626,19 @@ func (c *Client) servePut(env proto.Envelope) error {
 		}
 		return nil
 	}
+	// The content is owed on every path out of this function, not only the paths
+	// that want it. `replaceAtomically` and `CreateFrom` resolve the target path —
+	// and, for a create, take the name — *before* the sink runs, so both can refuse
+	// without having read a byte of the stream. Returning there would leave the data
+	// frames queued in front of this handler's answer, and the next thing the read
+	// loop sees is a data frame where it expects a control frame: the loop exits, and
+	// the server withdraws every node this client published. A mistyped share name
+	// would therefore cost a whole client its presence in the tree.
+	//
+	// One drain, here, for every failure that did not consume the stream, rather
+	// than one on each early return where it is easy to forget. Consumption is
+	// recorded by whether the operation is known to have read the stream at all.
+	var outErr error
 	switch req.Mode {
 	case proto.WriteModeCreate:
 		// A create takes the name before the content arrives, so a stream that
@@ -605,21 +646,36 @@ func (c *Client) servePut(env proto.Envelope) error {
 		// name was free when it was taken, which is the part that cannot be
 		// undone.
 		if err := c.fs.CreateFrom(share, rel, sink); err != nil {
-			return err
-		}
-		if streamErr != nil {
+			outErr = err
+		} else if streamErr != nil {
 			c.fs.removeIfPresent(share, rel)
-			return fmt.Errorf("content of %q ended early: %w", rel, streamErr)
+			outErr = fmt.Errorf("content of %q ended early: %w", rel, streamErr)
+		} else {
+			return nil
 		}
-		return nil
 	case proto.WriteModePut, "":
-		return c.fs.replaceAtomically(share, rel, sink, ended)
+		if err := c.fs.replaceAtomically(share, rel, sink, ended); err != nil {
+			outErr = err
+		} else {
+			return nil
+		}
 	default:
 		// An unknown mode is refused before the content is written: guessing
 		// which of the two writes was meant could destroy a file.
-		_ = c.drainContent(env.ID)
 		return fmt.Errorf("write request has unknown mode %q", req.Mode)
 	}
+
+	// Only reached on a failure that may not have read the stream. Draining is
+	// safe when it did: the stream is already at its end marker, so this reads
+	// the marker and returns.
+	//
+	// A failure to drain is returned in place of the original error, because it
+	// means the connection is out of step and that is the more serious of the
+	// two — the caller is about to lose this client entirely.
+	if err := c.drainContent(env.ID); err != nil {
+		return fmt.Errorf("%w (and the content could not be drained: %v)", outErr, err)
+	}
+	return outErr
 }
 
 // serveMkdir handles a directory creation.
@@ -662,10 +718,11 @@ func (c *Client) serveRemove(env proto.Envelope) error {
 
 // serveRename handles a rename within this client's own tree.
 //
-// A rename that named two different clients never reaches here: the server
-// refuses it because neither client could perform it alone, and copying the file
-// between machines would make a rename into a transfer with a window in the
-// middle where both names exist.
+// A rename that named two different clients never reaches here: the viewer
+// refuses it, because by the time a path arrives here the client name has been
+// stripped and the owner can no longer tell two clients' identical paths apart.
+// Copying the file between machines was the alternative, and that would make a
+// rename into a transfer with a window in the middle where both names exist.
 func (c *Client) serveRename(env proto.Envelope) error {
 	var req proto.RenameBody
 	if err := json.Unmarshal(env.Body, &req); err != nil {
@@ -920,8 +977,15 @@ func (c *Client) recvWithin(d time.Duration) (proto.Envelope, error) {
 //
 // A client is a long-running process whose failures would otherwise be silent:
 // the loop exiting with no explanation is exactly the situation that needs one.
+//
+// It goes to stderr rather than stdout because the client's stdout is not a log
+// stream — there is nothing on it a user parses — and a diagnostic that landed
+// there would interleave with whatever a future subcommand prints. The variable
+// is consulted per call rather than cached so that long-lived processes and
+// tests can turn it on without a restart.
 func debugf(format string, args ...any) {
 	if os.Getenv("PEERFOLD_DEBUG") == "" {
 		return
 	}
+	fmt.Fprintf(os.Stderr, "peerfold: "+format+"\n", args...)
 }

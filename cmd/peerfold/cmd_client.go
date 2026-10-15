@@ -133,21 +133,64 @@ func cmdClient(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	// The upload is a snapshot: it says what the shares hold at this instant.
+	// Without a watcher the tree then never changes again, which is the whole
+	// feature — a client that does not watch is a client that lied about what is
+	// on its disk the moment anything moved. So this is started here, after the
+	// snapshot, for the same reason the scanner runs before the watcher: the
+	// events from here on describe what changed *since* the scan.
+	//
+	// A watcher that fails to start is reported and stepped over rather than
+	// fatal. The snapshot is still indexed and still readable; what is lost is
+	// liveness, and a client that connects read-only is more useful than one that
+	// refuses to connect. Closing it before the client keeps the order the other
+	// way round: the watcher writes on this connection, so it must stop first.
+	watcher, err := c.Watch()
+	if err != nil {
+		fmt.Fprintf(stderr, "client: watching for changes: %v\n", err)
+		fmt.Fprintln(stderr, "client: the tree is indexed but will not follow changes on disk")
+	} else {
+		defer watcher.Close()
+	}
+
 	role := "client"
 	if c.Aggregate() {
 		role = "aggregating client"
 	}
 	fmt.Fprintf(stdout, "joined %s as %s (%s)\n", cfg.Server, c.Name(), role)
 
+	// Asking to aggregate and being told no is a ruling, not a failure — v1
+	// allows exactly one aggregator and the first one wins. But the line above
+	// says "client" either way, so a user who passed --aggregate would be left
+	// believing the flag was honored. Say it out loud instead: the flag was
+	// seen, and this is why it had no effect.
+	if cfg.Aggregate && !c.Aggregate() {
+		fmt.Fprintln(stderr, "client: --aggregate was not granted: another client is already aggregating; "+
+			"running as a plain supplier")
+	}
+
 	// Stay connected: the index belongs to this connection, so exiting would
 	// withdraw the tree that was just published. The connection is what keeps
-	// the share alive, so the process now waits for an interrupt.
+	// the share alive, so the process now waits for an interrupt — or for the
+	// connection to end on its own, which is a failure and has to be reported.
+	// Waiting only for the interrupt would leave a process that looks healthy
+	// while the server has already withdrawn everything it published.
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt)
 	defer signal.Stop(sig)
-	<-sig
-	fmt.Fprintln(stdout, "disconnected")
-	return 0
+
+	select {
+	case <-sig:
+		fmt.Fprintln(stdout, "disconnected")
+		return 0
+	case <-c.Done():
+		if err := c.Err(); err != nil {
+			fmt.Fprintf(stderr, "client: the connection ended: %v\n", err)
+		} else {
+			fmt.Fprintln(stderr, "client: the connection ended")
+		}
+		return 1
+	}
 }
 
 // shareArg is one --share NAME=PATH.

@@ -93,9 +93,11 @@ func cmdServerWith(args []string, stdout, stderr io.Writer, interrupt <-chan str
 
 	s := server.New(addr)
 	// New binds the listener, so a port already in use is reported here instead
-	// of after the process has announced that it is running.
+	// of after the process has announced that it is running. The operating
+	// system's own message is printed: "address already in use" tells a user
+	// what to do, and "address is unavailable" does not.
 	if s.Addr() == nil {
-		fmt.Fprintf(stderr, "server: listen on %s: address is unavailable\n", addr)
+		fmt.Fprintf(stderr, "server: listen on %s: %v\n", addr, s.Err())
 		return 1
 	}
 

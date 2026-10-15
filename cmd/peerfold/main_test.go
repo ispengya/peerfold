@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"net"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -75,6 +76,47 @@ func TestRunServerServesAndStops(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "stopped") {
 		t.Errorf("stdout = %q, want it to report that it stopped", out.String())
+	}
+}
+
+// TestRunServerReportsWhyThePortIsUnavailable pins that a failed bind says what
+// the operating system said.
+//
+// The command used to print "address is unavailable" for every listen failure,
+// because it only had Addr() to look at and that is nil when the bind fails. A
+// user whose port is taken needs to be told that, not that something was
+// unavailable: the two most common failures — the port is in use, and the
+// address is malformed — have completely different fixes.
+func TestRunServerReportsWhyThePortIsUnavailable(t *testing.T) {
+	var out, errOut bytes.Buffer
+	interrupt := make(chan struct{})
+
+	// Occupy a port so the bind has a specific, knowable reason to fail.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	defer ln.Close()
+
+	cfg := filepath.Join(t.TempDir(), "config.json")
+	code := cmdServerWith([]string{"--listen", ln.Addr().String(), "--config", cfg}, &out, &errOut, interrupt)
+
+	if code != 1 {
+		t.Fatalf("cmdServerWith on a taken port = %d, want 1; stderr = %q", code, errOut.String())
+	}
+	// The operating system's words, not a paraphrase. The wording differs by
+	// platform — "address already in use" on Unix, "Only one usage of each
+	// socket address ..." on Windows — so this accepts either rather than
+	// pinning one, while still requiring that the reason reached the user.
+	got := errOut.String()
+	if !strings.Contains(got, "in use") && !strings.Contains(got, "Only one usage") {
+		t.Fatalf("stderr = %q, want the operating system's reason for the failed bind", got)
+	}
+	if !strings.Contains(got, ln.Addr().String()) {
+		t.Fatalf("stderr = %q, want it to name the address %s", got, ln.Addr())
+	}
+	if strings.Contains(out.String(), "listening on") {
+		t.Fatalf("stdout = %q, want no claim of listening after a failed bind", out.String())
 	}
 }
 
