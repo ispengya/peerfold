@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +26,19 @@ const helloTimeout = 30 * time.Second
 // is waiting on: an owner that has not answered in two seconds is either gone or
 // wedged, and either way a failure serves the user better than a wait.
 const readTimeout = 2 * time.Second
+
+// drainTimeout bounds the cleanup read of a put's content on a path where the
+// write was refused.
+//
+// When the forwarding fails, the requester may be waiting: its writer is part
+// way through sending a file, and the reason it must be drained at all is that
+// nobody is going to read the rest of it. A drain that could block as long as
+// the requester's own send would hold this handler, and the connection behind
+// it, for as long as the requester chose — observed as a test hanging for six
+// minutes. So the drain is bounded, and a timeout ends it: the point of the
+// drain is to leave the connection at a frame boundary, and one where the peer
+// has stopped sending is not a connection worth rescuing.
+const drainTimeout = 5 * time.Second
 
 // writeTimeout bounds a write forwarded to a client.
 //
@@ -55,11 +67,15 @@ type Server struct {
 	reg    *Registry
 	router *Router
 
-	mu      sync.Mutex
-	conns   map[net.Conn]struct{}
-	closing bool
-	closed  bool
-	wg      sync.WaitGroup
+	mu    sync.Mutex
+	conns map[net.Conn]struct{}
+	// watchers is every live viewer connection, which is what an index update
+	// is pushed to. It is separate from conns because conns is all peers and
+	// this is only the ones that want to be told.
+	watchers map[*proto.Conn]struct{}
+	closing  bool
+	closed   bool
+	wg       sync.WaitGroup
 }
 
 // New returns a Server listening on listen. A listen failure is remembered and
@@ -67,10 +83,11 @@ type Server struct {
 // startup error; Addr is nil in that case.
 func New(listen string) *Server {
 	s := &Server{
-		ix:     &index.Index{},
-		reg:    &Registry{},
-		conns:  make(map[net.Conn]struct{}),
-		router: &Router{clients: make(map[string]*clientLink)},
+		ix:       &index.Index{},
+		reg:      &Registry{},
+		conns:    make(map[net.Conn]struct{}),
+		watchers: make(map[*proto.Conn]struct{}),
+		router:   &Router{clients: make(map[string]*clientLink)},
 	}
 	s.ln, s.lnErr = net.Listen("tcp", listen)
 	return s
@@ -209,12 +226,16 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	// A viewer only asks questions; it supplies nothing, so it is not a
 	// registry entry and owns no index entries.
+	//
+	// It is recorded as a watcher, though, because it is the role that wants to
+	// be told when the tree changes. The registration lasts exactly as long as
+	// this handler runs, which is exactly as long as the connection does.
 	if hb.Role == proto.RoleViewer {
 		if err := s.replyHello(c, env.ID, hb.Name, false); err != nil {
 			return
 		}
-		// A viewer has no name in the registry, so it owns no index entries
-		// and cannot upload a tree.
+		unwatch := s.watch(c)
+		defer unwatch()
 		s.serveLoop("", c)
 		return
 	}
@@ -272,9 +293,9 @@ func (s *Server) replyHello(c *proto.Conn, id uint64, name string, aggregate boo
 // for a viewer, which owns none.
 func (s *Server) serveLoop(name string, c *proto.Conn) {
 	for {
-		env, err := c.Recv()
-		if os.Getenv("PEERFOLD_DEBUG") != "" {
-		}
+		// RecvAny, not Recv: a client's update is a frame this loop has to act
+		// on, and the skipping that suits a viewer would discard it here.
+		env, err := c.RecvAny()
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 				// Recv reports a read failure with no envelope, so there is no
@@ -377,6 +398,24 @@ func (s *Server) serveLoop(name string, c *proto.Conn) {
 			continue
 		}
 
+		// A client reporting a change it saw happen. The index is updated here
+		// and the same update is pushed to every watcher, so a viewer learns
+		// about it through the connection it already has instead of asking
+		// again.
+		//
+		// The node list is not acknowledged: there is nothing for the client to
+		// do with an acknowledgement, and a frame in reply would give the
+		// client's read loop something to classify that means nothing.
+		if env.Kind == proto.KindEvent {
+			if name == "" {
+				// Only a named client owns index entries, so a viewer sending
+				// one of these is a protocol error rather than a change.
+				continue
+			}
+			s.applyEvent(name, env)
+			continue
+		}
+
 		// Any other forwarded kind is a plain answer, so it goes to whoever
 		// asked rather than being answered here. One with no waiter is a peer
 		// answering something it was not asked, which is a protocol error rather
@@ -391,6 +430,141 @@ func (s *Server) serveLoop(name string, c *proto.Conn) {
 		if err := c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: "not implemented"}); err != nil {
 			return
 		}
+	}
+}
+
+// eventBroadcastTimeout bounds one push to one watcher.
+//
+// A viewer that has stopped reading fills its socket buffer, and an unbounded
+// write to it would block here for ever. The bound turns one viewer's
+// misbehaviour into that viewer's own problem: it is dropped and the change is
+// still delivered to everyone else.
+const eventBroadcastTimeout = 5 * time.Second
+
+// applyEvent folds a client's change report into the index and pushes it to
+// every watcher.
+//
+// The index update and the broadcast carry the same nodes. A watcher holds the
+// same model the index does, so a viewer that applies the pushed update itself
+// ends up where a viewer that lists the server does — and the two must agree,
+// because a viewer will use one after the other.
+func (s *Server) applyEvent(name string, env proto.Envelope) {
+	var b proto.EventBody
+	if err := json.Unmarshal(env.Body, &b); err != nil {
+		return
+	}
+	nodes := fromNodeJSON(b.Nodes)
+	if len(nodes) == 0 {
+		return
+	}
+
+	// A deletion is not a node with a kind; it is an instruction to drop the
+	// path and everything under it. It is turned into the index's own removal
+	// here, so no other layer has to know the marker exists.
+	var keep []node.Node
+	for _, n := range nodes {
+		if n.Kind == node.KindDeleted {
+			s.ix.Remove(name, n.Path)
+			continue
+		}
+		keep = append(keep, n)
+	}
+	if len(keep) > 0 {
+		s.ix.Apply(name, keep)
+	}
+
+	// The update goes out with the client name on it, because a path is only
+	// meaningful inside one client's tree: "Documents/x.txt" names a different
+	// file on every machine.
+	out := proto.EventBody{Nodes: withClient(name, toNodeJSON(nodes))}
+	body, err := json.Marshal(out)
+	if err != nil {
+		return
+	}
+	s.broadcast(proto.Envelope{Kind: proto.KindEvent, Body: body})
+}
+
+// withClient prefixes every node's path with the client that reported it.
+//
+// The index is keyed by client name and by path, while the watcher's own paths
+// are relative to a share. A viewer holds the aggregated form, so the name has
+// to be put back before the update leaves the server.
+func withClient(name string, nodes []proto.NodeJSON) []proto.NodeJSON {
+	out := make([]proto.NodeJSON, 0, len(nodes))
+	for _, n := range nodes {
+		if n.Path == "" {
+			// The share root, which is already the name.
+			n.Path = name
+		} else {
+			n.Path = name + "/" + n.Path
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+// toNodeJSON converts nodes to their wire form.
+func toNodeJSON(nodes []node.Node) []proto.NodeJSON {
+	out := make([]proto.NodeJSON, 0, len(nodes))
+	for _, n := range nodes {
+		out = append(out, proto.NodeJSON{
+			Path:  n.Path,
+			Kind:  uint8(n.Kind),
+			Size:  n.Size,
+			Mode:  n.Mode,
+			Mtime: n.Mtime,
+		})
+	}
+	return out
+}
+
+// fromNodeJSON converts the wire form back to nodes.
+func fromNodeJSON(in []proto.NodeJSON) []node.Node {
+	out := make([]node.Node, 0, len(in))
+	for _, n := range in {
+		out = append(out, node.Node{
+			Path:  n.Path,
+			Kind:  node.Kind(n.Kind),
+			Size:  n.Size,
+			Mode:  n.Mode,
+			Mtime: n.Mtime,
+		})
+	}
+	return out
+}
+
+// broadcast sends one envelope to every watcher.
+//
+// A watcher that has gone is dropped rather than reported: nothing was asked of
+// it, so its absence is not an error, and it must not stop the update reaching
+// the watchers that are still there.
+func (s *Server) broadcast(env proto.Envelope) {
+	s.mu.Lock()
+	targets := make([]*proto.Conn, 0, len(s.watchers))
+	for c := range s.watchers {
+		targets = append(targets, c)
+	}
+	s.mu.Unlock()
+
+	for _, c := range targets {
+		if err := c.SendWithin(env, eventBroadcastTimeout); err != nil {
+			s.mu.Lock()
+			delete(s.watchers, c)
+			s.mu.Unlock()
+		}
+	}
+}
+
+// watch starts recording a viewer connection as a watcher, and returns the
+// function that stops.
+func (s *Server) watch(c *proto.Conn) (unwatch func()) {
+	s.mu.Lock()
+	s.watchers[c] = struct{}{}
+	s.mu.Unlock()
+	return func() {
+		s.mu.Lock()
+		delete(s.watchers, c)
+		s.mu.Unlock()
 	}
 }
 
@@ -409,16 +583,7 @@ func (s *Server) replyList(c *proto.Conn, env proto.Envelope) error {
 	if err != nil {
 		return c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: err.Error()})
 	}
-	out := make([]proto.NodeJSON, 0, len(nodes))
-	for _, n := range nodes {
-		out = append(out, proto.NodeJSON{
-			Path:  n.Path,
-			Kind:  uint8(n.Kind),
-			Size:  n.Size,
-			Mode:  n.Mode,
-			Mtime: n.Mtime,
-		})
-	}
+	out := toNodeJSON(nodes)
 	body, err := json.Marshal(proto.ListOKBody{Nodes: out})
 	if err != nil {
 		// A marshal failure is the server's fault, not the request's, so it is
@@ -619,6 +784,38 @@ func (s *Server) replyPut(c *proto.Conn, env proto.Envelope) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
 	defer cancel()
+
+	// drained says the requester's content stream has been read to its end
+	// marker. It is what the deferred drain below tests, because "the
+	// forwarding failed" does not mean "the content was read":
+	//
+	// A forward that fails before it reaches the owner — the usual case, the
+	// owner is gone — returns without ever calling the content function, and the
+	// requester has already sent its frames by then. Those frames used to be
+	// left on the connection: the requester read its answer and asked something
+	// else, and this loop read the leftover chunk as the next request and failed
+	// with "expected a control frame, got frame kind 2". The frame boundaries
+	// from there on belong to a stream nobody is indexing.
+	//
+	// So every path out of the forwarding reads the stream, whichever end it
+	// stops at.
+	drained := false
+	defer func() {
+		if drained {
+			return
+		}
+		// Bounded: the requester may still be sending, and this read is
+		// cleanup rather than part of the answer. See drainTimeout.
+		c.SetReadDeadline(time.Now().Add(drainTimeout))
+		defer c.SetReadDeadline(time.Time{})
+		for {
+			_, done, err := c.RecvData(env.ID)
+			if err != nil || done {
+				return
+			}
+		}
+	}()
+
 	// The content is copied straight through, one chunk at a time: it is read
 	// from the requester and written to the owner inside this call, so neither
 	// side ever holds the file. The router keeps the owner's connection locked
@@ -631,6 +828,7 @@ func (s *Server) replyPut(c *proto.Conn, env proto.Envelope) error {
 					return err
 				}
 				if done {
+					drained = true
 					return nil
 				}
 				if err := send(chunk); err != nil {

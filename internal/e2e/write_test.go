@@ -488,6 +488,15 @@ func TestE2EPutAfterTheOwnerLeaves(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "after.txt")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("a file was created by a write to an absent owner (err = %v)", err)
 	}
+	// The connection has to be in step afterwards, and this is the assertion
+	// that caught it not being: the put sent its content, the server refused
+	// before forwarding any of it, and nothing read those frames off the
+	// connection, so this next request was answered with a stale data frame
+	// ("expected a control frame, got frame kind 2") or, when the mismatch was
+	// noticed at close, with a transport error.
+	if _, err := v.List(""); err != nil {
+		t.Fatalf("List after a refused put: %v: the connection is out of step", err)
+	}
 }
 
 // waitForServerToForget blocks until a second viewer can no longer see the named

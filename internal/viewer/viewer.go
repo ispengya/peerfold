@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"peerfold/internal/node"
@@ -31,7 +32,37 @@ type Viewer struct {
 	conn net.Conn
 	pc   *proto.Conn
 	next uint64
+
+	// mu guards the fields below. It is taken around the fields and never across a
+	// read, because a reader that held it while waiting would stop the very
+	// hand-off it is waiting for.
+	mu     sync.Mutex
+	events chan []node.Node
+	// startReader makes the switch to a background reader happen once, and only
+	// on the first Watch. A viewer that never watches keeps the plain
+	// request/response path with its per-call deadline.
+	startReader sync.Once
+	reader      bool
+	// connToken is held by whoever may read the connection: the reader while it
+	// listens for updates, and a call from before its request is sent until its
+	// last frame is read. That single hand-off is what keeps a reply from being
+	// read by the reader, and a raced reply is what "replies are out of step"
+	// reports.
+	connToken chan struct{}
 }
+
+// readWindow bounds one read by the background reader.
+//
+// It is short, and that is the point. The reader holds the connection for as long
+// as it is in a read, and a call cannot take the connection until that read
+// returns: a reader parked on a quiet tree would therefore hold every call up
+// until the tree changed, which is the opposite of what a viewer is for. So it
+// reads for at most this long, hands the connection back, and looks again.
+//
+// A longer window (a minute, say) is still correct in the sense that no test
+// fails to *deliver* an update; what fails is every call made while the tree is
+// quiet, which is most of them. `idleRead` was that mistake.
+const readWindow = 20 * time.Millisecond
 
 // Dial connects to serverAddr and completes the viewer handshake: the server
 // replies to the hello with its name and aggregate ruling, and a viewer is not
@@ -85,6 +116,25 @@ func (v *Viewer) handshake() error {
 // client's own namespace, where a separator is an ordinary path character
 // rather than something the viewer should interpret.
 func (v *Viewer) List(path string) ([]node.Node, error) {
+	var out []node.Node
+	// The connection is taken before the request is sent, not after. Taking it
+	// afterwards leaves a race the reader wins whenever an update is already on
+	// its way: the reader holds the connection, the request goes out, the reader
+	// reads the reply to a question nobody asked it to read, and the call waits
+	// for an answer that has already been consumed.
+	err := v.stream(func() error {
+		var err error
+		out, err = v.list(path)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// list asks for one directory of the aggregated tree.
+func (v *Viewer) list(path string) ([]node.Node, error) {
 	client, rest := splitPath(path)
 
 	body, err := json.Marshal(proto.ListBody{Client: client, Path: rest})
@@ -142,6 +192,21 @@ func (v *Viewer) List(path string) ([]node.Node, error) {
 // holds names and sizes, so a file that has been deleted since the upload is
 // reported by the owner rather than served from a stale copy.
 func (v *Viewer) Read(path string, off int64, n int) ([]byte, error) {
+	var out []byte
+	// Taken before the request goes out: see List.
+	err := v.stream(func() error {
+		var err error
+		out, err = v.read(path, off, n)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// read is Read with the connection already in hand.
+func (v *Viewer) read(path string, off int64, n int) ([]byte, error) {
 	if off < 0 {
 		return nil, fmt.Errorf("viewer: read %q: offset %d is negative", path, off)
 	}
@@ -165,12 +230,20 @@ func (v *Viewer) Read(path string, off int64, n int) ([]byte, error) {
 	}
 	if head.Err != "" {
 		// The head frame is where "no such file" arrives. The content stream and
-		// the closing frame are still owed — frames are one sequence, so a part
-		// left unread would be parsed as the next answer — so both are read
+		// the closing frame are still owed 閳?frames are one sequence, so a part
+		// left unread would be parsed as the next answer 閳?so both are read
 		// before the failure is returned.
+		// Bound the stream's read as well: the connection is held for the whole
+		// round trip, so a server that stops mid-stream would otherwise hold it for
+		// ever.
+		if err := v.conn.SetReadDeadline(time.Now().Add(callTimeout)); err != nil {
+			return nil, err
+		}
 		if _, err := v.pc.RecvBody(id); err != nil {
+			v.conn.SetReadDeadline(time.Time{})
 			return nil, fmt.Errorf("viewer: read reply for %q: %s (and its stream: %v)", path, head.Err, err)
 		}
+		v.conn.SetReadDeadline(time.Time{})
 		if _, err := v.recv(callTimeout); err != nil {
 			return nil, fmt.Errorf("viewer: read reply for %q: %s (and its closing frame: %v)", path, head.Err, err)
 		}
@@ -184,7 +257,7 @@ func (v *Viewer) Read(path string, off int64, n int) ([]byte, error) {
 	}
 
 	// The content is a data stream, so it can exceed one frame. A zero-byte
-	// file arrives as one frame of zero bytes — which is not the same as no
+	// file arrives as one frame of zero bytes 閳?which is not the same as no
 	// frame at all, and that is what tells it apart from a failed read.
 	data, err := v.readContent(id)
 	if err != nil {
@@ -208,6 +281,7 @@ func (v *Viewer) Read(path string, off int64, n int) ([]byte, error) {
 // successful answer. Every failure travels in the head frame instead, so there is
 // nothing here to tell apart.
 func (v *Viewer) readContent(id uint64) ([]byte, error) {
+	defer v.conn.SetReadDeadline(time.Time{})
 	var body []byte
 	for {
 		if err := v.conn.SetReadDeadline(time.Now().Add(callTimeout)); err != nil {
@@ -243,16 +317,23 @@ func (v *Viewer) Put(path string, r io.Reader) error {
 //
 // It is separate from Put because the two differ in what they will destroy. A
 // caller that means "save this here" wants Put; one that means "this file must
-// not already exist" — writing a lock file, or refusing to clobber somebody
-// else's work — wants this, and could not get it by checking first: the check
+// not already exist" 閳?writing a lock file, or refusing to clobber somebody
+// else's work 閳?wants this, and could not get it by checking first: the check
 // and the write would not be one step, so a file created between them would be
 // overwritten anyway.
 func (v *Viewer) PutExclusive(path string, r io.Reader) error {
 	return v.put(path, r, proto.WriteModeCreate)
 }
 
-// put sends a whole-file write-back in the given mode.
+// put takes the connection first and then sends the write, so the reader is
+// already out of the way when the answer starts arriving.
 func (v *Viewer) put(path string, r io.Reader, mode string) error {
+	return v.stream(func() error { return v.putBody(path, r, mode) })
+}
+
+// putBody sends a whole-file write-back in the given mode, with the connection
+// in hand.
+func (v *Viewer) putBody(path string, r io.Reader, mode string) error {
 	client, rest, err := splitWritePath("write", path)
 	if err != nil {
 		return err
@@ -282,11 +363,15 @@ func (v *Viewer) Mkdir(path string) error {
 	if err != nil {
 		return err
 	}
-	body, err := json.Marshal(proto.MkdirBody{Client: client, Path: rest})
-	if err != nil {
-		return fmt.Errorf("viewer: encode mkdir: %w", err)
-	}
-	return v.writeRequest(proto.KindMkdir, body, "mkdir "+path)
+	// The connection is taken before the request is sent: see List. The body is
+	// built inside so nothing but this call can be in flight on it.
+	return v.stream(func() error {
+		body, err := json.Marshal(proto.MkdirBody{Client: client, Path: rest})
+		if err != nil {
+			return fmt.Errorf("viewer: encode mkdir: %w", err)
+		}
+		return v.writeRequest(proto.KindMkdir, body, "mkdir "+path)
+	})
 }
 
 // Remove deletes one file or one empty directory on the owning client.
@@ -295,11 +380,13 @@ func (v *Viewer) Remove(path string) error {
 	if err != nil {
 		return err
 	}
-	body, err := json.Marshal(proto.RemoveBody{Client: client, Path: rest})
-	if err != nil {
-		return fmt.Errorf("viewer: encode remove: %w", err)
-	}
-	return v.writeRequest(proto.KindRemove, body, "remove "+path)
+	return v.stream(func() error {
+		body, err := json.Marshal(proto.RemoveBody{Client: client, Path: rest})
+		if err != nil {
+			return fmt.Errorf("viewer: encode remove: %w", err)
+		}
+		return v.writeRequest(proto.KindRemove, body, "remove "+path)
+	})
 }
 
 // Rename moves a path within one client.
@@ -320,18 +407,20 @@ func (v *Viewer) Rename(oldPath, newPath string) error {
 	if newClient != oldClient {
 		// Refused here as well as by the owner, and deliberately so. The two
 		// ends are stripped of the client name before they are sent, so what the
-		// owner receives cannot say which clients they came from — if the
+		// owner receives cannot say which clients they came from 閳?if the
 		// refusal lived only there, this request would be indistinguishable from
 		// a legitimate rename of two identically spelled paths and would be
 		// carried out. This is the only party that still knows.
 		return fmt.Errorf("viewer: rename %q to %q: the two ends are on different clients (%q and %q): a rename stays inside one client",
 			oldPath, newPath, oldClient, newClient)
 	}
-	body, err := json.Marshal(proto.RenameBody{Client: oldClient, OldPath: oldRest, NewPath: newRest})
-	if err != nil {
-		return fmt.Errorf("viewer: encode rename: %w", err)
-	}
-	return v.writeRequest(proto.KindRename, body, "rename "+oldPath+" to "+newPath)
+	return v.stream(func() error {
+		body, err := json.Marshal(proto.RenameBody{Client: oldClient, OldPath: oldRest, NewPath: newRest})
+		if err != nil {
+			return fmt.Errorf("viewer: encode rename: %w", err)
+		}
+		return v.writeRequest(proto.KindRename, body, "rename "+oldPath+" to "+newPath)
+	})
 }
 
 // splitWritePath separates the client name from the path inside it and requires
@@ -362,7 +451,7 @@ func (v *Viewer) writeRequest(kind string, body []byte, what string) error {
 // The head is read and reported before the stream that follows it, and that
 // order is the point: the head is where every outcome travels, and the two
 // frames after it are the stream and the close. If the answer is already
-// known — the head says what happened — then a failure to read the rest of it,
+// known 閳?the head says what happened 閳?then a failure to read the rest of it,
 // which is the server failing to write frames it was cleaning up with, must not
 // replace what the head said with a report about the transport. That is how an
 // error the server had already sent would be lost in favour of "the connection
@@ -378,22 +467,24 @@ func (v *Viewer) awaitWrite(id uint64, what string) error {
 	if head.Kind != proto.KindWriteOK {
 		return fmt.Errorf("viewer: %s: reply kind = %q, want %q", what, head.Kind, proto.KindWriteOK)
 	}
-	if head.Err != "" {
-		// The outcome is decided and the stream that follows is empty by
-		// construction — a write's answer never carries content — so nothing is
-		// left unread by returning here: the close that comes next is the
-		// server's to send and no part of it can change this answer.
-		return fmt.Errorf("viewer: %s: %s", what, head.Err)
-	}
-	// The stream is read whatever the outcome says: a failed write still sent
-	// one, and its end marker is what puts this connection back at a frame
-	// boundary.
+	// All three parts are read whatever the head says. A write's answer is a
+	// head, an (empty) stream, and a closing frame even when it failed — the
+	// stream is what marks the end of the answer on the wire, and skipping it
+	// leaves its end marker to be read as the next reply. Returning on the
+	// head's error alone produced exactly that: the next request on this
+	// connection read a data frame and failed with "expected a control frame,
+	// got frame kind 2".
 	if _, err := v.readContent(id); err != nil {
 		return fmt.Errorf("viewer: %s: reading the answer's stream: %w", what, err)
 	}
 	tail, err := v.recv(callTimeout)
 	if err != nil {
 		return fmt.Errorf("viewer: %s ended without its closing frame: %w", what, err)
+	}
+	if head.Err != "" {
+		// The head carries the outcome, and it is reported after the answer has
+		// been consumed in full.
+		return fmt.Errorf("viewer: %s: %s", what, head.Err)
 	}
 	if tail.Err != "" {
 		return fmt.Errorf("viewer: %s: %s", what, tail.Err)
@@ -445,6 +536,7 @@ func (v *Viewer) recvBody(env proto.Envelope, id uint64, what string) ([]byte, e
 	if err := v.conn.SetReadDeadline(time.Now().Add(callTimeout)); err != nil {
 		return nil, fmt.Errorf("viewer: %s: %w", what, err)
 	}
+	defer v.conn.SetReadDeadline(time.Time{})
 	body, err := v.pc.RecvBody(id)
 	if err != nil {
 		return nil, fmt.Errorf("viewer: %s: %w", what, err)
@@ -454,8 +546,6 @@ func (v *Viewer) recvBody(env proto.Envelope, id uint64, what string) ([]byte, e
 
 // Close drops the connection. A viewer owns nothing on the server, so there is
 // nothing to clean up beyond the socket.
-func (v *Viewer) Close() error { return v.conn.Close() }
-
 // send writes one request and returns the ID it was given, so the reply can be
 // matched to it.
 func (v *Viewer) send(kind string, body []byte) (uint64, error) {
@@ -467,20 +557,221 @@ func (v *Viewer) send(kind string, body []byte) (uint64, error) {
 	return id, nil
 }
 
-// recv reads one envelope, bounding the wait so a quiet server fails the call
-// rather than hanging it for ever.
+// recv reads the next envelope, bounding the wait so a quiet server fails the
+// call rather than hanging it for ever.
+//
+// It runs inside stream, so the request has already gone out and the reader is
+// standing aside: this is the only reader of this reply.
+//
+// A pushed update that arrives before the reply is passed over here, and
+// published rather than dropped: the reader is not reading, so this is the only
+// place it can be seen, and a viewer that lost the update because it happened to
+// ask a question at the same time would be worse than one that asked nothing.
+// The same applies between a reply's head and its body; every body read below
+// uses the same wrapper.
 func (v *Viewer) recv(d time.Duration) (proto.Envelope, error) {
+	return v.recvWithin(d)
+}
+
+// recvWithin reads the next envelope with its own deadline, publishing any
+// pushed update that arrives while it waits.
+func (v *Viewer) recvWithin(d time.Duration) (proto.Envelope, error) {
 	if err := v.conn.SetReadDeadline(time.Now().Add(d)); err != nil {
 		return proto.Envelope{}, err
 	}
 	defer v.conn.SetReadDeadline(time.Time{})
-	return v.pc.Recv()
+	return v.pc.RecvEvent(v.publishEvent)
+}
+
+// emit publishes a batch of updates, and never waits: a watcher that has stopped
+// reading loses updates rather than breaking the connection.
+func (v *Viewer) emit(nodes []node.Node) {
+	v.mu.Lock()
+	ch := v.events
+	v.mu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- nodes:
+	default:
+	}
+}
+
+// stream runs one request and everything belonging to its answer with the reader
+// standing aside, and lets it resume afterwards.
+//
+// The order is the whole point. The connection is taken before the request goes
+// out, not after: a request sent while the reader still holds the connection
+// produces a reply the reader reads, and the call then waits for an answer that
+// has already been consumed — which is what "replies are out of step" reports.
+//
+// Before a reader exists there is nothing to stand aside: the call is the only
+// reader, and this is a no-op.
+func (v *Viewer) stream(fn func() error) error {
+	v.mu.Lock()
+	if !v.reader {
+		v.mu.Unlock()
+		return fn()
+	}
+	token := v.connToken
+	v.mu.Unlock()
+
+	select {
+	case <-token:
+	case <-time.After(callTimeout):
+		return fmt.Errorf("viewer: no free connection within %s", callTimeout)
+	}
+	defer func() { token <- struct{}{} }()
+	return fn()
+}
+
+// isTimeout reports whether err is a deadline expiring rather than a connection
+// failing. The two look alike at a Recv and mean opposite things here.
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// startPump switches the viewer to a single background reader.
+//
+// It is what makes Watch work at all. Pushed updates arrive on their own
+// schedule, and without something reading the socket they would sit in its
+// buffer until the next request happened to be made 閳?a watcher that hears
+// nothing until it asks a question is not watching. Exactly one goroutine reads
+// the connection at a time from here on, because two concurrent readers would
+// shred the frame boundaries.
+func (v *Viewer) startPump() {
+	v.startReader.Do(func() {
+		v.mu.Lock()
+		v.events = make(chan []node.Node, 64)
+		v.connToken = make(chan struct{}, 1)
+		v.connToken <- struct{}{}
+		v.reader = true
+		events := v.events
+		v.mu.Unlock()
+		go v.pump(events)
+	})
+}
+
+// pump reads pushed updates while no call is being served.
+// pump reads pushed updates.
+//
+// It never reads a reply, and the token alone is what makes that true — there is
+// no flag saying "a call is underway", because the call holding the token is
+// exactly that statement. A call takes the token before it sends, so while this
+// holds the token the call has not asked anything yet and no reply can exist;
+// when this finds the token gone it waits, and finds it again only after the
+// call has read its own answer to the end.
+//
+// The read is bounded by readWindow, which is what lets the connection go: a
+// call cannot take it until this read returns, so a read parked for as long as
+// the tree is quiet would hold every call up until the tree changed.
+func (v *Viewer) pump(events chan []node.Node) {
+	defer func() {
+		// The connection is gone, so every later call has to fail rather than
+		// wait for a reply nobody is left to read.
+		v.mu.Lock()
+		v.reader = false
+		v.mu.Unlock()
+	}()
+	for {
+		select {
+		case <-v.connToken:
+		default:
+			// A call is mid-round-trip. Take the token the moment it is back.
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		err := v.conn.SetReadDeadline(time.Now().Add(readWindow))
+		if err != nil {
+			return
+		}
+		// Only pushed updates are published; anything else here has no call
+		// waiting for it, because a call holds the token, and is dropped rather
+		// than queued — nothing reads a queue on this connection.
+		_, err = v.pc.RecvEvent(v.publishEvent)
+		v.connToken <- struct{}{}
+		if err != nil && !isTimeout(err) {
+			return
+		}
+	}
+}
+
+// publishEvent decodes one pushed update and hands it to whoever is watching.
+func (v *Viewer) publishEvent(env proto.Envelope) {
+	var b proto.EventBody
+	if json.Unmarshal(env.Body, &b) != nil {
+		return
+	}
+	v.emit(nodeJSONToNodes(b.Nodes))
+}
+
+// nodeJSONToNodes converts a pushed update's wire nodes to the tree's model.
+func nodeJSONToNodes(in []proto.NodeJSON) []node.Node {
+	out := make([]node.Node, 0, len(in))
+	for _, n := range in {
+		out = append(out, node.Node{
+			Path:  n.Path,
+			Kind:  node.Kind(n.Kind),
+			Size:  n.Size,
+			Mode:  n.Mode,
+			Mtime: n.Mtime,
+		})
+	}
+	return out
+}
+
+// Watch returns a channel of index updates pushed by the server.
+//
+// Each value is the batch one filesystem change produced, with fully qualified
+// paths: "win/Documents/x.txt", not "Documents/x.txt". The channel is shared 閳?// calling Watch twice returns the same channel rather than splitting the
+// updates 閳?and it is closed when the viewer is.
+//
+// The first call starts a background reader, because a push arrives on the
+// server's schedule rather than in answer to anything. From then on a call's own
+// timeout bounds the wait for its reply, and the reader hands the connection
+// back every readWindow so a call is not held up by a quiet tree.
+//
+// The channel is buffered and a push never waits for a reader, so a caller that
+// stops reading loses updates rather than breaking the connection. That is the
+// intended trade: a viewer that needs the tree always has List, and a listing
+// taken after an update has already been applied cannot be stale.
+func (v *Viewer) Watch() <-chan []node.Node {
+	v.startPump()
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.events
+}
+
+// Match reports whether a pushed path is target itself or something under it.
+//
+// It exists so a caller does not have to reinvent the comparison, which is a
+// path question rather than a string one: the prefix "win/Documents" must match
+// "win/Documents/x.txt" but not "win/DocumentsX/x.txt".
+func Match(target, path string) bool {
+	if path == target {
+		return true
+	}
+	return strings.HasPrefix(path, target+"/")
+}
+
+// Close ends the connection and closes the event channel, so a caller ranging
+// over it is released rather than left waiting for ever.
+func (v *Viewer) Close() error {
+	v.mu.Lock()
+	if v.events != nil {
+		close(v.events)
+		v.events = nil
+	}
+	v.mu.Unlock()
+	return v.conn.Close()
 }
 
 // splitPath turns a user-facing path into the (client, path) pair the protocol
 // carries.
 //
-// A bare name is a client and its path is empty — "" addresses the top level.
+// A bare name is a client and its path is empty 閳?"" addresses the top level.
 // The split happens once, on the first separator: everything after it belongs
 // to the client's own namespace, where a separator is an ordinary path
 // character rather than something the viewer should interpret.

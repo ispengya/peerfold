@@ -468,3 +468,37 @@ func TestServerWritesOnOneConnectionStayInStep(t *testing.T) {
 		t.Fatalf("read after writes = %q, want %q: the connection is out of step", got, "read back")
 	}
 }
+
+// TestServerPutToAnAbsentClientStillDrainsTheContent pins the other failure
+// path a put has: the request is refused because the named client is not
+// connected, which is decided before the content is ever forwarded to anyone.
+//
+// The requester has already sent its content by then, so the only question is
+// whether this connection reads it here or reads it later as something else.
+// It read it later: the next request was answered with "expected a control
+// frame, got frame kind 2", and the connection stayed one frame out of step
+// from there on. That is why the drain is deferred rather than inline — "the
+// forwarding failed" does not mean "the content was read".
+func TestServerPutToAnAbsentClientStillDrainsTheContent(t *testing.T) {
+	_, addr := start(t)
+	viewer, _ := hello(t, addr, "me", "viewer", false)
+	defer viewer.Close()
+	conn := proto.NewConn(viewer)
+
+	body, err := json.Marshal(proto.WriteBody{Client: "nobody", Path: "Documents/a.txt", Mode: proto.WriteModePut})
+	if err != nil {
+		t.Fatalf("Marshal WriteBody: %v", err)
+	}
+
+	head, got, tail := askWrite(t, conn, 1, proto.KindWrite, body, []byte("content for nobody"))
+	checkWriteShape(t, 1, head, got, tail, "client is not connected")
+
+	// The same connection has to be usable afterwards, and the length of the
+	// content is what makes the leftover detectable: the frames the drain did
+	// not read are exactly the ones the next read would find first.
+	head, got, tail = askRead(t, conn, 2, "nobody", "Documents/a.txt")
+	checkReadShape(t, 2, head, tail, "client is not connected")
+	if len(got) != 0 {
+		t.Fatalf("read after a refused put = %q, want nothing", got)
+	}
+}

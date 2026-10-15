@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 )
 
 // dataHeaderLen is the big-endian stream id that prefixes every data frame's
@@ -58,11 +59,109 @@ func (c *Conn) Send(env Envelope) error {
 	return nil
 }
 
-// Recv reads the next control frame. A data frame in that position is a
-// protocol violation rather than something to skip past.
+// SendWithin writes env as a control frame, giving up after d.
+//
+// It exists for a message one end sends without being asked — an index update
+// pushed to a watcher — where the writer must not be held up by a reader that
+// has stopped reading. A peer that stops reading fills its socket buffer, and an
+// unbounded write to it blocks until the buffer drains, which for a reader that
+// never reads again is never. One peer's misbehaviour would then become every
+// peer's, since the writer is the one fanning the message out.
+//
+// A deadline needs a socket, so on a connection that is not one the write is
+// attempted without a bound. That case is produced by tests that drive a Conn
+// over an in-memory pipe; there is no buffer to fill when the writer and the
+// reader are the same process.
+func (c *Conn) SendWithin(env Envelope, d time.Duration) error {
+	payload, err := json.Marshal(env)
+	if err != nil {
+		return fmt.Errorf("proto: encode control envelope: %w", err)
+	}
+	dc, ok := c.rw.(deadliner)
+	if !ok {
+		return c.Send(env)
+	}
+
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	if c.werr != nil {
+		return fmt.Errorf("proto: write on a broken connection: %w", c.werr)
+	}
+	if err := dc.SetWriteDeadline(time.Now().Add(d)); err != nil {
+		return fmt.Errorf("proto: set write deadline: %w", err)
+	}
+	// The deadline is cleared whatever happens, so it bounds this send rather
+	// than every write that follows it. Leaving it set would make an unrelated
+	// later write fail with a timeout it never asked for.
+	defer func() { _ = dc.SetWriteDeadline(time.Time{}) }()
+
+	if err := WriteFrame(c.rw, FrameControl, payload); err != nil {
+		c.werr = err
+		return err
+	}
+	return nil
+}
+
+// deadliner is an io.ReadWriteCloser that can bound one write, which is what a
+// net.Conn provides.
+type deadliner interface {
+	SetWriteDeadline(t time.Time) error
+}
+
+// Recv reads the next control frame, passing over any pushed index update.
+//
+// Skipping is the right default for a peer that receives updates it has not
+// asked for — a viewer — because an update can otherwise land between a request
+// and its reply and be mistaken for the reply. A peer that must see every
+// control frame uses RecvAny: the server is such a peer, because a client's
+// update is a frame it has to act on rather than one it passes over.
 func (c *Conn) Recv() (Envelope, error) {
+	return c.recvControl(nil)
+}
+
+// RecvAny reads the next control frame, whatever its kind.
+func (c *Conn) RecvAny() (Envelope, error) {
 	c.rmu.Lock()
 	defer c.rmu.Unlock()
+	return c.readControl()
+}
+
+// RecvEvent reads the next control frame that is not a pushed index update,
+// calling handle for each update it passes.
+//
+// It exists for the reader that publishes updates: it is Recv with somewhere to
+// put what is skipped.
+func (c *Conn) RecvEvent(handle func(Envelope)) (Envelope, error) {
+	return c.recvControl(handle)
+}
+
+// recvControl reads frames until one is not an update, and returns it.
+//
+// Every read of a viewer's connection goes through here or through RecvData, and
+// both pass over updates: the server pushes them whenever any supplying client
+// reports a change, so one can land between a reply's head frame and its body,
+// or between two chunks of a read's content. A body reader that took one for
+// data would desynchronise the stream.
+func (c *Conn) recvControl(handle func(Envelope)) (Envelope, error) {
+	c.rmu.Lock()
+	defer c.rmu.Unlock()
+	for {
+		env, err := c.readControl()
+		if err != nil {
+			return Envelope{}, err
+		}
+		if env.Kind != KindEvent {
+			return env, nil
+		}
+		if handle != nil {
+			handle(env)
+		}
+	}
+}
+
+// readControl reads exactly one frame and requires it to be a control frame. The
+// caller holds rmu.
+func (c *Conn) readControl() (Envelope, error) {
 	kind, payload, err := ReadFrame(c.rw)
 	if err != nil {
 		return Envelope{}, err
@@ -109,27 +208,38 @@ func (c *Conn) sendDataLocked(id uint64, chunk []byte) error {
 // RecvData reads the next chunk of the response stream identified by id. The
 // second result reports that the stream ended, which the peer signals with a
 // zero-length chunk.
+//
+// A pushed update that lands between two chunks is passed over rather than
+// mistaken for data: see recvControl.
 func (c *Conn) RecvData(id uint64) ([]byte, bool, error) {
 	c.rmu.Lock()
 	defer c.rmu.Unlock()
-	kind, payload, err := ReadFrame(c.rw)
-	if err != nil {
-		return nil, false, err
+	for {
+		kind, payload, err := ReadFrame(c.rw)
+		if err != nil {
+			return nil, false, err
+		}
+		if kind == FrameControl {
+			var env Envelope
+			if err := json.Unmarshal(payload, &env); err == nil && env.Kind == KindEvent {
+				continue
+			}
+		}
+		if kind != FrameData {
+			return nil, false, fmt.Errorf("proto: expected a data frame, got frame kind %d", kind)
+		}
+		if len(payload) < dataHeaderLen {
+			return nil, false, fmt.Errorf("proto: data frame carries %d bytes, want at least %d for the stream id", len(payload), dataHeaderLen)
+		}
+		if got := binary.BigEndian.Uint64(payload[:dataHeaderLen]); got != id {
+			return nil, false, fmt.Errorf("proto: data frame is for stream %d, want %d", got, id)
+		}
+		chunk := payload[dataHeaderLen:]
+		if len(chunk) == 0 {
+			return nil, true, nil
+		}
+		return chunk, false, nil
 	}
-	if kind != FrameData {
-		return nil, false, fmt.Errorf("proto: expected a data frame, got frame kind %d", kind)
-	}
-	if len(payload) < dataHeaderLen {
-		return nil, false, fmt.Errorf("proto: data frame carries %d bytes, want at least %d for the stream id", len(payload), dataHeaderLen)
-	}
-	if got := binary.BigEndian.Uint64(payload[:dataHeaderLen]); got != id {
-		return nil, false, fmt.Errorf("proto: data frame is for stream %d, want %d", got, id)
-	}
-	chunk := payload[dataHeaderLen:]
-	if len(chunk) == 0 {
-		return nil, true, nil
-	}
-	return chunk, false, nil
 }
 
 // SendBody writes body as the response stream identified by id, in chunks, then
@@ -226,6 +336,27 @@ func (c *Conn) SendAnnounced(id uint64, env Envelope, content func(id uint64, se
 		return err
 	}
 	return nil
+}
+
+// SetReadDeadline bounds the next reads on this connection, or clears the bound
+// when d is the zero time.
+//
+// The server uses it to bound a cleanup read: a put whose forwarding failed has
+// content on the wire that must be read off to leave the connection at a frame
+// boundary, but the requester may be part way through sending it and nobody is
+// going to ask for the rest. Without a bound that cleanup read waits for as long
+// as the requester cares to take.
+//
+// A stream that cannot be bounded says so by returning false, which is not an
+// error: a pipe used in a test has no deadline, and a caller that needs a bound
+// to be safe has to decide what to do about its absence. Only the read framing
+// changes here, never the frame boundaries.
+func (c *Conn) SetReadDeadline(t time.Time) bool {
+	d, ok := c.rw.(interface{ SetReadDeadline(time.Time) error })
+	if !ok {
+		return false
+	}
+	return d.SetReadDeadline(t) == nil
 }
 
 // Close closes the underlying stream.
