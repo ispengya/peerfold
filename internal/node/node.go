@@ -17,6 +17,20 @@ const (
 	KindFile Kind = 0
 	// KindDir is a directory.
 	KindDir Kind = 1
+	// KindSymlink is a symbolic link.
+	//
+	// The scanner used to record a link as KindFile with Size set to the
+	// length of its target string, because it took only the permission bits
+	// from the owner's FileInfo and decided the kind with IsDir. That made a
+	// stat and a read disagree — the owner's read follows the link — so a
+	// read-modify-write through a mount overwrote the target file.
+	//
+	// The mount layer refuses a link with ELOOP. It can only do that if the
+	// index says what the entry is, which is what this kind is for.
+	//
+	// 2 was free: File and Dir are 0 and 1, Deleted is 255 so that it cannot
+	// collide with a real kind.
+	KindSymlink Kind = 2
 	// KindDeleted is not a kind a filesystem can report. A node carrying it is
 	// an instruction: the path no longer exists, so the index must drop it (and
 	// its subtree). The scanner never produces it; the watcher and the index

@@ -120,6 +120,42 @@ func validName(name string) bool {
 // DefaultBatch is the batch size used when a caller passes a non-positive one.
 const DefaultBatch = 500
 
+// classify decides what a walked entry is, from the FileInfo the walk reported
+// and whether the DirEntry called itself a directory.
+//
+// Two Windows cases make this more than a two-way choice, and both used to be
+// indexed as a regular file with a meaningless size:
+//
+//   - A symbolic link. d.Info() reports the link itself, so the symlink bit is
+//     set. The owner's read opens the path and follows the link, so recording
+//     it as a file made a stat say 9 bytes and a read return the target — and a
+//     read-modify-write through a mount overwrote the target file.
+//   - A directory junction or other reparse point. Go reports these with
+//     ModeIrregular set and neither the symlink bit nor the dir bit, and
+//     DirEntry.IsDir() also says false, because a junction is not a directory
+//     to Lstat. Junctions are far more common than symlinks on Windows —
+//     OneDrive, node_modules, "C:\Users\All Users" — so this is the case that
+//     bites most often. It is treated as a link because that is the safe
+//     answer: a junction points somewhere, and the mount layer refuses links.
+//
+// A name that is neither a directory, a link, nor a regular file (a socket, a
+// device, a pipe) is reported as KindSymlink rather than KindFile, so that the
+// mount layer refuses it. Indexing it as a file would promise a size and a
+// content that do not exist.
+func classify(mode os.FileMode, isDir bool) node.Kind {
+	switch {
+	case mode&os.ModeSymlink != 0:
+		return node.KindSymlink
+	case isDir:
+		return node.KindDir
+	case mode&os.ModeType != 0:
+		// ModeIrregular, ModeNamedPipe, ModeSocket, ModeDevice, ModeCharDevice.
+		return node.KindSymlink
+	default:
+		return node.KindFile
+	}
+}
+
 // Scan walks every share and hands the nodes to emit in batches of at most
 // batch entries.
 //
@@ -164,7 +200,7 @@ func Scan(sh Shares, batch int, emit func([]node.Node) error) error {
 		header := node.Node{
 			Path:  name,
 			Kind:  node.KindDir,
-			Mode:  uint32(rootInfo.Mode().Perm()),
+			Mode:  uint32(rootInfo.Mode()),
 			Mtime: rootInfo.ModTime().UnixNano(),
 		}
 		if err := add(header); err != nil {
@@ -204,13 +240,11 @@ func Scan(sh Shares, batch int, emit func([]node.Node) error) error {
 			}
 			n := node.Node{
 				Path:  name + "/" + filepath.ToSlash(rel),
-				Mode:  uint32(info.Mode().Perm()),
+				Mode:  uint32(info.Mode()),
 				Mtime: info.ModTime().UnixNano(),
 			}
-			if d.IsDir() {
-				n.Kind = node.KindDir
-			} else {
-				n.Kind = node.KindFile
+			n.Kind = classify(info.Mode(), d.IsDir())
+			if n.Kind == node.KindFile {
 				n.Size = info.Size()
 			}
 			return add(n)

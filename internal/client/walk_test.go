@@ -222,8 +222,14 @@ func TestScanEmitsWholeTree(t *testing.T) {
 	if a.Mtime != info.ModTime().UnixNano() {
 		t.Errorf("Documents/a.txt Mtime = %d, want %d", a.Mtime, info.ModTime().UnixNano())
 	}
-	if a.Mode != uint32(info.Mode().Perm()) {
-		t.Errorf("Documents/a.txt Mode = %o, want %o", a.Mode, info.Mode().Perm())
+	// Mode carries the full FileMode, type bits included, so that a consumer
+	// can tell a directory, a file and a symlink apart. The expectation is
+	// therefore the complete mode and not just the permission bits.
+	if a.Mode != uint32(info.Mode()) {
+		t.Errorf("Documents/a.txt Mode = %#o, want %#o", a.Mode, uint32(info.Mode()))
+	}
+	if perm := a.Mode & 0o7777; perm != uint32(info.Mode().Perm()) {
+		t.Errorf("Documents/a.txt permission bits = %#o, want %#o", perm, uint32(info.Mode().Perm()))
 	}
 
 	// The share root itself, plus every entry beneath it. An empty directory

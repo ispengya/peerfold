@@ -211,24 +211,28 @@ func (w *watch) emitTree(dir string) {
 		if !ok {
 			return nil
 		}
-		if d.IsDir() {
-			w.send([]node.Node{{Path: rel, Kind: node.KindDir}})
-			return nil
-		}
 		info, err := d.Info()
 		if err != nil {
 			return nil
 		}
-		if !info.Mode().IsRegular() {
-			return nil
-		}
-		w.send([]node.Node{{
+		// These nodes stand in for events that were missed, so they have to
+		// match what Scan would have produced for the same entries. They used
+		// to leave Mode unset on directories and drop anything that was not a
+		// regular file, which meant a subtree read after a new directory
+		// appeared disagreed with the same subtree read by the initial scan:
+		// a directory arrived with mode 0, and a symlink or a Windows junction
+		// vanished from a tree the scan had put it in.
+		kind := classify(info.Mode(), d.IsDir())
+		n := node.Node{
 			Path:  rel,
-			Kind:  node.KindFile,
-			Size:  info.Size(),
-			Mode:  uint32(info.Mode().Perm()),
+			Kind:  kind,
+			Mode:  uint32(info.Mode()),
 			Mtime: info.ModTime().UnixNano(),
-		}})
+		}
+		if kind == node.KindFile {
+			n.Size = info.Size()
+		}
+		w.send([]node.Node{n})
 		return nil
 	})
 }
@@ -290,9 +294,22 @@ func (w *watch) handle(ev fsnotify.Event) {
 		}
 		return
 	}
-	// A symlink is reported as whatever it points at, or not at all: the index
-	// holds real entries, and a link is not one.
-	if info.Mode()&os.ModeSymlink != 0 {
+	// A symlink or a reparse point (a Windows junction) gets a node of its own
+	// rather than being dropped. It used to return here, which meant a link
+	// the scan had indexed could never be updated again for the life of the
+	// connection: the index kept saying KindFile with the length of the target
+	// string while the thing on disk changed.
+	//
+	// classify is the same function Scan uses, so the two paths cannot
+	// disagree about what a given entry is.
+	kind := classify(info.Mode(), info.IsDir())
+	if kind != node.KindFile && kind != node.KindDir {
+		w.send([]node.Node{{
+			Path:  rel,
+			Kind:  kind,
+			Mode:  uint32(info.Mode()),
+			Mtime: info.ModTime().UnixNano(),
+		}})
 		return
 	}
 	if info.IsDir() {
@@ -317,10 +334,14 @@ func (w *watch) handle(ev fsnotify.Event) {
 			// same state.
 			w.emitTree(ev.Name)
 		}
-		w.send([]node.Node{{Path: rel, Kind: node.KindDir, Mode: uint32(info.Mode().Perm())}})
+		w.send([]node.Node{{Path: rel, Kind: node.KindDir, Mode: uint32(info.Mode())}})
 		return
 	}
 	if !info.Mode().IsRegular() {
+		// classify already sends anything with a type bit as a link, so this
+		// is a guard rather than a decision. Say so instead of returning
+		// silently: a change that reaches here is one the index will not learn
+		// about, and silence is how the old symlink bug stayed hidden.
 		return
 	}
 
@@ -328,7 +349,7 @@ func (w *watch) handle(ev fsnotify.Event) {
 		Path:  rel,
 		Kind:  node.KindFile,
 		Size:  info.Size(),
-		Mode:  uint32(info.Mode().Perm()),
+		Mode:  uint32(info.Mode()),
 		Mtime: info.ModTime().UnixNano(),
 	}})
 }

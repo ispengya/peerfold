@@ -344,3 +344,61 @@ func TestWatchRefusesNoEmitter(t *testing.T) {
 		t.Fatal("Watch with no emitter = nil error, want a refusal")
 	}
 }
+
+// TestWatchSubtreeNodesMatchScan pins that the nodes emitted while filling in
+// the contents of a new directory carry the same information Scan would have
+// given for the same entries.
+//
+// They did not. The walk that closes the gap after a directory appears sent
+// directories with Mode left at zero and dropped anything that was not a
+// regular file. Both matter to the mount layer: a directory whose mode is 0 has
+// no permission bits, and an entry the scan indexed but this walk omitted
+// leaves the two views of the same subtree disagreeing.
+//
+// The Mode expectation is taken from the filesystem rather than written as a
+// literal, because Windows does not honour the mode a program asks for and a
+// literal would test the host instead of the code.
+func TestWatchSubtreeNodesMatchScan(t *testing.T) {
+	root, c, _ := watchFixture(t)
+
+	fresh := filepath.Join(root, "fresh")
+	if err := os.MkdirAll(filepath.Join(fresh, "inner"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(fresh, "inner", "deep.txt"), []byte("deep"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// The directory the caller reports itself, plus the one the closing walk
+	// reports.
+	for path, local := range map[string]string{
+		"Documents/fresh":       fresh,
+		"Documents/fresh/inner": filepath.Join(fresh, "inner"),
+	} {
+		n := c.waitFor(t, "for "+path, func(n node.Node) bool { return n.Path == path })
+		if n.Kind != node.KindDir {
+			t.Errorf("%s Kind = %d, want KindDir", path, n.Kind)
+		}
+		info, err := os.Stat(local)
+		if err != nil {
+			t.Fatalf("Stat %s: %v", local, err)
+		}
+		if want := uint32(info.Mode()); n.Mode != want {
+			t.Errorf("%s Mode = %#o, want %#o (the filesystem's own answer)", path, n.Mode, want)
+		}
+		if n.Mode&0o777 == 0 && info.Mode().Perm() != 0 {
+			t.Errorf("%s Mode = %#o has no permission bits, but the filesystem reports %v", path, n.Mode, info.Mode().Perm())
+		}
+	}
+
+	// And the file inside the new subtree, with its size and a real mtime.
+	deep := c.waitFor(t, "for Documents/fresh/inner/deep.txt", func(n node.Node) bool {
+		return n.Path == "Documents/fresh/inner/deep.txt"
+	})
+	if deep.Kind != node.KindFile || deep.Size != 4 {
+		t.Errorf("deep.txt = %+v, want a 4-byte file", deep)
+	}
+	if deep.Mtime == 0 {
+		t.Error("deep.txt Mtime = 0; the closing walk must carry the modification time like Scan does")
+	}
+}
