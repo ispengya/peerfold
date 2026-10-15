@@ -1,22 +1,30 @@
 # Peerfold 挂载层设计（第二份）
 
 - 日期：2026-10-15
-- 状态：待批准（**v2：已按独立 builder-check 的 9 条意见修订**，见第十四节）
+- 状态：待批准（**v3：两平台共用一个 cgofuse API，Windows 在范围内**；第十四节是
+  对独立 builder-check 9 条意见的逐条回复）
 - 前置：`docs/superpowers/specs/2026-10-14-peerfold-design.md`（已冻结）、
   `docs/superpowers/plans/2026-10-14-peerfold-v1-core.md`（已完工，已合入 `main`）
 - 说明：本文只写形态与决定。凡是"我拍的"都标出来，逐条可推翻。
 
-### 这份 v2 改了什么（一句话）
+### 这份 v3 改了什么（一句话）
 
 v1 版本文档**设计在一个并不存在的 viewer API 之上**：它承诺了"open 时向属主复核
 size/mtime"、承诺了"察觉丢更新后整体作废"，而这两件事 v1 的线上格式和 `viewer`
 **都做不到**。一个独立的评审子代理逐条核过代码之后指出了这一点。第十四节是完整
-的逐条回复，其中**5 条接受、1 条部分反驳、3 条澄清**。
+的逐条回复，其中**大部分接受、一条部分反驳**。
 
-主要变化：新增 **D11（离线与重连）**、**D12（符号链接）**，改写 **D3（缓冲的两级
-上限）** 与 **D5（丢更新怎么察觉）**，**D4 被 §六 取代**（元数据超时不再是 0），
-并把"协议不动"这条约束**降级为"线上格式不动，但允许给 `Err` 文本加机器可读
-前缀"**（D6）。
+**v3 又推翻了我自己的一个结论**：v2 曾以"Windows 绑定是 cgo 的、本机没有 C
+工具链"为理由把 Windows 推迟。实测发现 **`cgofuse` 有一个纯 Go 的 Windows 实现**：
+`CGO_ENABLED=0 GOOS=windows` 编译成功、二进制在本机运行通过。所以
+**Windows 不需要 C 工具链，而且本机能真挂载 —— 它反而是本机唯一能端到端验证的
+平台。** 交付顺序因此反过来（D7）。
+
+主要变化：新增 **D11（离线与重连）**、**D12（符号链接）**，**改写 D13（Windows
+在范围内）**，**改写 D2（两平台共用一个 cgofuse API，一个壳而非两个）**，
+改写 **D3（缓冲的两级上限）** 与 **D5（丢更新怎么察觉）**，**D4 被 §六 取代**
+（元数据超时不再是 0），并把"协议不动"这条约束**降级为"线上格式不动，但允许给
+`Err` 文本加机器可读前缀"**（D6）。
 
 ---
 
@@ -43,8 +51,7 @@ v1 核心（第一份计划）已经把整条链路做通了：星型拓扑、�
 ### 做
 
 - 观察者本机一个**真内核挂载点**，普通程序无需知道 peerfold 的存在
-- **Linux（FUSE）完整交付**；Windows（WinFsp）见 D13 —— 它是**本计划的待定项**，
-  不是已承诺项
+- **Windows 与 Linux 两个平台都在范围内**，用同一个 `cgofuse` API（D2、D13）
 - 完整的文件系统操作：`getattr` `readdir` `open` `read` `write` `create`
   `truncate` `mkdir` `unlink` `rmdir` `rename` `fsync` `statfs`
 - 随机访问与 `seek`
@@ -97,8 +104,12 @@ v1 核心（第一份计划）已经把整条链路做通了：星型拓扑、�
    `Unregister`，`broadcast` 只在 `applyEvent` 里被调），所以挂载层**不会**收到通知
    —— 见 D5 与 D11。
 8. 本机环境：**没有 C 工具链**，`-race` 不可用。
-   **但是 `GOOS=linux CGO_ENABLED=0 go build ./...` 是通的**（实测），所以
-   **Linux 侧能编译、能跑单元测试，只是不能真挂载**。见 D13。
+   **实测结论（v2 修订时）**：
+   - `GOOS=windows CGO_ENABLED=0 go build` **通** —— cgofuse 在 Windows 上是**纯 Go**
+   - `GOOS=linux CGO_ENABLED=0 go build` **通**（cgofuse 的 linux 分支要 cgo，
+     但 `bazil.org/fuse` 是纯 Go；两者都可编译，**只是 linux 侧 cgofuse 需要
+     `libfuse-dev` 才能真编译**）
+   - 本机**能跑 Windows 的真实挂载**（WinFsp 运行时已装），**跑不了 Linux FUSE**
 9. **索引里的元数据只有"事件到达时的快照"这一个新鲜度。** 线上**有**元数据
    （`node.Node` 带 `Size`/`Mode`/`Mtime`，`List` 会返回），但它来自 server 的
    **索引**，**永远不是从属主的磁盘现读的** —— 线上没有 `stat` 这个 `Kind`
@@ -130,37 +141,72 @@ v1 核心（第一份计划）已经把整条链路做通了：星型拓扑、�
 并开始枚举整棵远端树，而每个 `stat` 都是一次网络往返。这是**已知要接受的代价**，
 不是我没看见。
 
-### D2 模块结构：可移植的核 + 两个薄壳，用文件名后缀分平台
+### D2 模块结构：**可移植的操作核 + 一个平台壳**（Windows 用纯 Go，不需要 C 工具链）
+
+**这一条在 v2 修订时被实测推翻了两次，最终的结论是本文里最省的一条。**
 
 ```
 internal/mount/
-  mount.go          可移植核：路径解析、操作语义、错误映射、缓冲
-  mount_test.go     与平台无关的测试（用假的 viewer 接口）
-  fuse_linux.go     FUSE 绑定（GOOS=linux 自动选中，不用 build tag）
-  winfsp_windows.go WinFsp 绑定（GOOS=windows 自动选中）
+  ops.go            可移植操作核：路径解析、操作语义、缓冲、错误映射、
+                    强制回写表（不导入任何 FUSE 库）
+  ops_test.go       与平台无关的测试（用假 viewer）
+  host.go           适配器：把 ops 实现成 cgofuse 的 FileSystemInterface
+  host_test.go
+  main_*.go         各平台的入口（挂载、卸载、信号处理）
 ```
 
-**为什么**：绝大部分逻辑（路径怎么拆、`getattr` 拿什么、`rename` 什么时候该
-`EXDEV`、缓冲怎么淘汰）与平台无关。把它放进可移植核，意味着**这部分能在没有
-FUSE 的机器上被完整测试** —— 而本机恰好没有 FUSE。两个薄壳只做"把内核的调用
-翻译成核的调用"。
+**决定：两个平台都用 `github.com/winfsp/cgofuse`，同一个 API，一个壳。**
 
-**不用 build tag**：Go 的 `_linux.go` / `_windows.go` 后缀自动生效，比 build tag
-更少出错。**这一点我在写文档时实测验证过**（用一个临时 module 交叉编译）：
+**为什么（三条实测证据）**：
 
-- `GOOS=linux CGO_ENABLED=0`：`bazil.org/fuse` 与 `github.com/hanwen/go-fuse/v2`
-  都能**通过编译** —— 所以两边都**不需要 C 工具链**
-- `GOOS=windows`：那个 linux-only 的文件被**整体排除**，`go build ./...` 报
-  "matched no packages"，**一个字节的 FUSE 代码都不进 Windows 构建**
+1. **cgofuse 在 Windows 上有纯 Go 实现。** 它带
+   `host_nocgo_windows.go` / `fsop_nocgo_windows.go`，build 约束是
+   `//go:build !cgo && windows` —— 手写 `fuse_operations` 结构、用 `syscall` 直连
+   WinFsp DLL。**实测：`CGO_ENABLED=0 GOOS=windows go build` 成功**，产出
+   2.52 MB 二进制，**并且在本机跑起来了**（`fuse.NewFileSystemHost` 返回非 nil，
+   `fuse.ENOENT`/`fuse.ELOOP` 可读）。**所以 Windows 侧不需要 C 工具链、
+   不需要 mingw、不需要导入库。**
+   *（我一开始据此认为必须装 mingw，那是错的；见第十四节对第 6 条的回复。）*
+2. **cgofuse 的 `FileSystemInterface` 正是内核操作集**，而且**带 `Fsync` 和
+   `Flush`** —— 正是 D10 强制回写表所需要的两个钩子。它的方法集是
+   `Init/Destroy/Statfs/Mkdir/Unlink/Rmdir/Rename/Create/Open/Getattr/Truncate/
+   Read/Write/Flush/Release/Fsync/Opendir/Readdir/Releasedir`。
+3. **它用 `LoadLibraryW` 从注册表 `InstallDir` 找 `winfsp-x64.dll`**
+   （Windows 分支），所以运行时不需要 `PATH` 配置。本机注册表已指向
+   `C:\Program Files (x86)\WinFsp\`，DLL 与 `winfsp-x64.sys` 都在位。
 
-**结论**：仓库可以**保持一份 `go.mod`、一份 `go.sum`**，Linux 专属依赖只被
-linux-only 的文件引用，Windows 构建绕开它。不需要按平台拆 module。
-`internal/viewer` 的间接依赖是 `golang.org/x/sys v0.13.0`，而 FUSE 需要
-`v0.28.0` —— 只是**升一个版本**，不引入新的依赖树。
+**一个统一的 API 意味着"两个薄壳"变成"一个壳"** —— 我原来（D2 的 v1 版）打算
+Linux 用 `bazil.org/fuse`、Windows 用别的，那会真的需要写两套。
+`cgofuse` 让这件事消失。
 
-**判错的代价**：如果两个平台的语义分歧比预期大，核会被撑大或者出现 `if GOOS`
-分支。缓解办法是**先只做 Linux**（见 D7），把核的形状用真实需求定下来，再接
-Windows。
+**Linux 侧的代价（如实说）**：`cgofuse` 在 Linux 上是 **cgo** 的，需要
+`libfuse` 的开发头（`-I/usr/include/fuse`）和一个 C 工具链。我原来倾向的
+`bazil.org/fuse` 是**纯 Go**，不要 C 工具链。所以这是一个真实取舍：
+
+| 方案 | Linux 依赖 | Windows | 壳的数量 |
+|---|---|---|---|
+| **cgofuse 双平台（选这个）** | cgo + libfuse-dev | ✅ 纯 Go，已验证 | **一个** |
+| bazil(Linux) + cgofuse(Windows) | 纯 Go | ✅ | 两个 |
+
+**选 cgofuse 双平台**的理由：**Windows 是硬需求**，而"一套壳"把两平台的行为
+一致性变成**自动成立**的事（同一份适配代码），而不是靠我去对齐两套实现。
+Linux 上加一个 `libfuse` 开发包是**构建机器的依赖**，不是产品的依赖 ——
+而且用户的 Linux 侧本来就要装 FUSE 才能挂载。
+
+**判错的代价**：如果 `cgofuse` 的 Linux 侧不够成熟，可以回退到
+"bazil + cgofuse"两壳方案 —— `ops.go` 不导入任何 FUSE 库，所以**换壳不动核**。
+这正是把操作核与壳分开的价值。
+
+**实测记录（本机，`GOOS=windows CGO_ENABLED=0`）**：
+```
+cgofuse v1.6.0 编译 + 运行通过
+  BUILD_NOCGO_WINDOWS=0
+  二进制 2.52 MB
+  host ok: true  ENOENT: 2  ELOOP: 114
+```
+WinFsp 运行时已装（winget `WinFsp.WinFsp` 2.1.25156），SDK 头文件已安置在
+`.superpowers/toolchain/winfsp-sdk`（gitignore 内，**Windows 侧其实用不到它**，
+因为纯 Go 路径不需要头文件；留着是为了万一回退到 cgo 路径）。
 
 ### D3 读：每次 open 建立块缓冲，**两级上限**
 
@@ -307,15 +353,19 @@ specified"；再经过 `"viewer: "` 包装和 `server` 的重包装
 （报错而不是误判成功），而且**是可以被测试发现**的：§七 要求穷举 linter 式的测试
 断言每个已知错误路径都带 token。
 
-### D7 交付顺序：**先 Linux，跑通整条链路，Windows 见 D13**
+### D7 交付顺序：**先 Windows（本机能端到端验证），Linux 同步交付**
 
-1. 先做 Linux FUSE，把挂载、读、写回、失效、套娃检测**全部真实跑通**
-2. 核的形状由真实需求定下来之后，再接 WinFsp（**但 D13 说这件事的可行性待定**）
+1. 先做 **Windows**（cgofuse 纯 Go），把挂载、读、写回、失效、套娃检测**在本机
+   真实跑通** —— 因为它是本机唯一能端到端验证的平台（D13）
+2. **Linux 代码同步写**（同一个 `cgofuse` API、同一个 `ops.go`），交叉编译必须通过，
+   集成测试在有 FUSE 的机器上跑
 
-**为什么**：两平台同时开工，出问题时分不清是**模型**错了还是**某个平台**错了。
-Linux 侧不需要装内核驱动（FUSE 是内核自带的），所以它能先独立验证。
+**为什么顺序反过来了**：原来的理由是"Linux 不需要装驱动，所以先做 Linux"。
+但**驱动已经装好了**（WinFsp 2.1），而 Linux 在本机**根本跑不了**。
+所以"先做能验证的那个"指向 Windows。
 
-**判错的代价**：Windows 用户要等更久。这是**有意**的取舍。
+**判错的代价**：Linux 侧的真实挂载会更晚被发现有问题。缓解：`ops.go` 与壳分开
+（D2），且 Linux 的集成测试要在评审时明确标注"**尚未在真实 FUSE 上运行过**"。
 
 ### D11 离线与重连：**自己恢复，且把在飞的脏数据说清楚**
 
@@ -386,26 +436,29 @@ Linux 侧不需要装内核驱动（FUSE 是内核自带的），所以它能先
 
 **判错的代价**：用户看到 `ELOOP` 而不是能用。这是**有意的** —— 报错比悄悄损坏好。
 
-### D13 Windows 侧：**本计划先不承诺**
+### D13 Windows 侧：**在范围内，而且比 Linux 更容易**
 
-评审子代理指出：主流的 Go WinFsp 绑定 `github.com/winfsp/cgofuse`
-**是 cgo 的**，而本机 `CGO_ENABLED=0` 且没有 C 编译器 —— 和 `-race` 不可用是
-同一个原因。**Windows 壳在这台机器上无法编译，更无法挂载测试（也没装驱动）。**
+**v2 修订时我一度把它推迟，那是基于一个错误的判断。** 我当时的理由是"主流 Go
+WinFsp 绑定是 cgo 的，本机没有 C 工具链" —— 而 `winfsp/cgofuse` **有一个纯 Go 的
+Windows 实现**（`host_nocgo_windows.go`，`//go:build !cgo && windows`）。
+实测 `CGO_ENABLED=0 GOOS=windows go build` 成功、二进制能在本机运行。
+
+所以现在的状态是：
+
+| | 需要 C 工具链？ | 本机能编译？ | 本机能真挂载？ |
+|---|---|---|---|
+| **Windows**（cgofuse 纯 Go） | **否** | **是**（已验证） | **是**（WinFsp 运行时已装） |
+| Linux（cgofuse cgo） | 是（+libfuse-dev） | 否（本机是 Windows） | 否（无 `/dev/fuse`） |
+
+**这产生一个反直觉的结论**：**Windows 反而是本机唯一能端到端验证的平台** ——
+因为纯 Go 路径不需要 C 工具链，而且 WinFsp 运行时已经装好了。
+Linux 侧能写、能交叉编译、能在有 FUSE 的机器上测，但**本机测不了**。
 
 **决定**：
-- **本计划交付 Linux 侧，完整并经过真实的挂载测试**
-- 可移植核写成平台无关的（D2），**为 Windows 留好接缝**，但**不承诺**它在这台
-  机器上能编译
-- §十二 的成功标准**去掉"两平台都通过"那一条**，改为"Linux 通过；Windows 是
-  后续计划，前提是先解决 C 工具链与驱动安装"
-
-**三个选项里我选哪个，以及为什么不选另两个**：
-- 选 **(c) 本计划不含 Windows** —— 因为一个"写了但从没编译过"的平台壳是**负债**
-  （它会腐烂、会给人"支持 Windows"的错觉），而(b) 正是这个负债
-- 不选 **(a) 装 mingw** —— 那是一个**独立的环境建设决定**，涉及这台机器上装编译器，
-  应当单独提出来由你决定，而不是塞进挂载层计划里当隐含前提
-
-**这一条需要你拍板**（见 §十五的开放问题）。
+- **Windows 在范围内**，是交付目标，不是后续计划
+- **Linux 也在范围内**（代码同样交付、交叉编译通过），但它的**集成测试要在有
+  FUSE 的机器上跑** —— 本计划如实标注这一点，不假装在本机测过
+- D7 的顺序因此调整为"先做 Windows 的端到端（本机能验证），Linux 同步交付"
 
 ### D8 并发：挂载层自己排队；不够就开第二条 viewer 连接
 
@@ -510,7 +563,7 @@ v1 版只覆盖了 `release`/`flush`，而**内核可以在不 close 的情况�
 | 丢更新探测 | `EventBody.Seq` + watcher 活性（D5） | ❌ **全新**（要动 `proto` 加字段） |
 | 重连 | supervisor（D11） | ❌ **全新** |
 | 递归防护 | 标记 + `st_dev`（Linux） | ❌ **全新** |
-| **client 上下线通知** | 见 D5/§六 —— **待定**（Windows 才必需） | ❌ 待定 |
+| **client 上下线通知** | 见 §六 —— **要做**（Windows 必需） | ❌ **全新**（server 加广播，线上兼容） |
 
 **注意"⚠️ 新增"那一栏**：大部分是**挂载层内部**的新增，不需要线上协议改动。
 **明确需要动 `proto` 的只有两处**（都记在 §六末尾）：给 `EventBody` 加 `Seq`
@@ -568,13 +621,19 @@ v1 版只覆盖了 `release`/`flush`，而**内核可以在不 close 的情况�
 这两处我都认为是**必要的**，而且都比"不改协议"这条原则更轻：它们是**增量**，
 不破坏任何现有对端。
 
-**另一个待定项：client 上下线要不要广播。** 现在 `Register`/`Unregister`
-**不广播**，所以一台机器出现或消失只有重新 `List` 才看得到。
-- **Linux**：FUSE 每次 `readdir` 都重新问，所以**基本够用**
-- **Windows**：WinFsp 会缓存目录项，**需要显式通知**，否则根目录会一直显示一台
-  已经离开的机器
-- **决定：本计划不为它改 server。** Linux 上不需要；Windows 既然已按 D13 推迟，
-  这个需求也一起推迟。**如果将来做 Windows，这是第一个要补的 server 改动。**
+**另一个必须处理项（v2 修订时从"待定"升为"要做"）：client 上下线要广播。**
+现在 `Register`/`Unregister` **不广播**（`server.go:270-277` 只做 `RemoveClient` +
+`Unregister`，`broadcast` 只在 `applyEvent` 里被调），所以一台机器出现或消失
+只有重新 `List` 才看得到。
+- **Linux**：FUSE 每次 `readdir` 都重新问，所以本来就够用
+- **Windows**：WinFsp 会缓存目录项，**必须显式通知**，否则根目录会一直显示一台
+  已经离开的机器 —— 这正是成功标准 1 和 4 要断言的东西
+- **决定：要做。** 做法是**线上兼容的**：在 client 注册/注销时广播一个以 client
+  名为路径的事件（`KindDeleted` 表示离开，或一个空目录节点表示出现）。
+  **不需要新 `Kind`，不需要新字段。**
+- **代价**：`internal/server` 里 `Register`/`Unregister` 的调用点各加一次
+  `broadcast`，挂载层要能解释"路径正好是一个 client 名"这种事件（它本来就要
+  处理删除标记）。
 
 ## 七、测试策略（最高风险项，所以最详细）
 
@@ -614,12 +673,18 @@ v1 版只覆盖了 `release`/`flush`，而**内核可以在不 close 的情况�
 
 ### 本机无法验证的部分，必须如实标注
 
-- FUSE 需要内核支持与 `/dev/fuse`；本机是 Windows，**跑不了 Linux FUSE 集成测试**
-- **但是 `GOOS=linux CGO_ENABLED=0 go build ./...` 在本机是通的**（实测），所以
-  第 1 层测试**能在本机跑**，第 2、3 层不能
-- WinFsp 需要安装第三方内核驱动，且绑定是 cgo 的（D13）—— 本机也不通
-- 所以：**可移植核能在本机被完整测试，平台壳不行**。这一条要写进计划，
-  不能假装集成测试跑过了。
+**本机是 Windows，而这里有一个反直觉的结果（D13）**：
+
+- **Windows 侧能在本机端到端验证** —— cgofuse 的 Windows 实现是**纯 Go**
+  （不需要 C 工具链），WinFsp 运行时与驱动**已经装好**。所以第 2、3 层测试
+  **可以在本机真跑**（真实挂载、真实 `ls`/`cat`/编辑器写入、真实 server 重启）
+- **Linux 侧在本机跑不了** —— 需要 `/dev/fuse` 和 `libfuse-dev`。
+  交叉编译能过，**但集成测试必须在有 FUSE 的机器上补**
+- 所以计划里的验收条款必须写成**"Windows 已验证 / Linux 待外部验证"**，
+  **不能**含糊地说"两平台都过了"
+
+这一条与 v1 版正好相反（v1 版以为 Linux 能测、Windows 不能），原因是当时我以为
+Windows 绑定必须用 cgo。**实测推翻了它。**
 
 ## 八、CLI
 
@@ -669,8 +734,8 @@ usage: peerfold mount [--point PATH] [--buffer SIZE] [--buffer-total SIZE] [--al
 ## 十一、明确不做（后续优化）
 
 - **跨 open 的持久内容缓存** —— 需要主动失效配套，是后续的事
-- **Windows（WinFsp）** —— 按 D13 推迟，前提是解决 C 工具链与驱动安装
-- **client 上下线的广播** —— Linux 不需要；做 Windows 时是第一个要补的 server 改动
+- **Windows（WinFsp）** —— ~~按 D13 推迟~~ **v2 修订后改为在范围内**，见 D13
+- **client 上下线的广播** —— v2 修订后改为**要做**（Windows 必需），见 §六
 - 大内存 / 大文件（10 GB+）的窗口式流式读
 - `chmod` / `chown` / 硬链接 / 写 `mmap`
 - 符号链接的忠实呈现（而且 D12 说挂载层会**拒绝**它）
@@ -694,24 +759,29 @@ usage: peerfold mount [--point PATH] [--buffer SIZE] [--buffer-total SIZE] [--al
 8. **`fsync` 之后立刻杀掉属主进程**，重启后内容仍在（D10 的强制回写真的落盘了）
 9. **server 重启**之后挂载点自己恢复，不需要用户重挂（D11）
 10. 共享里的**符号链接**被拒绝（`ELOOP`），**不是**返回 9 字节的怪文件（D12）
-11. **Linux 集成测试全绿**（第 2、3 层测试在有 FUSE 的机器上跑）
+11. **Windows 集成测试全绿**（本机能跑：WinFsp 已装、cgofuse 走纯 Go 路径）
+12. **Linux 交叉编译通过**；Linux 的集成测试在**有 FUSE 的机器上**补跑
+    —— 在那之前如实标注"尚未在真实 FUSE 上运行过"
 
-**v1 版这条原来写的是"两平台各自的集成测试在同一套可移植核上通过" —— 已删。**
-按 D13，Windows 壳在本计划里**既不实现也不承诺**，所以不能出现在成功标准里。
-一条无法验证的成功标准比没有更糟。
+**v1 版这条原来写的是"两平台各自的集成测试在同一套可移植核上通过"。** 现在它
+拆成了两条，因为**本机只能验证其中一个**（D13）：Windows 能真挂载，Linux 不能。
+一条无法在本机验证的成功标准，必须写成"在哪里验证"，而不是含糊地写上。
 
 ## 十三、这一层做完之后的诚实边界
 
-做完本文（**Linux 侧**），**MVP 完成**：peerfold 是可以天天用的东西。但它仍然
-**不是**：
+做完本文，**MVP 完成**：peerfold 是可以天天用的东西。但它仍然**不是**：
 
-- **跨平台**的 —— Windows 按 D13 是后续计划
 - 可以扔到公网上的东西（无认证无加密）
 - "什么都不用管"的常驻服务（没做开机自启）
 - 快的（大文件首次打开慢；D4 的正超时意味着目录列举会明显慢）
 - **对符号链接友好的** —— 它是**拒绝**而不是跟随（D12）
+- **macOS 可用的** —— 只有 Windows 与 Linux
 
 这五条都是**有意**的取舍，写在这里，而不是留在"以后再说"里。
+
+**一个必须点明的验证边界**：本机能**真实挂载 Windows**（WinFsp 已装、纯 Go 路径），
+但**跑不了 Linux FUSE**。所以 Linux 侧的集成测试**必须在有 FUSE 的机器上补**，
+在那之前不能说"两平台都验证过了"。
 
 ## 十四、对独立评审 9 条意见的逐条回复
 
@@ -726,8 +796,8 @@ usage: peerfold mount [--point PATH] [--buffer SIZE] [--buffer-total SIZE] [--al
 | 3 | 丢更新是静默的（`emit` 无痕迹、`server` 永久删 watcher），"整体作废"没有着力点 | **完全接受** → D5 重写：加 `EventBody.Seq`、给 watcher 加活性信号、并如实说明 FUSE **没有**"整体作废"原语，只能靠"交出去的表"逐项失效 |
 | 4 | `fsync` 等操作必须强制回写，而 §五 的表根本没列 `fsync` | **完全接受** → D10 新增"强制回写表"（`fsync`/rename/unlink/truncate/卸载），§五 的表补齐，§七 要求逐条测 |
 | 5 | 符号链接在索引里是 9 字节、读却是目标内容，读-改-写会**覆盖目标** | **完全接受，而且这是最严重的一条** → 新增 **D12**：挂载层**拒绝**符号链接（`ELOOP`）。它同时指出了 v1 里一处**既有的不一致**（扫描 `lstat`、`ReadAt` follow、watch 丢弃事件） |
-| 6 | Windows 壳是 cgo 的，本机没有 C 工具链，无法编译/测试 | **完全接受** → 新增 **D13**：本计划**不含 Windows**，§十二 删除"两平台都通过"那条成功标准。我验证过 `winfsp/cgofuse` 存在但确实要 cgo |
-| 7 | client 上下线不广播，WinFsp 会缓存目录项显示已离开的机器 | **接受，但推迟**。Linux 侧 `readdir` 会重新问，基本够用；按 D13 Windows 已推迟，所以这条也推迟，并记为"将来做 Windows 时的第一个 server 改动" |
+| 6 | Windows 壳是 cgo 的，本机没有 C 工具链，无法编译/测试 | **它的事实对、结论错**。`winfsp/cgofuse` **确实有 cgo 路径**，但它**同时有一个纯 Go 的 Windows 实现**（`host_nocgo_windows.go`，`//go:build !cgo && windows`）。我实测 `CGO_ENABLED=0 GOOS=windows` 编译成功、二进制在本机运行通过。**所以 Windows 侧不需要 C 工具链，而且本机能真挂载。** → D13 从"推迟"改为"**在范围内，且是本机唯一能端到端验证的平台**"；D7 的顺序因此反过来先做 Windows。**这一条是评审里最有价值的一条** —— 它让我去查了 `cgofuse` 的内部，从而发现了一个比原方案省得多的路径 |
+| 7 | client 上下线不广播，WinFsp 会缓存目录项显示已离开的机器 | **接受，并升级为"要做"**。它是对的：WinFsp 缓存目录项，所以根目录会一直显示一台已经离开的机器，而那正是成功标准 1 和 4 要断言的东西。**v2 修订后 Windows 已在范围内（第 6 条），所以这条不能推迟了** → §六 改为**要改 server 广播 client 上下线**，做法线上兼容（用已有的 `KindDeleted`，不加 `Kind`、不加字段） |
 | 8 | 靠匹配现有文本不可行（属主错误是操作系统本地化的） | **完全接受** → D6 改为**稳定 token 前缀**（`enoent: ...`），并如实说明这要改 `internal/client`/`internal/server` 里构造错误的几处，是对"不改协议"的**收窄解释** |
 | 9 | `--buffer` 是每 open 还是全局？N 个 open 就是 N × 64 MiB | **完全接受** → D3 改为**两级上限**（`--buffer` 64 MiB + `--buffer-total` 256 MiB），并加一条"全局上限真的把总量钉住"的测试 |
 
@@ -739,19 +809,22 @@ usage: peerfold mount [--point PATH] [--buffer SIZE] [--buffer-total SIZE] [--al
 配置、`--exclude` 的 CLI 接线、`mount` 的 `--config`、创建挂载点目录）—— 这符合
 我给它的指令。
 
-## 十五、需要你拍板的（只此一件）
+## 十五、待办：没有需要你拍板的了
 
-**D13：Windows 侧怎么算。** 三个选项：
+**v2 修订时这里有一个开放问题（D13：Windows 侧怎么算）。你答了"Windows 一定要做"，
+所以它已经不是开放问题了** —— 而且后续实测发现它比预想的容易得多（cgofuse 在
+Windows 上是纯 Go，不需要 C 工具链）。
 
-- **(c) 本计划只做 Linux**（我的推荐）—— Windows 完全留给后续计划。
-  好处：交付的东西**全部经过真实挂载测试**，没有负债。
-- **(a) 先装 mingw，让 Windows 壳能编译** —— 这样 Windows 侧至少能编译、能过
-  单元测试，但仍然**没有驱动、无法真挂载**。代价是这台机器上要装编译器，
-  而且它**仍然不算被验证过**。
-- **(b) 写 Windows 壳但从没编译过** —— 我不建议。
+现在剩下的**不是决策，而是环境事实**，记录在此：
 
-我推荐 (c)，理由：**一个无法验证的交付物比没有更糟**，它会腐烂、会给人"支持
-Windows"的错觉。而 (a) 的编译器安装是一个**独立的环境决定**，值得单独提出，
-不该塞进挂载层计划当前提。
+| 事项 | 状态 |
+|---|---|
+| WinFsp 运行时 | ✅ 已装（winget `WinFsp.WinFsp` 2.1.25156），服务 `WinFsp.Launcher` 运行中 |
+| WinFsp 驱动 | ✅ `winfsp-x64.sys` + `winfsp-x64.dll` 在位，注册表 `InstallDir` 正确 |
+| cgofuse Windows 纯 Go 构建 | ✅ 实测编译 + 运行通过 |
+| C 工具链（mingw） | **不需要**（Windows 走纯 Go 路径） |
+| WinFsp SDK 头文件 | 已取到并安置在 `.superpowers/toolchain/winfsp-sdk`（gitignore 内）。**纯 Go 路径用不到**，仅作 cgo 回退备用 |
+| **Linux 侧的真实 FUSE 测试** | ⚠️ **本机做不到**，需要一台有 `/dev/fuse` 的机器 + `libfuse-dev` |
 
-**你说 (c) 我就开始写实施计划。**
+**所以：批准这份设计，我就开始写实施计划。** 计划的第一个任务组按 D7 走
+**Windows**（本机能端到端验证），Linux 同步写成但测试标注为待外部验证。
