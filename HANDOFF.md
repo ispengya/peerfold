@@ -1,7 +1,9 @@
 # peerfold 交接文档（给下一个会话）
 
-> 写于 2026-10-14 会话中断点。本文件是**执行态**交接，不是产品文档；产品文档见 `docs/superpowers/`。
-> 阅读顺序建议：§1 → §2 → §3（立刻要做的）→ §5（环境陷阱，不看必踩）→ §6（裁定，会约束你）。
+> 本文件已于 v1 核心完工时重写。它现在是一份**完工记录 + 下一段工作的入口**，
+> 不再是"执行到一半"的交接。产品文档在 `docs/superpowers/`。
+> 阅读顺序建议：§1 → §2（做到哪了）→ §3（下一步做什么）→ §5（环境陷阱，不看必踩）
+> → §6（裁定，会约束你）→ §10（已知偏差，别美化）。
 
 ---
 
@@ -23,59 +25,102 @@
 
 ---
 
-## 2. 当前进度
+## 2. 当前进度：**v1 核心（CLI-only）已完工，全部审核意见已处置**
 
-### 已完成：Task 1（模块骨架、配置读写、CLI 分发）—— 审核通过
+分支 `feat/v1-core`，比 `main` 领先 30 个提交（`main` 是基线 `61c748f` "chore: 初始化仓库"）。
 
-提交链（分支 `feat/v1-core`）：
+**已提交的最后一个提交是 `73e4830`。本轮终审的全部修复仍在工作区里未提交**
+（18 个路径：16 改 2 新）。提交前先跑一次全量测试，见 §3 第 1 步。
 
-   4ea125c  refactor: Task 1 复审意见——取消 Shares 归一化，使 Save/Load 成为精确互逆   <- HEAD
-   ca4c1c8  fix: Task 1 审核意见——删去空断言测试、统一 Shares 归一化、补全分发分支测试
-   ed0f017  feat: 模块骨架、配置读写与 CLI 分发
-   61c748f  chore: 初始化仓库（设计文档、实施计划、技能脚手架）
+### 计划 Task 1–11 全部完成
 
-- 测试：`cmd/peerfold` 4 个 + `internal/config` 6 个，共 10 个全绿；gofmt 干净、`go vet` 干净。
-- 审核记录：Task 1 审核者 **Approved**（0 Critical / 0 Important / 5 Minor，已处理）→ fix round 1 复审：全部处理 → fix round 2 复审：**全部处理，无新增 Critical/Important**。
-- 交付物：`go.mod`/`go.sum`、`.gitattributes`、`internal/config/{config.go,config_test.go}`、`cmd/peerfold/{main.go,main_test.go,cmd_server.go,cmd_client.go,cmd_tree.go}`（后三个是打印 TODO 到 stderr 并返回 0 的桩）。
+11 个任务逐个走完了"实现 → 自测 → 派发只读审核子代理 → 修 → 复审"的循环。
+最后对**整条分支**做了两个终审：一个查协议/并发，一个查计划符合度/测试。
 
-### 进行中：Task 2（线上协议——帧与连接）—— **代码已写，未提交，且最后一步未验证**
+### 测试规模（每包 `^func Test` 计数）
 
-`internal/proto/` 目前是 **untracked**（`git status --short` 显示 `?? internal/proto/`），5 个文件：
+    cmd/peerfold : 50        internal/server : 47
+    internal/client : 64     internal/viewer : 15
+    internal/e2e : 50        internal/proto  : 21
+    internal/index : 20      internal/config : 6
+    internal/node : 3
+
+全量 `go test ./... -count=1` 九个包全绿。各包耗时（便于判断是不是卡住了）：
+`client` 10–16s、`e2e` 30–43s、`server` 1.5–6.4s、`cmd/peerfold` 2s、
+`proto` 1.2–1.7s、`viewer` 1s、`index` 0.5s、`config` 0.8s、`node` 0.4s。
+
+### 终审结论
+
+- **Reviewer 1（协议/并发）**：初判"未就绪"，3 个 **已证实的 Critical** + 4 个 Important。
+  Critical 全部修完，每个都有**先看它失败、再看它通过**的测试钉住（见 §6.3）。
+- **Reviewer 2（计划符合度/测试）**：初判"修完可合"，0 Critical + 5 Important，全部处置。
+
+### 本轮修掉的真正要害（细节见 §6.3 与账本 Ruling 33–47）
+
+1. **`peerfold client` 从没启动过 watcher** —— 标题特性"实时"在发出去的二进制里
+   根本不存在（`c.Watch()` 只有测试在调）。
+2. **与应答交错的变更事件被静默丢弃** —— 我先复现出 30 个变更丢 2 个，才动手。
+3. **被拒绝的 put 不读走内容** —— owner 的读循环把数据帧当控制帧，连接死掉，
+   该 client 的**全部节点**从树上消失。
+
+### Task 2 的技术事实（**已完成**，此处保留供查证）
+
+下面是 Task 2 当时的过程记录。它当年写的是"未提交、未验证"，**现在两种情况都变了**：
+`internal/proto/` 早已提交，21 个测试全绿，写锁的变异测试也补做过了。留着是因为
+帧/连接层的这些约束是后面每个任务都要遵守的，比结论更有用。
+
+`internal/proto/` 的 5 个文件：
 
 - `frame.go`：`FrameKind`（`FrameControl=1`、`FrameData=2`）、`MaxPayload = 1<<20`、`WriteFrame`、`ReadFrame`。帧 = 1 字节 kind + 4 字节大端长度 + payload。`io.ReadFull` 读满头部；帧边界处的干净结束返回 `io.EOF`，中途截断返回 `io.ErrUnexpectedEOF`；长度超限的错误信息含 `too large`。
 - `conn.go`：`Conn` + `NewConn` + `Send`/`Recv`/`SendData`/`RecvData`/`Close`。**读锁 `rmu` 与写锁 `wmu` 分开，且 `Send` 与 `SendData` 共用 `wmu`**（否则并发发送会交错）。数据帧 payload = 8 字节大端 stream ID + 内容；**零长度内容 = 流结束**（0 字节文件就是一个空帧）。
 - `messages.go`：`Envelope{ID,Kind,Body,Err,EOF}`、13 个 kind 常量（含 `KindListOK`）、`RoleClient`/`RoleViewer`、以及全部 body 结构体（`HelloBody`、`HelloOKBody`、`NodeJSON`、`TreeDoneBody`、`ListBody`、`ListOKBody`、`ReadBody`、`WriteBody`、`MkdirBody`、`CreateBody`、`RenameBody`、`RemoveBody`、`EventBody`）。
 - `frame_test.go`（6 个测试）、`conn_test.go`（3 个测试）。
 
-**验证状态（重要，别当成已完成）**：
+**当时的验证状态（现已全部完成，保留原始记录）**：
 
 1. RED 证据齐全：先 `no non-test Go files in internal/proto`，后 `undefined: proto.NewConn` 等。
 2. **曾**跑到 9/9 PASS（不带 `-race`；本机无 C 编译器，`-race` 不可用，见 §5）。
-3. 之后我**加强了 `TestConnConcurrentSend`**（8 个并发发送者 × 32KB 各不相同载荷，逐字节比对收到的 body），目的是在缺少竞态检测器时让「漏掉写锁」这个缺陷可被发现。**这个加强版还没有跑过一次。**
-4. 我原本要做的下一步是：**拿掉写锁做变异测试**，确认加强后的测试真的会失败。**这条命令的提权被取消了，所以没有执行**，`conn.go` 的写锁完好（已确认有 2 处 `c.wmu.Lock()`），工作区没有残留改动。
+3. 当时加强了 `TestConnConcurrentSend`（8 个并发发送者 × 32KB 各不相同载荷，
+   逐字节比对收到的 body），用来在缺少竞态检测器时让"漏掉写锁"可被发现。
+4. 当时那步变异测试因提权被取消而没跑；**后来补做了**。
 
 ---
 
 ## 3. 立刻要做的（第一步，按顺序）
 
-   1) 跑一次全量测试，确认加强后的 conn_test.go 能编译且通过：
-      go test ./... -v
-      （必须带 danger-full-access 提权，见 §5）
+**当前状态：v1 核心的代码全部写完了，终审意见也全部处置了；剩下的是"把工作区
+里的修复提交掉，然后决定怎么合进 `main`"。**
 
-   2) 补做被取消的变异测试（这是判断「并发测试到底有没有鉴别力」的唯一办法）：
-      - 备份或记住 conn.go
-      - 删掉 Send 与 SendData 里的 c.wmu.Lock() / defer c.wmu.Unlock() 共 4 行
-      - go test ./internal/proto/ -run TestConnConcurrentSend -count=5 -v
-      - 期望：FAIL。若仍 PASS，说明这个测试没有鉴别力，需要再想办法（装 C 编译器跑 -race，或改成确定性更强的断言）
-      - 用 git checkout -- internal/proto/conn.go 还原，再确认全绿
+   1) 先确认工作区是绿的（这一步不能跳，也不能只看上一次的结果）：
+      gofmt -l .                      # 期望：无输出
+      go build ./...                  # 期望：退出 0
+      go vet ./...                    # 期望：退出 0
+      go test ./... -count=1 -timeout 900s   # 期望：九个包全 ok
 
-   3) gofmt + vet，然后提交（Step 7）：
-      git add internal/proto
-      git commit -m "feat: 线上协议帧与连接封装"
+   2) 提交本轮修复。工作区里有 18 个路径（16 改 2 新）：
+      - 已改：cmd/peerfold/{cmd_client.go,cmd_server.go,cmd_write_test.go,main_test.go}、
+        docs/peerfold-cli.md、internal/client/{client.go,fsops.go,watch.go}、
+        internal/e2e/write_test.go、internal/index/index_test.go、
+        internal/proto/conn.go、internal/server/{registry.go,router.go,server.go,write_test.go}、
+        internal/viewer/{viewer.go,watch_test.go}
+      - 新增：internal/e2e/cli_test.go、internal/e2e/inflight_test.go
+      - 建议拆成几个提交（修 CLI 接线 / 修协议层 / 修 viewer / 文档），也可以一个。
+        **提交信息写在文件里，用 `git commit -F <file>`** —— PowerShell 5.1 没有
+        heredoc，且命令行上的非 ASCII 会被传输过程弄坏（见 §5）。
 
-   4) 生成审核包并派发 Task 2 的**只读审核子代理**（模板见 §4），审核通过后往 ledger 追加
-      「Task 2: complete (commits <base7>..<head7>, review clean)」，
-      然后按同样的循环做 Task 3。
+   3) 提交完再跑一次第 1 步的四条命令（提交不该改变结果，但这正是要确认的）。
+
+   4) 然后做**分支整合的决定**。这是本会话唯一没做的收尾动作，因为它是**不可逆的、
+      且在工作区之外**（合并/推送），按 SDD 的止损条件必须由人决定：
+         (a) 本地合进 `main`
+         (b) 推送并开 PR
+         (c) 就这样留着（保持 `feat/v1-core` 独立）
+      事实：`main` 存在，`feat/v1-core` 领先它 30 个提交，**没有 upstream**，
+      环境是普通仓库（`GIT_DIR` == `D:\github\peerfold\.git`）。
+
+   5) 下一段工作是**挂载层**（FUSE / WinFsp），那是另一份计划，本文件不覆盖它。
+      动工前必须先读 §10 的已知偏差 —— 其中 `viewer.Read` 的 `n` 语义那一条会直接
+      咬到挂载层。
 
 补一句：Task 2 的 stdout 行为是「帧」级别，没有 CLI 可跑；要手工验证就写个临时 Go 测试，别去动 `cmd/`。
 
@@ -201,16 +246,77 @@
 - **R7 提交前用 `go test` 退出码做门禁**（踩过失败提交）。
 - **R8 测试必须被证明可失败**：新增或修改测试后，用变异测试确认它在缺陷存在时真的会失败，再宣称它「钉住了」某个性质。踩过：为满足审核意见而新加的 `TestConfigNilSharesRoundTrip` 第一版**永不可能失败**，被复审者当场识破。判错的代价：一堆看起来在保护你、实际什么也不检查的测试。
 
+### 6.3 终审阶段（Ruling 33–47，**这一节是新加的，也最要紧**）
+
+完整理由在账本 `.superpowers/sdd/2026-10-14-peerfold-v1-core/progress.md`（**注意：
+`.superpowers/` 在 `.gitignore` 里，账本不进提交，只存在于工作区**）。
+这里只列会约束后续工作的结论：
+
+- **R33**：计划的 Task 1 把每个子命令都留成"打印 TODO 返回 0"的桩，而**后续 11 个
+  任务里没有任何一个**指派 `peerfold server` 的真正实现 —— 计划缺口，我按 v1 的
+  实际入口补上了。
+- **R34（Critical）**：`peerfold client` **从没调用过 `c.Watch()`**。标题特性"实时"
+  在二进制里不存在。`TestCLIClientKeepsTheTreeLiveAfterItJoins` 驱动真实二进制，
+  删掉那行就失败。
+- **R35（Critical）**：与转发应答**交错**进来的变更事件会被静默丢弃（`pumpStream`
+  → `RecvData`(nil) 加一个普通 `Recv()`，两者都跳过 `KindEvent`）。**我先复现出
+  30 个变更丢 2 个**才动手。修法是把 `onEvent` 贯穿下去。
+- **R36（Critical）**：被拒绝的 put 不读走内容，owner 的读循环于是把数据帧当控制帧，
+  连接死掉 → 该 client 的**全部节点**从树上消失。修法是**每条路径**都 drain。
+- **R37**：`drainThenAnswer` 的清理读必须有截止时间，否则一个沉默的 peer 能永久
+  停住该连接。**我第一版测试是空转的**（变异体也能过），加了等待下界才有鉴别力。
+- **R38**：`debugf` 从不格式化任何东西；`Client.Err()`/`Done()` 是新增的。
+  `Done()` 用的是 `loopEnded` 而不是 `done` —— 后者表示"调用方主动关闭"。
+- **R39**：`viewer.ErrCrossClient` 是**必须存在**的定点错误（拒绝在本地做，身份
+  可观测）；而已删掉的 `server.ErrCrossClient` 身份**从来不可观测**。这两件事不一样。
+- **R40**：viewer 的两处 body 读改用 `RecvDataEvent`，否则正文中途的推送和**截断
+  通知**都会被丢掉（后者会把截断的目录当成完整目录）。
+- **R41**：**v1 没有定期重扫**。注释和文档里"下一次扫描会修复"是假的，已删。
+  丢帧是**不可自愈**的。这是有意保留的开放项。
+- **R42（重要，方法论）**：**不要事后改冻结的计划。** 偏离记在账本和
+  `docs/peerfold-cli.md` 的"v1 已知限制"里。理由：回填计划会毁掉偏离记录本身 ——
+  以后分不清"计划本来就这么说"和"我们后来改成了这样"。
+- **R43（会咬到挂载层）**：计划写 `viewer.Read(path, off, n int64)` 且 `n == 0`
+  表示"读到结尾"；实现全栈用 `n int`、**负数**表示读到结尾。挂载层照计划写
+  `Read(p, off, 0)` 会拿到空切片而**不是错误**。**挂载层必须用 -1。**
+- **R44**：`sendStreamErrorLocked` 要记住写失败（第一个写错误对这条连接是终局的）。
+- **R45**：原子替换后同步父目录，**失败不上报**（内容已持久、改名已成功，无可回滚）。
+- **R46**：client 的读截止时间按块重臂，不是每轮循环一次。
+- **R47（接受，不改）**：`Router.detach` 按名字删、没有身份检查。窗口是微秒级、
+  自愈、不致命；真要关掉需要跨两个类型做一次加锁的原子操作，收益不抵改动面。
+  **记录在案，不假装它不存在。**
+
 ---
 
 ## 7. 待用户确认 / 待决定的事项
 
-1. **`viewer` 角色是对规格的增补** —— 设计文档只写了 server 和 client 两种角色，而计划的 CLI 需要 `viewer`（只观察、不供给文件）。**当前按「已接受」处理**，但如果用户反对，Task 5/6 要回头改。
-2. **`git init` 是控制器做的**（分支 `feat/v1-core`，初始提交 `61c748f`）。用户未明确要求过。
-3. **要不要装 C 工具链以启用 `-race`？** 影响：整个协议层与后续所有并发代码的竞态检测能力。
-4. **计划的批准是隐含的**：用户在计划写完后说「先不考虑这么多」，执行是据此推进的，不是显式批准。若用户想改计划，现在改成本最低。
-5. **第二份计划尚未写**：挂载侧（Linux FUSE + Windows WinFsp、按需水合、内核缓存失效）。它只增加一个视图层，**不改协议、索引、读写路径**。
-6. **Task 1 的 5 条 Minor 审核意见**已全部处理（3 条改代码、2 条裁定保留），无需用户介入，仅备案。
+**仍然开放的三件（都需要用户拍板）：**
+
+1. **分支怎么合**（见 §3 第 4 步）：本地合进 `main` / 推送开 PR / 就这样留着。
+   这是唯一真正卡住的收尾动作 —— 它不可逆且在工作区之外，按 SDD 的止损条件
+   必须由人决定，不能由我代拍。
+2. **要不要装 C 工具链以启用 `-race`？** 影响：整个协议层与后续所有并发代码的
+   竞态检测能力。**这是 §10 第 7 条至今没有被解除的原因** —— 用变异测试顶替
+   `-race` 是权宜之计，不是等价物。
+3. **第二份计划尚未写**：挂载侧（Linux FUSE + Windows WinFsp、按需水合、内核
+   缓存失效、`--exclude`）。它只增加一个视图层，**不改协议、索引、读写路径**，
+   但 **R43（`viewer.Read` 的 `n` 语义）会直接咬到它**。
+
+**已经按"接受"处理、但如果用户反对要回头的：**
+
+4. **`viewer` 角色是对规格的增补** —— 设计文档只写了 server 和 client 两种角色，
+   而计划的 CLI 需要 `viewer`（只观察、不供给文件）。实现已按已接受推进，
+   用户若反对则 `cmd` 与 `internal/viewer` 要回头改。
+5. **`git init` 是控制器做的**（分支 `feat/v1-core`，初始提交 `61c748f`）。
+   用户未明确要求过。
+6. **计划的批准是隐含的**：用户在计划写完后说「先不考虑这么多」，执行是据此推进
+   的，不是显式批准。计划现已冻结且执行完毕；记在这里是为了让"隐含批准"这件事
+   本身有据可查，而不是事后追认。
+
+**无需用户介入，仅备案：**
+
+7. **Task 1 的 5 条 Minor 审核意见**已全部处理（3 条改代码、2 条裁定保留）。
+8. **三个终审 Critical 的修法**已在 §6.3 / 账本 R33–R36 记录，无需用户确认。
 
 ---
 
@@ -260,42 +366,84 @@
 
 ---
 
-## 9. 剩余任务（计划里的 Task 3–11）
+## 9. 剩余任务（计划里的 Task 3–11）—— **全部已完成**
 
-- **Task 3** 节点模型与共享目录扫描（定义 `node.KindDeleted = 255`、`NodeKindDeleted`）
-- **Task 4** 全局索引（`Index`、`Apply` 需处理 `KindDeleted`、`Remove(client,path)`）
-- **Task 5** Server：监听、注册表、单聚合门禁（+ R2：空 `Listen` 要用 `Default()` 兜底）
-- **Task 6** Client：拨号、上传目录树、`peerfold client` 子命令
-- **Task 7** 列举查询、`KindListOK` 与 `peerfold ls`（这里才断言「PATH 不存在 → 非零」）
-- **Task 8** 读路径与 `peerfold cat`（离线立即判定）
-- **Task 9** 写路径与 `put`/`mkdir`/`rm`/`mv`/`touch`（含平台分叉测试）
-- **Task 10** 变更传播：fsnotify → 索引 → 观察者
-- **Task 11** 端到端主流程验收
-- **Final** 整分支终审（用 `requesting-code-review` 的 code-reviewer 模板）+ `finishing-a-development-branch`
+计划 Task 1–11 逐个走完了"实现 → 自测 → 只读审核者 → 修 → 限定范围复审"
+的循环，最后做了整分支终审。**这一节从待办变成状态记录：**
 
-流程要求：一个任务做完 → 生成 diff 包 → 派发只读审核者 → 处理 findings（每轮修复后都要再一次**限定范围**的复审）→ 往 ledger 追加完成行 → 下一个任务。**审核有未处理的 Critical/Important 时不许进下一个任务。**
+- **Task 3** 节点模型与共享目录扫描 —— 完成（`node.KindDeleted = 255`）
+- **Task 4** 全局索引 —— 完成
+- **Task 5** Server：监听、注册表、单聚合门禁 —— 完成
+- **Task 6** Client：拨号、上传目录树、`peerfold client` —— 完成
+  （**注意 R34：`Watch()` 的接线是终审才补上的**）
+- **Task 7** 列举查询与 `peerfold ls` —— 完成
+- **Task 8** 读路径与 `peerfold cat` —— 完成
+- **Task 9** 写路径与 `put`/`mkdir`/`rm`/`mv`/`touch` —— 完成
+- **Task 10** 变更传播：fsnotify → 索引 → 观察者 —— 完成
+- **Task 11** 端到端主流程验收 —— 完成
+- **Final** 整分支终审 —— 完成（见 §2 的结论）；`finishing-a-development-branch`
+  的**决定**尚未做（见 §3 第 4 步）。
 
-收尾时（全部做完且终审干净后）：把 ledger 里**每一条** `Ruling:` 汇总进最终消息的「Rulings I made」，每条附「判错的代价」——那是这些决策唯一能到达用户的地方。然后才删工作区。最后用 `finishing-a-development-branch`。
+**下一段工作**是挂载侧（第二份计划，**尚未写**）：Linux FUSE + Windows WinFsp、
+按需水合、内核缓存失效、`--exclude`（见 R41/M13）。它只增加一个视图层，
+不改协议、索引、读写路径 —— 但 **R43 会直接咬到它**。
 
 ---
 
 ## 10. 已知偏差（如实记录，别美化）
 
+**过程类（前一轮留下的）：**
+
 1. **实现者子代理不可用** → 混合模式，控制器自己写代码。质量门靠只读审核者保住。
 2. **技能的 Model Selection 无法遵守**：harness 的 `subagent` 工具**没有 `model` 参数**，所有派发都用会话默认模型。
 3. **Task 1 的实现报告迟交**：第一次写入所在的命令在 `gofmt` 处中断（脚本因 `gofmt` 不在 PATH 而中止），重做提交时漏补，被审核者记为证据缺口。后来补写，并在报告里自述原因。
 4. **一次失败提交**：为落实审核意见而新加的测试第一版必然失败，且我在未检查退出码的情况下提交了它。已 `--amend` 覆盖并加门禁。
-5. **没有 `-race`**（见 §5.5、§7.3）。
+5. **没有 `-race`**（见 §5.5、§7.3）。**这一条至今没有被解除** —— 见下面第 7 条。
 6. **中文输出在只读模式下会乱码**：read-only 的 PowerShell 处于 ConstrainedLanguage，harness 的 UTF-8 前导代码失败，导致中文在终端显示为乱码——**文件内容是好的**，判断文件正确性要用 `read` 工具而不是终端回显。
+
+**产品类（交付出去的东西本身的边界）：**
+
+7. **"没有数据竞争"这句话没有被证实。** 只能说"能跑的测试没有观察到竞争"。
+   `TestConnConcurrentSend` 自己承认它不证明锁正确，而 `emit_test.go` 有一半的
+   主张依赖 `-race`。按 R3 用变异测试顶替，但变异测试顶不了竞态检测器。
+8. **`readWindow = 20ms` 约束的是**整个帧**的读取**，不只是"等第一个字节"。
+   一个在 20ms 内没到齐的推送帧（控制帧上限 1 MiB）会让 `RecvEvent` 停在一帧的
+   中间，而 `pump` 在超时后把令牌还回去当"空闲"，下一个读者就从帧中间开始 ——
+   **永久错位**。要正确关掉它需要 proto 层能报告"读到哪里了"，见账本 I1。
+   **已知、有意留下的开放项**，不是遗漏。
+9. **列表接口没有分批**：`Query.List` 返回整个 `[]node.Node`，`ls` 把一整层装进
+   内存（server 一份、viewer 一份，约 3 倍）。计划第 25 行要求"列表必须能分批"，
+   **尚未达成**。
+10. **`ReadAt` 不返回 `io.EOF`**；`viewer.Read` 的 `n` 是 `int` 且负数才表示
+    "读到结尾"（**R43：会咬到挂载层**）。两处都写在 `docs/peerfold-cli.md`。
+11. **丢掉的变更不可自愈**：v1 没有定期重扫（R41）。fsnotify 缓冲溢出或一次推送
+    失败会让索引停在那次变更之前，直到同路径再变或 client 重连。
+12. **`M13`：`--exclude` 走不到**：`NewShares(shareArgs(cfg.Shares), nil)` 的排除
+    列表在生产里永远是 `nil`，没有任何 flag 能到达它。排除逻辑只被测试覆盖。
+13. **`M14`（留给挂载计划）**：推送的删除只带 `KindDeleted`，**丢失了"这曾是个
+    目录"**这一事实；只应用推送更新的消费者会留下子节点（server 的索引是对的）。
+    代码里那句"两个模型一致"的注释是错的。
+14. **`M15`**：`emitTree` 每个节点一帧（10 万条目 = 10 万帧/更新/广播）。
+15. **删除依据名字，不依据身份**（R47）；**子进程/symlink 边界**：`LocalPath` 是
+    纯词法的，所以 share 内部的符号链接仍可逃逸。
 
 ---
 
 ## 11. 给下一个会话的忠告
 
-- **先读 `.superpowers/sdd/2026-10-14-peerfold-v1-core/progress.md`**，它比这份文档更细，且含全部裁定的原始上下文。
+- **先读 `.superpowers/sdd/2026-10-14-peerfold-v1-core/progress.md`**，它比这份文档
+  更细，且含全部裁定（33–47）的原始上下文。**注意它在 `.gitignore` 里，不进提交。**
 - **不要重新发明流程**：简报切段、diff 包、只读审核、ledger，都在 §4 写好了。
 - **不要试图派实现者子代理**，它写不了文件。
-- **不要相信终端里的中文回显**，用 `read` 工具看文件。
+- **不要相信终端里的中文回显**，用 `read` 工具看文件。写非 ASCII 内容的唯一可靠
+  办法是用 `write` 工具写进文件（命令行上的 CJK 字面量会在传输中被弄坏）。
+- **不要事后改冻结的计划**（R42）。偏离记在账本 + `docs/peerfold-cli.md`。
 - **每写一个测试就问自己：它在缺陷存在时会失败吗？** 不会失败的测试是负债。
+  本轮我自己的 I4 测试第一版就是空转的，靠变异测试才发现。
 - **提交前看退出码。**
-- 提权被拒绝时不要反复重试；先问用户。
+- **外部反馈要怀疑，但要认真核对**：终审的三个 Critical 我都先自己复现再动手；
+  其中一条 reviewer 的前提是错的（A4），我用技术理由顶回去了。
+- **不要为了让它变绿而放宽断言** —— 先问"被改的那条路真的被走到了吗"，
+  再问"这段代码是不是没有鉴别力"。本轮两种都遇到过。
+- 提权被拒绝时不要反复重试；先问用户。本会话的沙箱是 `danger-full-access`，
+  所以**不要设 `sandbox_permissions`**（批准已禁用，设了会被自动拒绝）。

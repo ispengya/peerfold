@@ -97,6 +97,22 @@ func TestChildrenDoesNotMatchASiblingByPrefix(t *testing.T) {
 			t.Fatalf("Children(Documents) = %v, want %v", paths(got), want)
 		}
 	}
+
+	// The hazard lives one level down, and only this query reaches it. A
+	// comparison written as "the candidate's raw text starts with the parent's,
+	// then trim the separator" passes the check above — both siblings really are
+	// direct children — and leaks "Documents/subway" into this listing. Asking
+	// for the deeper parent is the only way to see it, because that is the only
+	// case where the queried prefix is followed by a letter rather than a
+	// separator.
+	sub, err := ix.Children("win", "Documents/sub")
+	if err != nil {
+		t.Fatalf("Children(Documents/sub): %v", err)
+	}
+	if len(sub) != 1 || sub[0].Path != "Documents/sub/b.txt" {
+		t.Fatalf("Children(Documents/sub) = %v, want only [Documents/sub/b.txt]: "+
+			"a sibling matched by prefix is not a child", paths(sub))
+	}
 }
 
 func TestChildrenOnFileIsNotADirectory(t *testing.T) {
