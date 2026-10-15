@@ -69,6 +69,16 @@ type Viewer struct {
 // A longer window (a minute, say) is still correct in the sense that no test
 // fails to *deliver* an update; what fails is every call made while the tree is
 // quiet, which is most of them. `idleRead` was that mistake.
+//
+// Known limitation, deliberately not papered over: the window bounds the whole
+// frame read, not just the wait for its first byte. A pushed update large enough
+// not to finish arriving within it — a control frame may be up to MaxPayload,
+// 1 MiB — can leave the read stopped part-way through a frame, and the frame is
+// then resumed by whoever reads the connection next rather than by this reader.
+// The bound is not needed once bytes have started arriving; making it stop at
+// the first byte would close this, and that is a proto-level change (ReadFrame
+// would have to report how far it got, which it does not). It is left open here
+// rather than half-fixed, and it is recorded as a limitation.
 const readWindow = 20 * time.Millisecond
 
 // Dial connects to serverAddr and completes the viewer handshake: the server

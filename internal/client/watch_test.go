@@ -87,13 +87,22 @@ func watchFixture(t *testing.T) (root string, c *collector, closer interface{ Cl
 
 // TestWatchReportsANewFile pins the basic case: a file that appears is reported
 // with its path inside the share, as a file, with the size it actually has.
+//
+// The wait is for the *complete* node, not for the path to appear, and the
+// difference is the whole point. A create and the bytes that follow it are two
+// events, and the watcher stats the path on the first one — so the first report
+// can legitimately carry size 0 for a file that is about to have five bytes.
+// Reading that as a final answer is exactly the "the tree lies" failure the
+// design calls out by name, so this asserts the settled value rather than the
+// first one that mentions the name.
 func TestWatchReportsANewFile(t *testing.T) {
 	root, c, _ := watchFixture(t)
 
 	if err := os.WriteFile(filepath.Join(root, "x.txt"), []byte("hello"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	got := c.waitFor(t, "for Documents/x.txt", func(n node.Node) bool { return n.Path == "Documents/x.txt" })
+	got := c.waitFor(t, "for Documents/x.txt to be reported with its size",
+		func(n node.Node) bool { return n.Path == "Documents/x.txt" && n.Size == 5 })
 	if got.Kind != node.KindFile {
 		t.Fatalf("kind = %d, want KindFile", got.Kind)
 	}
