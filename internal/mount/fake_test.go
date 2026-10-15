@@ -28,6 +28,20 @@ type fakeCaller struct {
 	data  map[string][]byte
 	calls []string
 
+	// listErr, when set, is returned by List for listErrPath only (or for every
+	// path when listErrPath is empty). It exists so a test can prove the mount
+	// maps a failing caller rather than reading the nil children as an empty
+	// directory -- the two are indistinguishable at the call site unless the
+	// error is checked.
+	//
+	// The path restriction is not a convenience. lookup() reaches the caller to
+	// resolve a path, so an error injected for every path is raised inside
+	// lookup() and the operation returns before the code under test runs. A test
+	// written that way passes whether or not the operation maps the error at all,
+	// which is a test that cannot fail.
+	listErr     error
+	listErrPath string
+
 	// watchCh is created on first use by Watch, so a test can hold the channel
 	// before the core starts watching and drive it afterwards.
 	watchCh chan []node.Node
@@ -116,6 +130,14 @@ func (f *fakeCaller) List(path string) ([]node.Node, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, "List "+path)
 	defer f.mu.Unlock()
+	// An injected failure is checked before the shape checks below, so a test can
+	// prove the mount maps a caller error rather than discarding it. It is
+	// restricted to one path so that resolving the path being operated on does
+	// not itself fail: an error on every path is raised inside lookup(), and the
+	// operation returns before the code under test runs.
+	if f.listErr != nil && (f.listErrPath == "" || f.listErrPath == path) {
+		return nil, f.listErr
+	}
 	// The answer here mirrors index.Children, and it has to: lookup() derives
 	// its whole ENOENT-versus-ENOTDIR distinction from this call's error, so a
 	// fake that answered differently would hide a real bug or, worse, make a
