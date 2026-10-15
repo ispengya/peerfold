@@ -373,8 +373,11 @@ func (r *Router) Send(ctx context.Context, client string, env proto.Envelope) (p
 // reason this method exists rather than the caller sending the frames itself: no
 // other frame may land between the announcement and its content.
 //
-// content is nil for a request that carries no bytes.
-func (r *Router) ForwardWrite(ctx context.Context, client string, env proto.Envelope, content func(id uint64, send func([]byte) error) error) (proto.Envelope, error) {
+// content is nil for a request that carries no bytes. It may return a notice
+// alongside its error — an envelope the peer at the other end sent about why the
+// content stopped — which SendAnnounced relays to the target so a truncated
+// stream is not taken for a whole file.
+func (r *Router) ForwardWrite(ctx context.Context, client string, env proto.Envelope, content func(id uint64, send func([]byte) error) (proto.Envelope, error)) (proto.Envelope, error) {
 	r.mu.Lock()
 	link, ok := r.clients[client]
 	if !ok {

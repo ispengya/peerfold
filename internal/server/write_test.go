@@ -87,14 +87,14 @@ func askWrite(t *testing.T, conn *proto.Conn, id uint64, kind string, body []byt
 		// The announcement and its content go out under one hold of the write
 		// lock, which is what keeps another frame from landing between them.
 		var sent bool
-		err := conn.SendAnnounced(id, env, func(_ uint64, send func([]byte) error) error {
+		err := conn.SendAnnounced(id, env, func(_ uint64, send func([]byte) error) (proto.Envelope, error) {
 			sent = true
 			if len(content) > 0 {
 				if err := send(content); err != nil {
-					return err
+					return proto.Envelope{}, err
 				}
 			}
-			return nil
+			return proto.Envelope{}, nil
 		})
 		if err != nil {
 			t.Fatalf("SendAnnounced %s %d: %v", kind, id, err)
@@ -280,10 +280,20 @@ func TestServerWriteRejectedRequestKeepsTheAnswerShape(t *testing.T) {
 	}
 }
 
-// TestServerRenameAcrossSharesIsRefused pins that a rename whose two ends are in
-// different shares is refused before it is forwarded, since a share is a
-// directory and no two of them are the same directory.
-func TestServerRenameAcrossSharesIsRefused(t *testing.T) {
+// TestServerRenameIsForwardedWithoutAShareCheck pins the boundary of what this
+// layer decides.
+//
+// By the time a rename reaches the server the client name has been stripped, so
+// the first component of each path is a share inside the client — not a client
+// name. A check here that compared those components was comparing shares while
+// it believed it was comparing clients, and it refused a request it had no way
+// to judge. Both real rules live where the fact does: the viewer refuses two
+// clients, because it is the only party that still has both names, and the owner
+// refuses two shares, because only it knows its share map.
+//
+// So the server forwards this and lets the owner answer. The paths here name two
+// shares of one client, which the owner accepts.
+func TestServerRenameIsForwardedWithoutAShareCheck(t *testing.T) {
 	_, addr := start(t)
 	owner, _ := hello(t, addr, "win", "client", false)
 	defer owner.Close()
@@ -303,37 +313,6 @@ func TestServerRenameAcrossSharesIsRefused(t *testing.T) {
 		t.Fatalf("Marshal RenameBody: %v", err)
 	}
 	head, got, tail := askWrite(t, conn, 1, proto.KindRename, body, nil)
-	checkWriteShape(t, 1, head, got, tail, "span two clients")
-
-	select {
-	case line := <-seen:
-		t.Fatalf("the owner was asked %q, want the refusal to happen before forwarding", line)
-	case <-time.After(200 * time.Millisecond):
-	}
-}
-
-// TestServerRenameWithinOneShareIsForwarded pins the other half: the refusal is
-// about the two ends, not about renames.
-func TestServerRenameWithinOneShareIsForwarded(t *testing.T) {
-	_, addr := start(t)
-	owner, _ := hello(t, addr, "win", "client", false)
-	defer owner.Close()
-	seen := make(chan string, 4)
-	writeOwner(t, proto.NewConn(owner), "", seen)
-
-	viewer, _ := hello(t, addr, "me", "viewer", false)
-	defer viewer.Close()
-	conn := proto.NewConn(viewer)
-
-	body, err := json.Marshal(proto.RenameBody{
-		Client:  "win",
-		OldPath: "Documents/a.txt",
-		NewPath: "Documents/b.txt",
-	})
-	if err != nil {
-		t.Fatalf("Marshal RenameBody: %v", err)
-	}
-	head, got, tail := askWrite(t, conn, 1, proto.KindRename, body, nil)
 	checkWriteShape(t, 1, head, got, tail, "")
 
 	select {
@@ -341,11 +320,11 @@ func TestServerRenameWithinOneShareIsForwarded(t *testing.T) {
 		if !strings.HasPrefix(line, proto.KindRename+" ") {
 			t.Fatalf("the owner was asked %q, want a %s request", line, proto.KindRename)
 		}
-		if !strings.Contains(line, "Documents/a.txt") || !strings.Contains(line, "Documents/b.txt") {
-			t.Fatalf("the owner was asked %q, want both ends", line)
+		if !strings.Contains(line, "Documents/a.txt") || !strings.Contains(line, "Photos/a.txt") {
+			t.Fatalf("the owner was asked %q, want both ends as they arrived", line)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the owner was never asked to rename")
+	case <-time.After(3 * time.Second):
+		t.Fatal("the owner was never asked, want the server to forward the rename")
 	}
 }
 

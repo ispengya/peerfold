@@ -298,6 +298,59 @@ func TestFSRemoveMissingPathFails(t *testing.T) {
 	}
 }
 
+// TestFSLocalPathRefusesTheEmptyPath pins the guard that the escape check does
+// not provide: the empty relative path names the share root itself.
+//
+// filepath.Join(root, "") is root, and root is trivially under itself, so the
+// empty path resolved successfully to the share's own root directory. Every
+// symptom below follows from that one resolution, and each is a real one:
+//
+//   - Remove("") unlinked the share root. It looked safe because Remove refuses
+//     a non-empty directory, but an empty share is exactly the case a user
+//     reaches for `rm` on, and there the root is empty and goes.
+//   - replaceAtomically("") built its temporary file from filepath.Dir(full),
+//     which is the share's *parent* directory, and wrote the whole payload to
+//     "<parent>/.Documents.peerfold.tmp" — outside the share. The rename that
+//     followed failed, so the temp file was cleaned up, but the bytes had
+//     already been written past the boundary.
+//   - Mkdir("") and Create("") failed only incidentally, on "already exists"
+//     and "is a directory" from the OS rather than by any decision of ours.
+//
+// It was reachable from the wire: "peerfold rm win/Documents" names a client and
+// a share and no path inside it, which the owner's own parser reduces to "".
+// Asserting on LocalPath is what makes the test deterministic — the other
+// symptoms depend on whether the share happened to be empty at the time.
+func TestFSLocalPathRefusesTheEmptyPath(t *testing.T) {
+	fs, share, root := fsWriteFixture(t)
+
+	full, err := fs.LocalPath(share, "")
+	if err == nil {
+		t.Errorf("LocalPath(%q, \"\") = %q, want a refusal: the empty path is the share root", share, full)
+	}
+	if full != "" {
+		t.Errorf("LocalPath returned %q alongside an error, want the empty path: a caller must not be able to use it", full)
+	}
+	_ = root
+
+	// And the operations refuse, so no symptom is reachable even if a future
+	// change moves the guard.
+	empty := filepath.Join(root, "emptyshare")
+	if err := os.Mkdir(empty, 0o755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	empties, err := client.NewShares([]string{share + "2=" + empty}, nil)
+	if err != nil {
+		t.Fatalf("NewShares: %v", err)
+	}
+	es := client.NewFS(empties)
+	if err := es.Remove(share+"2", ""); err == nil {
+		t.Errorf("Remove(\"\") on an empty share = nil error, want a refusal: it would delete the share root")
+	}
+	if _, err := os.Stat(empty); err != nil {
+		t.Fatalf("the empty share root is gone (err = %v): Remove(\"\") reached it", err)
+	}
+}
+
 // TestFSWriteOpsRefuseEscape pins that every write resolves through LocalPath
 // first. A read that escaped would disclose a file; a write that escaped would
 // modify one, so the check matters at least as much here.

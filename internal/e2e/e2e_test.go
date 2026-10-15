@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -539,5 +540,141 @@ func TestE2EListAWidthPastOneFrame(t *testing.T) {
 	// frame must not have torn the connection down on its way out.
 	if _, err := v.List(""); err != nil {
 		t.Fatalf("List after a wide listing: %v", err)
+	}
+}
+
+// waitForWithin is waitFor with a deadline of the caller's choosing.
+//
+// It exists so a test can assert a promise about latency rather than only about
+// eventual consistency: "within two seconds" is a different claim from "the
+// index eventually catches up", and only one of them is the thing the design
+// promises.
+func waitForWithin(t *testing.T, d time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for {
+		if cond() {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("did not happen within %s: %s", d, what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestMainFlowEndToEnd is the acceptance test for the whole of v1 core: it walks
+// the six steps of the design's main flow, in one test, against a real server,
+// real clients and real temporary directories.
+//
+// The other e2e tests each pin one behaviour; this one exists to answer a
+// different question — "is the main flow actually usable end to end?" — because a
+// suite of passing parts can still leave a flow that does not work. It is
+// deliberately written the way a user would drive it, and every assertion is made
+// against either the aggregated tree the viewer sees or the bytes on the
+// supplying machine's disk, never against an internal.
+//
+// There is no kernel mount in v1, so the viewer here is the CLI's role (ls, cat,
+// put) rather than a mounted directory. The mount is a later plan; it reuses this
+// same role and does not change the protocol, the index, or these paths.
+func TestMainFlowEndToEnd(t *testing.T) {
+	// (1) A server.
+	_, addr := startServer(t)
+
+	// (2) Two clients come online, each supplying one directory.
+	winDocs := share(t, "Documents", map[string]string{
+		"a.txt":     "from windows",
+		"sub/b.txt": "nested",
+	})
+	linuxHome := share(t, "home", map[string]string{
+		"notes.md": "from linux",
+	})
+	win := join(t, addr, "win", "Documents="+winDocs)
+	linux := join(t, addr, "linux", "home="+linuxHome)
+
+	// Step 6 has to observe a change the client makes on its own, so both
+	// watchers have to be running before the flow starts. Starting them here
+	// rather than later is what makes "the tree was already live" the condition
+	// the latency assertion is made under.
+	watchClient(t, win)
+	watchClient(t, linux)
+
+	v := dialViewer(t, addr)
+
+	// (3) Every machine is in the tree at once.
+	top, err := v.List("")
+	if err != nil {
+		t.Fatalf("List(\"\"): %v", err)
+	}
+	if got := pathsOf(top); len(got) != 2 || got[0] != "linux" || got[1] != "win" {
+		t.Fatalf("List(\"\") = %v, want [linux win] — both machines in one tree", got)
+	}
+
+	// (4) A file on one of them reads, over the wire, from that machine.
+	got, err := v.Cat("win/Documents/a.txt")
+	if err != nil {
+		t.Fatalf("Cat: %v", err)
+	}
+	if string(got) != "from windows" {
+		t.Fatalf("Cat(win/Documents/a.txt) = %q, want %q", got, "from windows")
+	}
+	// Nested content too: a listing that only ever reaches one level deep would
+	// still pass a test that only read a top-level file.
+	nested, err := v.Cat("win/Documents/sub/b.txt")
+	if err != nil {
+		t.Fatalf("Cat(nested): %v", err)
+	}
+	if string(nested) != "nested" {
+		t.Fatalf("Cat(win/Documents/sub/b.txt) = %q, want %q", nested, "nested")
+	}
+
+	// (5) A write goes back to the machine that owns the file, and the file on
+	// that machine's disk really changes. The disk is the assertion: the index
+	// is the server's opinion, and "saved successfully" has to mean the owner's
+	// bytes changed, not that the server believes they did.
+	if err := v.Put("win/Documents/a.txt", strings.NewReader("written from the viewer")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if got := onDisk(t, winDocs, "a.txt"); got != "written from the viewer" {
+		t.Fatalf("a.txt on the supplying machine = %q, want %q", got, "written from the viewer")
+	}
+	// And the tree agrees, which is what the next listing would show a user.
+	if got, err := v.Cat("win/Documents/a.txt"); err != nil {
+		t.Fatalf("Cat after Put: %v", err)
+	} else if string(got) != "written from the viewer" {
+		t.Fatalf("Cat after Put = %q, want the written content", got)
+	}
+
+	// (6) A change made on the supplying machine, without the viewer asking and
+	// without reconnecting, is in the tree within two seconds.
+	if err := os.WriteFile(filepath.Join(linuxHome, "fresh.txt"), []byte("appeared"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	waitForWithin(t, 2*time.Second, "fresh.txt created on the linux machine to appear in the tree",
+		func() bool { return hasPath(t, v, "linux/home", "home/fresh.txt") })
+
+	// The listing has to be right about the file it just reported, not merely
+	// mention its name: a size taken from something else is the "tree lies"
+	// failure the design calls out by name.
+	nodes, err := v.List("linux/home")
+	if err != nil {
+		t.Fatalf("List(linux/home): %v", err)
+	}
+	for _, n := range nodes {
+		if n.Path == "home/fresh.txt" {
+			if n.Kind != node.KindFile || n.Size != 8 {
+				t.Fatalf("fresh.txt = %+v, want an 8-byte regular file", n)
+			}
+		}
+	}
+
+	// The flow ends with everything still connected: a write, a read and a
+	// change arriving must not have left either connection one frame out of
+	// step, which is invisible until the next request and so is asserted here.
+	if _, err := v.List(""); err != nil {
+		t.Fatalf("List at the end of the flow: %v", err)
+	}
+	if got := onDisk(t, linuxHome, "notes.md"); got != "from linux" {
+		t.Fatalf("notes.md on the linux machine = %q, want it untouched", got)
 	}
 }

@@ -26,10 +26,25 @@ func NewFS(sh Shares) *FS { return &FS{shares: sh} }
 // it refuses to produce one that escapes the share root. On refusal it returns
 // an empty path as well as an error: a caller that received a path alongside
 // the error would be free to use it, which is the whole thing being prevented.
+//
+// The empty relative path is refused here rather than by each operation, because
+// it names the share root itself and the escape check does not catch it:
+// filepath.Join(root, "") is root, and root is trivially under itself. Left
+// accepted it made Remove("") unlink the whole share root and made
+// replaceAtomically("") build its temporary file beside that root, in the
+// share's parent directory, and write the payload there. Both were reachable
+// from the wire, since "win/Documents" names a client and a share and no path
+// inside it.
 func (f *FS) LocalPath(share, rel string) (string, error) {
 	root, ok := f.shares.Root(share)
 	if !ok {
 		return "", fmt.Errorf("client: no such share %q", share)
+	}
+	if rel == "" {
+		// Naming the share itself is not a path inside it. Every caller here
+		// means a file or a directory in the share, and the root is neither:
+		// it is the thing they are relative to.
+		return "", fmt.Errorf("client: path is empty: a share-relative path must name something inside share %q", share)
 	}
 	full := filepath.Join(root, rel)
 	if !node.IsUnder(root, full) {

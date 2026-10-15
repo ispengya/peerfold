@@ -181,10 +181,16 @@ func TestFSLocalPathAllowsInside(t *testing.T) {
 	if base := filepath.Base(got); base != "known.bin" {
 		t.Errorf("LocalPath = %q, want it to end in known.bin", got)
 	}
-	// The share root itself is a legal target (listing it is how a caller
-	// discovers children), so the empty relative path must be allowed.
-	if _, err := fs.LocalPath(share, ""); err != nil {
-		t.Errorf("LocalPath(\"\") = %v, want the share root", err)
+	// The share root itself is not a legal target: the empty relative path
+	// names the root, and naming the root is not naming something inside it.
+	// It used to be allowed on the grounds that listing a share needs it, but
+	// listing is served by the scanner, which starts at the root it already
+	// has — no read or write ever asks LocalPath for the root. Allowing it was
+	// how Remove("") came to unlink the share root itself, and how a whole-file
+	// write to "" came to put its temporary file in the share's parent
+	// directory.
+	if got, err := fs.LocalPath(share, ""); err == nil {
+		t.Errorf("LocalPath(\"\") = %q, want a refusal: the empty path is the share root", got)
 	}
 }
 

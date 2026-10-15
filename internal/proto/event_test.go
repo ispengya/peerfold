@@ -3,7 +3,9 @@ package proto_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -234,5 +236,82 @@ func TestRecvBodyEndsOnTheEndMarkerWhenOnlyAnUpdateFollows(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatalf("Send: %v", err)
+	}
+}
+
+// TestSendAnnouncedTellsTheReceiverWhenContentWasCutShort pins the only way a
+// receiver can tell a whole stream from a prefix of one.
+//
+// The end marker is identical either way — "the stream ended" and "the stream is
+// all there" are the same frame — so without a signal the receiver publishes a
+// truncated file as a complete one. That is silent data loss, and it is
+// reachable: the sender's content comes from a local reader (a viewer piping a
+// file into a put), and a reader that dies part-way used to produce a
+// well-formed short stream that was renamed over the target.
+//
+// So the error path writes a control frame carrying the reason before the end
+// marker, and this pins that it arrives, with the reason, on the stream's own ID.
+func TestSendAnnouncedTellsTheReceiverWhenContentWasCutShort(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	deadline(t, a, b)
+	ca, cb := proto.NewConn(a), proto.NewConn(b)
+
+	const id = 7
+	cutErr := errors.New("the local file stopped after 3 bytes")
+	done := sendAsync(func() error {
+		return ca.SendAnnounced(id, proto.Envelope{Kind: proto.KindWrite},
+			func(_ uint64, send func([]byte) error) (proto.Envelope, error) {
+				if err := send([]byte("abc")); err != nil {
+					return proto.Envelope{}, err
+				}
+				return proto.Envelope{}, cutErr
+			})
+	})
+
+	head, err := cb.Recv()
+	if err != nil {
+		t.Fatalf("Recv head: %v", err)
+	}
+	// The head carries the requester's ID, which is zero here because this test
+	// is about the stream; what matters is that it is the announcement and not
+	// something else.
+	if head.Kind != proto.KindWrite {
+		t.Fatalf("head = kind %q, want kind %q", head.Kind, proto.KindWrite)
+	}
+
+	// The prefix arrives, then the cut-short notice, then the end marker.
+	var notices []proto.Envelope
+	var body []byte
+	var doneReading bool
+	for !doneReading {
+		chunk, isDone, err := cb.RecvDataEvent(id, func(e proto.Envelope) {
+			notices = append(notices, e)
+		})
+		if err != nil {
+			t.Fatalf("RecvDataEvent: %v", err)
+		}
+		if isDone {
+			doneReading = true
+			break
+		}
+		body = append(body, chunk...)
+	}
+	if err := <-done; err != nil && !errors.Is(err, cutErr) {
+		t.Fatalf("SendAnnounced = %v, want the content's own error", err)
+	}
+
+	if string(body) != "abc" {
+		t.Errorf("the receiver read %q, want %q: the prefix must still arrive", body, "abc")
+	}
+	if len(notices) != 1 {
+		t.Fatalf("the receiver saw %d control frames on the stream, want exactly 1: the cut-short notice", len(notices))
+	}
+	if notices[0].ID != id {
+		t.Errorf("the notice is on stream %d, want %d: it must belong to this stream", notices[0].ID, id)
+	}
+	if !strings.Contains(notices[0].Err, "stopped after 3 bytes") {
+		t.Errorf("the notice's Err = %q, want the sender's reason in it", notices[0].Err)
 	}
 }

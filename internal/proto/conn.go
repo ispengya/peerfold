@@ -3,6 +3,7 @@ package proto
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -212,6 +213,25 @@ func (c *Conn) sendDataLocked(id uint64, chunk []byte) error {
 // A pushed update that lands between two chunks is passed over rather than
 // mistaken for data: see recvControl.
 func (c *Conn) RecvData(id uint64) ([]byte, bool, error) {
+	return c.RecvDataEvent(id, nil)
+}
+
+// RecvDataEvent is RecvData with somewhere to put two things RecvData has to
+// throw away: a pushed index update that lands between two chunks, and a control
+// frame that reports the stream was cut short.
+//
+// Both are passed to handle. An update needs a publisher, and a truncation needs
+// a reader that will act on it — RecvData has neither, so both are dropped
+// there, which is right for a caller reading a stream whose failure it cannot
+// report or undo.
+//
+// A control frame that is not an update arrives here when a sender's content
+// failed part-way and it told the receiver so before ending the stream; the
+// envelope carries the reason and the reader must treat the content as
+// incomplete. This is the only way a receiver can tell a whole stream from a
+// prefix: the end marker is identical either way, so without the envelope a
+// truncated file would be published as a complete one.
+func (c *Conn) RecvDataEvent(id uint64, handle func(Envelope)) ([]byte, bool, error) {
 	c.rmu.Lock()
 	defer c.rmu.Unlock()
 	for {
@@ -221,9 +241,16 @@ func (c *Conn) RecvData(id uint64) ([]byte, bool, error) {
 		}
 		if kind == FrameControl {
 			var env Envelope
-			if err := json.Unmarshal(payload, &env); err == nil && env.Kind == KindEvent {
+			if err := json.Unmarshal(payload, &env); err != nil {
+				// A control frame this reader cannot read is still a control
+				// frame: it is not data, so it cannot be mistaken for a chunk,
+				// and dropping it keeps the stream in step.
 				continue
 			}
+			if handle != nil {
+				handle(env)
+			}
+			continue
 		}
 		if kind != FrameData {
 			return nil, false, fmt.Errorf("proto: expected a data frame, got frame kind %d", kind)
@@ -288,6 +315,37 @@ func (c *Conn) RecvBody(id uint64) ([]byte, error) {
 	}
 }
 
+// SendStreamError tells the peer that a content stream was cut short, so it can
+// tell a prefix of a file from the whole of one.
+//
+// It exists as a method because both ends need it: the server when the content
+// it was forwarding fails, and a viewer when its own local reader dies part-way
+// through sending a file. Either way the end marker alone cannot say it — "the
+// stream ended" and "the stream is all there" are the same frame — so a receiver
+// that is not told publishes the truncated bytes as a complete file.
+//
+// The envelope goes out on id with the reason in Err. It is not checked for
+// success: the caller is already failing, and a connection that cannot carry the
+// notice is a connection whose reader sees the failure anyway.
+func (c *Conn) SendStreamError(id uint64, cause error) {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	c.sendStreamErrorLocked(id, cause)
+}
+
+// sendStreamErrorLocked is SendStreamError for a caller that already holds wmu —
+// which SendAnnounced does, for the whole of a stream.
+func (c *Conn) sendStreamErrorLocked(id uint64, cause error) {
+	payload, err := json.Marshal(Envelope{ID: id, Err: cause.Error()})
+	if err != nil {
+		return
+	}
+	if c.werr != nil {
+		return
+	}
+	_ = WriteFrame(c.rw, FrameControl, payload)
+}
+
 // SendAnnounced writes a request frame and then, while still holding the write
 // lock, the content stream that belongs to it.
 //
@@ -301,9 +359,16 @@ func (c *Conn) RecvBody(id uint64) ([]byte, error) {
 // content means the announcement stands alone, which is what a write with no
 // bytes (mkdir, remove, rename) sends.
 //
+// content may also return a notice alongside its error — an Envelope to send to
+// the receiver before the end marker, on the same stream. It exists for
+// forwarding: a proxy between two peers can read a truncation notice from one
+// and has to pass it on to the other, and the notice is a control frame of this
+// stream rather than data of it. A nil notice means there is nothing to pass on,
+// which is the normal failure.
+//
 // The stream is always terminated with the end marker, so the peer can tell
 // "the content has ended" from "the connection stalled".
-func (c *Conn) SendAnnounced(id uint64, env Envelope, content func(id uint64, send func([]byte) error) error) error {
+func (c *Conn) SendAnnounced(id uint64, env Envelope, content func(id uint64, send func([]byte) error) (Envelope, error)) error {
 	payload, err := json.Marshal(env)
 	if err != nil {
 		return fmt.Errorf("proto: encode control envelope: %w", err)
@@ -324,10 +389,28 @@ func (c *Conn) SendAnnounced(id uint64, env Envelope, content func(id uint64, se
 			}
 			return c.sendDataLocked(id, chunk)
 		}
-		if err := content(id, send); err != nil {
-			// The content failed part-way. The marker is still sent, so the
-			// peer sees a short stream rather than a stream that never ends,
-			// and the failure is reported to the sender.
+		if notice, err := content(id, send); err != nil {
+			// The content failed part-way, and the receiver has to be told,
+			// because the end marker below cannot say it: "the stream ended" and
+			// "the stream is all there" look identical on the wire, so a stream
+			// that stopped after three bytes of a megabyte would be taken for a
+			// complete three-byte file and published at the target name.
+			//
+			// A notice carried out of content takes precedence: it is the
+			// upstream peer's own words about why the content stopped, and this
+			// end is only the relay. Otherwise the reason here is the one to
+			// send. The frame is written under the same lock as the rest of the
+			// stream, so it cannot land anywhere except between two chunks of
+			// this stream.
+			//
+			// Best-effort: the notice's own failure is not reported, because the
+			// failure being reported is the one that matters and a broken
+			// connection reports itself to the receiver anyway.
+			cause := err
+			if notice.Err != "" {
+				cause = errors.New(notice.Err)
+			}
+			c.sendStreamErrorLocked(id, cause)
 			_ = c.sendDataLocked(id, nil)
 			return err
 		}

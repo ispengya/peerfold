@@ -34,11 +34,21 @@ const readTimeout = 2 * time.Second
 // way through sending a file, and the reason it must be drained at all is that
 // nobody is going to read the rest of it. A drain that could block as long as
 // the requester's own send would hold this handler, and the connection behind
-// it, for as long as the requester chose — observed as a test hanging for six
+// it, for as long as the requester chose 閳?observed as a test hanging for six
 // minutes. So the drain is bounded, and a timeout ends it: the point of the
 // drain is to leave the connection at a frame boundary, and one where the peer
 // has stopped sending is not a connection worth rescuing.
 const drainTimeout = 5 * time.Second
+
+// chunkTimeout bounds the wait for one more chunk of a forwarded write.
+//
+// It is per chunk, not per transfer: a large file over a slow link keeps
+// resetting it and is never failed for being slow, while a requester that stops
+// sending midway is failed instead of holding the owner's connection 閳?and the
+// write lock on it 閳?for the whole of writeTimeout. Without it, the wait for the
+// next frame inherited whatever deadline the previous read left behind, and a
+// requester that simply stopped talking parked an owner's connection forever.
+const chunkTimeout = 5 * time.Minute
 
 // writeTimeout bounds a write forwarded to a client.
 //
@@ -48,13 +58,6 @@ const drainTimeout = 5 * time.Second
 // making progress would be wrong; the bound exists so a wedged owner or a
 // requester that stops sending fails the call rather than holding it for ever.
 const writeTimeout = 10 * time.Minute
-
-// ErrCrossClient reports a rename whose two ends are not in one place.
-//
-// It is exported because the condition is a property of what was asked, not of
-// this server's internals: a caller may reasonably decide to do something else
-// with that answer.
-var ErrCrossClient = errors.New("server: a rename cannot span two clients")
 
 // Server accepts client connections and owns the aggregated index.
 //
@@ -300,8 +303,8 @@ func (s *Server) serveLoop(name string, c *proto.Conn) {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 				// Recv reports a read failure with no envelope, so there is no
 				// request to correlate an answer with. Send the diagnostic
-				// out of band — an empty Kind and ID mean "this is not the
-				// reply to anything" — and then close, since the framing is
+				// out of band 閳?an empty Kind and ID mean "this is not the
+				// reply to anything" 閳?and then close, since the framing is
 				// what just failed.
 				_ = c.Send(proto.Envelope{Err: err.Error()})
 			}
@@ -446,7 +449,7 @@ const eventBroadcastTimeout = 5 * time.Second
 //
 // The index update and the broadcast carry the same nodes. A watcher holds the
 // same model the index does, so a viewer that applies the pushed update itself
-// ends up where a viewer that lists the server does — and the two must agree,
+// ends up where a viewer that lists the server does 閳?and the two must agree,
 // because a viewer will use one after the other.
 func (s *Server) applyEvent(name string, env proto.Envelope) {
 	var b proto.EventBody
@@ -538,6 +541,18 @@ func fromNodeJSON(in []proto.NodeJSON) []node.Node {
 // A watcher that has gone is dropped rather than reported: nothing was asked of
 // it, so its absence is not an error, and it must not stop the update reaching
 // the watchers that are still there.
+//
+// Each target is written to in its own goroutine, and that is not an
+// optimisation 閳?it is what keeps one watcher from stalling the others and from
+// stalling the client that reported the change. SendWithin's bound only starts
+// once it holds the connection's write lock, so a watcher whose socket is
+// already blocked mid-reply (a reply it is not reading: a suspended process, a
+// peer that stopped reading an 8 MB read) parks the sender on that lock. Written
+// serially, as this was, that parking happened in the reporting client's own
+// serving loop: every later change that client reported went unread and never
+// reached the index, and no other watcher was told anything. The identical
+// goroutine also means a genuinely wedged watcher cannot push the rest of the
+// fan-out past its own deadline, because it never shares their turn.
 func (s *Server) broadcast(env proto.Envelope) {
 	s.mu.Lock()
 	targets := make([]*proto.Conn, 0, len(s.watchers))
@@ -547,11 +562,13 @@ func (s *Server) broadcast(env proto.Envelope) {
 	s.mu.Unlock()
 
 	for _, c := range targets {
-		if err := c.SendWithin(env, eventBroadcastTimeout); err != nil {
-			s.mu.Lock()
-			delete(s.watchers, c)
-			s.mu.Unlock()
-		}
+		go func(c *proto.Conn) {
+			if err := c.SendWithin(env, eventBroadcastTimeout); err != nil {
+				s.mu.Lock()
+				delete(s.watchers, c)
+				s.mu.Unlock()
+			}
+		}(c)
 	}
 }
 
@@ -605,7 +622,7 @@ func (s *Server) replyList(c *proto.Conn, env proto.Envelope) error {
 //
 // The answer is three parts in the same shape whether the read worked or not: a
 // control frame, the content as a data stream, and a closing control frame. The
-// control frame is what carries "this file is not available" — the content stream
+// control frame is what carries "this file is not available" 閳?the content stream
 // alone cannot say why a read produced nothing, and reporting every failure as an
 // empty body would make a deleted file and a zero-byte file the same thing to the
 // caller.
@@ -627,8 +644,7 @@ func (s *Server) replyRead(c *proto.Conn, env proto.Envelope) error {
 		fail = errors.New("bad read request: offset must not be negative")
 	default:
 		// The owner is asked over its connection, and this handler runs on the
-		// server's connection to the requester — not on the owner's serve loop —
-		// so the owner's loop is free to answer.
+		// server's connection to the requester 閳?not on the owner's serve loop 閳?		// so the owner's loop is free to answer.
 		ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
 		defer cancel()
 		var err error
@@ -659,9 +675,9 @@ func (s *Server) replyRead(c *proto.Conn, env proto.Envelope) error {
 		return c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindReadOK})
 	}
 
-	// The content is already in hand — the router reads a whole answer before it
+	// The content is already in hand 閳?the router reads a whole answer before it
 	// hands it over, so the owner's connection is never read by two goroutines at
-	// once — and the reading failure, if there was one, is attached to the frame
+	// once 閳?and the reading failure, if there was one, is attached to the frame
 	// that is about to be sent.
 	content := <-stream
 	if err := c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindReadOK, Err: reply.Err}); err != nil {
@@ -683,8 +699,8 @@ func (s *Server) replyRead(c *proto.Conn, env proto.Envelope) error {
 // replyWrite forwards one write request to the client that owns the path and
 // reports how it went.
 //
-// The answer has the same three-part shape a read uses — a control frame, a
-// content stream, a closing control frame — for the same reason: frames are one
+// The answer has the same three-part shape a read uses 閳?a control frame, a
+// content stream, a closing control frame 閳?for the same reason: frames are one
 // sequence, so a part left unread becomes the next frame whoever reads it. The
 // stream here is empty on every path and still present, because its absence is
 // indistinguishable from a dropped frame.
@@ -744,7 +760,7 @@ func (s *Server) replyNamed(c *proto.Conn, env proto.Envelope, client, what stri
 // same place.
 //
 // The cross-client case is refused before the request is ever built, by the
-// viewer that knows both client names — the paths travel with the client name
+// viewer that knows both client names 閳?the paths travel with the client name
 // stripped off, so by the time they arrive the information is no longer in them.
 // What is left to check here is the same rule one level down: a rename must stay
 // inside one share, because a share is a directory and no two of them are the
@@ -755,13 +771,80 @@ func (s *Server) replyRename(c *proto.Conn, env proto.Envelope, b proto.RenameBo
 	if b.Client == "" {
 		return s.writeAnswer(c, env, errors.New("bad rename request: client is required"))
 	}
-	oldShare, _ := splitPath(b.OldPath)
-	newShare, _ := splitPath(b.NewPath)
-	if oldShare != newShare {
-		return s.writeAnswer(c, env, fmt.Errorf("%w: %s is in share %q and %s is in share %q",
-			ErrCrossClient, b.OldPath, oldShare, b.NewPath, newShare))
-	}
+	// There is deliberately no check here that the two ends are in one place, and
+	// one used to be: it split each path at the first separator and compared the
+	// results. By this point the client name has been stripped, so the first
+	// component is a *share* inside the client rather than a client name, and the
+	// comparison was therefore asking a question the owner already answers.
+	//
+	// Both rules are enforced where they can actually be decided. The viewer
+	// refuses a rename whose two ends name different clients, because it is the
+	// only party that still has both names; and the owner refuses one whose two
+	// ends name different shares, because only it knows its own share map. Each
+	// of those has a fact this handler does not, so repeating the owner's check
+	// here could only ever agree with it or be wrong.
 	return s.replyNamed(c, env, b.Client, "rename")
+}
+
+// forwardPutContent reads one requester's content stream and hands each chunk to
+// send, returning any truncation notice the requester sent.
+//
+// recvID and sendID are different on purpose: the requester's stream is
+// numbered from its own view of the connection, while the owner sees the stream
+// the router allocated for this forward. Reading on the forward's ID would look
+// for frames the requester never sent 閳?it is the requester's ID that names the
+// bytes arriving here, and send is what re-stamps them for the owner.
+//
+// It is the forwarding half of replyPut, and it has two jobs beyond copying
+// bytes. The first is the truncation notice: a requester that stops part-way
+// says so on the stream, and the owner cannot see it otherwise 閳?the end marker
+// that follows is identical to a complete stream's 閳?so the notice is returned
+// to SendAnnounced, which relays it to the owner before ending the stream there.
+// Without it, a put whose local reader died mid-file would publish the prefix
+// over the target.
+//
+// The second is the update that may land between two chunks: RecvDataEvent hands
+// one to the handler, and there is nothing to do with it here because this
+// connection's updates belong to serveLoop, which is not reading while it is
+// inside replyPut. Dropping it is right 閳?the change is not lost, since serveLoop
+// reads it as soon as the answer is written 閳?and it must not be mistaken for a
+// chunk of the file.
+func (s *Server) forwardPutContent(c *proto.Conn, recvID uint64, send func([]byte) error) (proto.Envelope, error) {
+	var notice proto.Envelope
+	// The deadline is cleared on the way out, so it cannot be inherited by
+	// whatever this connection reads next.
+	defer c.SetReadDeadline(time.Time{})
+	for {
+		// Bounded per chunk. See chunkTimeout.
+		if !c.SetReadDeadline(time.Now().Add(chunkTimeout)) {
+			// Nothing will bound the wait, so the read cannot be allowed to
+			// happen: an unbounded read here holds the owner's connection and
+			// its write lock until the requester decides to speak again.
+			return notice, errors.New("server: this connection cannot time out a read, so the content cannot be waited for")
+		}
+		chunk, done, err := c.RecvDataEvent(recvID, func(e proto.Envelope) {
+			if e.Err != "" {
+				notice = e
+			}
+		})
+		if err != nil {
+			return notice, err
+		}
+		if done {
+			// The stream ended, and a notice that arrived before the marker is
+			// the reason it ended early. Reporting it as a failure rather than
+			// as a clean end is what makes SendAnnounced relay it to the owner:
+			// returning nil here would end the owner's stream as though the
+			// content were all there, and the prefix would be published.
+			if notice.Err != "" {
+				return notice, errors.New(notice.Err)
+			}
+			return notice, nil
+		}
+		if err := send(chunk); err != nil {
+			return notice, err
+		}
+	}
 }
 
 // replyPut forwards a whole-file write-back, streaming the requester's content
@@ -789,8 +872,8 @@ func (s *Server) replyPut(c *proto.Conn, env proto.Envelope) error {
 	// marker. It is what the deferred drain below tests, because "the
 	// forwarding failed" does not mean "the content was read":
 	//
-	// A forward that fails before it reaches the owner — the usual case, the
-	// owner is gone — returns without ever calling the content function, and the
+	// A forward that fails before it reaches the owner 閳?the usual case, the
+	// owner is gone 閳?returns without ever calling the content function, and the
 	// requester has already sent its frames by then. Those frames used to be
 	// left on the connection: the requester read its answer and asked something
 	// else, and this loop read the leftover chunk as the next request and failed
@@ -821,20 +904,21 @@ func (s *Server) replyPut(c *proto.Conn, env proto.Envelope) error {
 	// side ever holds the file. The router keeps the owner's connection locked
 	// for the whole sequence, so the stream cannot be interleaved with another.
 	reply, err := s.router.ForwardWrite(ctx, b.Client, proto.Envelope{Kind: proto.KindWrite, Body: env.Body},
-		func(id uint64, send func([]byte) error) error {
-			for {
-				chunk, done, err := c.RecvData(env.ID)
-				if err != nil {
-					return err
-				}
-				if done {
-					drained = true
-					return nil
-				}
-				if err := send(chunk); err != nil {
-					return err
-				}
+		func(id uint64, send func([]byte) error) (proto.Envelope, error) {
+			notice, err := s.forwardPutContent(c, env.ID, send)
+			if err == nil || notice.Err != "" {
+				// The end marker was read. That is true both when the stream
+				// ended cleanly and when it ended with a truncation notice: the
+				// notice is written before the marker, so seeing one means the
+				// marker was consumed too. Either way the deferred cleanup has
+				// nothing left to read, and running it would consume the *next*
+				// request 閳?which is what happened when the notice path left
+				// drained false: the drain read the following List request's
+				// head off the wire and threw it away, and the requester waited
+				// forever for an answer the server had already discarded.
+				drained = true
 			}
+			return notice, err
 		})
 	if err != nil {
 		return s.writeAnswer(c, env, err)
@@ -897,8 +981,8 @@ func (s *Server) writeAnswer(c *proto.Conn, env proto.Envelope, reason error) er
 // the client's own namespace, where a separator is an ordinary path character
 // and not something the server should read a second time.
 //
-// Backslash counts as a separator as well, so that "win\Documents" — which a
-// Windows user will type — names the same client as "win/Documents". A share
+// Backslash counts as a separator as well, so that "win\Documents" 閳?which a
+// Windows user will type 閳?names the same client as "win/Documents". A share
 // name cannot contain one, so it can only ever be a redundant spelling of the
 // boundary.
 func splitPath(path string) (client, rest string) {

@@ -400,6 +400,20 @@ func TestE2EWritesKeepTheConnectionInStep(t *testing.T) {
 // TestE2EPutFailsWhenTheReaderDies pins what happens when the content stops
 // half-way: the call fails, and no partial file is left at the target where
 // every later reader would take it for the whole file.
+//
+// The reader here dies on the *requester's* side, which is the case the end
+// marker cannot describe: the bytes that did arrive are a well-formed stream of
+// three bytes, so the owner would rename the prefix over the target unless the
+// server tells it the content was cut short. That notice is what this pins, and
+// it is why the second call is here rather than only the stat: the put returns
+// as soon as the local reader fails, while the owner is still receiving, so
+// asserting on the file straight afterwards would be asserting on a race — the
+// old version of this test passed by checking before the write landed, and kept
+// passing when the write published a truncated file.
+//
+// The follow-up call is what makes it deterministic: the viewer holds one
+// connection, so a round trip to the server can only complete after the server
+// has finished with the put, which means after the owner has answered it.
 func TestE2EPutFailsWhenTheReaderDies(t *testing.T) {
 	_, addr := startServer(t)
 	root := share(t, "Documents", map[string]string{"a.txt": "aaaa"})
@@ -410,8 +424,38 @@ func TestE2EPutFailsWhenTheReaderDies(t *testing.T) {
 	if err == nil {
 		t.Fatal("Put with a dying reader = nil, want a failure")
 	}
+	if _, err := v.List(""); err != nil {
+		t.Fatalf("List after a failed put: %v: the connection is out of step", err)
+	}
 	if _, err := os.Stat(filepath.Join(root, "partial.bin")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("a partial file was left at the target (err = %v)", err)
+	}
+}
+
+// TestE2EPutFailsWhenTheReaderDiesOverAnExistingFile is the case that loses data
+// rather than merely leaving a stray file: the target already holds a whole
+// file, and a put whose content stops part-way must not replace it with the
+// prefix that arrived.
+//
+// A prefix is the dangerous shape because it is indistinguishable from a whole
+// file to every later reader — there is no size to check against and no
+// trailing byte that says otherwise. The old behaviour truncated the target to
+// the three bytes that arrived, or to zero bytes when the reader died before
+// the first chunk.
+func TestE2EPutFailsWhenTheReaderDiesOverAnExistingFile(t *testing.T) {
+	_, addr := startServer(t)
+	root := share(t, "Documents", map[string]string{"keep.txt": "the original contents"})
+	join(t, addr, "win", "Documents="+root)
+	v := dialViewer(t, addr)
+
+	if err := v.Put("win/Documents/keep.txt", &dyingReader{failAfter: 3}); err == nil {
+		t.Fatal("Put with a dying reader = nil, want a failure")
+	}
+	if _, err := v.List(""); err != nil {
+		t.Fatalf("List after a failed put: %v: the connection is out of step", err)
+	}
+	if got := onDisk(t, root, "keep.txt"); got != "the original contents" {
+		t.Fatalf("keep.txt = %q, want %q: a truncated put overwrote it", got, "the original contents")
 	}
 }
 

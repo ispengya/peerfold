@@ -35,6 +35,15 @@ const (
 	maxBatchBody = proto.MaxPayload / 2
 )
 
+// errContentTruncated reports that the server said the content of a write
+// stopped part-way.
+//
+// It is a sentinel rather than a message because the write must be abandoned
+// when it happens, and that decision is made by whoever asks the sink's verify
+// hook: a prefix of a file looks exactly like a whole file to every later
+// reader, so publishing it is silent data loss.
+var errContentTruncated = errors.New("the content was cut short by the sender")
+
 // Options configures a Client.
 type Options struct {
 	// Server is the address to dial.
@@ -556,7 +565,16 @@ func (c *Client) servePut(env proto.Envelope) error {
 	var streamErr error
 	sink := func(w io.Writer) error {
 		for {
-			chunk, done, err := c.pc.RecvData(env.ID)
+			// A control frame that is not a pushed update is the sender telling
+			// this end that the content was cut short. It has to be recorded,
+			// because the end marker that follows is identical to a complete
+			// stream's: without this, a prefix of a file would be published as
+			// the whole file.
+			chunk, done, err := c.pc.RecvDataEvent(env.ID, func(e proto.Envelope) {
+				if e.Err != "" && streamErr == nil {
+					streamErr = fmt.Errorf("%w: %s", errContentTruncated, e.Err)
+				}
+			})
 			if err != nil {
 				streamErr = err
 				return nil

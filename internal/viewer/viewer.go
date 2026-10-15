@@ -38,6 +38,13 @@ type Viewer struct {
 	// hand-off it is waiting for.
 	mu     sync.Mutex
 	events chan []node.Node
+	// closed says the event channel has been closed. emit and Close both decide
+	// what to do with it under mu, so a batch can never be offered to a channel
+	// that has already been closed — which would be a panic rather than a lost
+	// update. Without the flag the decision was split: emit read the channel
+	// under mu and then sent to it after releasing the lock, and a Close in that
+	// window closed the channel underneath it.
+	closed bool
 	// startReader makes the switch to a background reader happen once, and only
 	// on the first Watch. A viewer that never watches keeps the plain
 	// request/response path with its per-call deadline.
@@ -230,8 +237,8 @@ func (v *Viewer) read(path string, off int64, n int) ([]byte, error) {
 	}
 	if head.Err != "" {
 		// The head frame is where "no such file" arrives. The content stream and
-		// the closing frame are still owed 閳?frames are one sequence, so a part
-		// left unread would be parsed as the next answer 閳?so both are read
+		// the closing frame are still owed — frames are one sequence, so a part
+		// left unread would be parsed as the next answer — so both are read
 		// before the failure is returned.
 		// Bound the stream's read as well: the connection is held for the whole
 		// round trip, so a server that stops mid-stream would otherwise hold it for
@@ -257,7 +264,7 @@ func (v *Viewer) read(path string, off int64, n int) ([]byte, error) {
 	}
 
 	// The content is a data stream, so it can exceed one frame. A zero-byte
-	// file arrives as one frame of zero bytes 閳?which is not the same as no
+	// file arrives as one frame of zero bytes — which is not the same as no
 	// frame at all, and that is what tells it apart from a failed read.
 	data, err := v.readContent(id)
 	if err != nil {
@@ -317,8 +324,8 @@ func (v *Viewer) Put(path string, r io.Reader) error {
 //
 // It is separate from Put because the two differ in what they will destroy. A
 // caller that means "save this here" wants Put; one that means "this file must
-// not already exist" 閳?writing a lock file, or refusing to clobber somebody
-// else's work 閳?wants this, and could not get it by checking first: the check
+// not already exist" — writing a lock file, or refusing to clobber somebody
+// else's work — wants this, and could not get it by checking first: the check
 // and the write would not be one step, so a file created between them would be
 // overwritten anyway.
 func (v *Viewer) PutExclusive(path string, r io.Reader) error {
@@ -351,7 +358,20 @@ func (v *Viewer) putBody(path string, r io.Reader, mode string) error {
 	// read: the server is waiting for it, and a viewer that waited for the
 	// answer first would be waiting for the owner to answer a request whose
 	// content had not been sent.
+	//
+	// A local reader that fails still leaves the server's answer on the way: the
+	// server ends the stream and answers on every path, including the one where
+	// the content was cut short. Returning here without reading that answer
+	// leaves the connection out of step — the next call reads this answer and
+	// reports an ID that does not match its own request — and the failure would
+	// be reported twice, once now and once by whatever came next. So the answer
+	// is drained and the content's own error is what the caller gets, because
+	// that is the error that explains why.
 	if err := v.sendContent(id, r); err != nil {
+		// The answer's error is deliberately dropped: the server reports that
+		// the content was cut short, which is this error's cause rather than
+		// news, and the local failure is the one worth naming.
+		_ = v.awaitWrite(id, "write to "+path)
 		return err
 	}
 	return v.awaitWrite(id, "write to "+path)
@@ -407,7 +427,7 @@ func (v *Viewer) Rename(oldPath, newPath string) error {
 	if newClient != oldClient {
 		// Refused here as well as by the owner, and deliberately so. The two
 		// ends are stripped of the client name before they are sent, so what the
-		// owner receives cannot say which clients they came from 閳?if the
+		// owner receives cannot say which clients they came from — if the
 		// refusal lived only there, this request would be indistinguishable from
 		// a legitimate rename of two identically spelled paths and would be
 		// carried out. This is the only party that still knows.
@@ -451,7 +471,7 @@ func (v *Viewer) writeRequest(kind string, body []byte, what string) error {
 // The head is read and reported before the stream that follows it, and that
 // order is the point: the head is where every outcome travels, and the two
 // frames after it are the stream and the close. If the answer is already
-// known 閳?the head says what happened 閳?then a failure to read the rest of it,
+// known — the head says what happened — then a failure to read the rest of it,
 // which is the server failing to write frames it was cleaning up with, must not
 // replace what the head said with a report about the transport. That is how an
 // error the server had already sent would be lost in favour of "the connection
@@ -513,6 +533,14 @@ func (v *Viewer) sendContent(id uint64, r io.Reader) error {
 			// The stream still has to be ended, so the server is not left
 			// waiting for bytes that will never come. The failure is reported
 			// afterwards, but the attempt to close the stream is unconditional.
+			//
+			// The notice comes first, because the end marker cannot carry it:
+			// "the stream ended" and "the stream is all there" are the same
+			// frame, so without a signal the owner would take the bytes that did
+			// arrive for the whole file and rename them over the target. This is
+			// the requester-side half of the same notice the server sends when
+			// its own forwarding fails.
+			v.pc.SendStreamError(id, err)
 			endErr := v.pc.SendData(id, nil)
 			if endErr != nil {
 				return fmt.Errorf("viewer: content failed (%v) and its stream could not be ended (%v)", err, endErr)
@@ -586,14 +614,16 @@ func (v *Viewer) recvWithin(d time.Duration) (proto.Envelope, error) {
 // emit publishes a batch of updates, and never waits: a watcher that has stopped
 // reading loses updates rather than breaking the connection.
 func (v *Viewer) emit(nodes []node.Node) {
+	// The whole decision is made under the lock — whether there is a channel, and
+	// whether it is still open — because the send itself is non-blocking and so
+	// holding the lock here cannot wait on a caller.
 	v.mu.Lock()
-	ch := v.events
-	v.mu.Unlock()
-	if ch == nil {
+	defer v.mu.Unlock()
+	if v.events == nil || v.closed {
 		return
 	}
 	select {
-	case ch <- nodes:
+	case v.events <- nodes:
 	default:
 	}
 }
@@ -637,7 +667,7 @@ func isTimeout(err error) bool {
 //
 // It is what makes Watch work at all. Pushed updates arrive on their own
 // schedule, and without something reading the socket they would sit in its
-// buffer until the next request happened to be made 閳?a watcher that hears
+// buffer until the next request happened to be made — a watcher that hears
 // nothing until it asks a question is not watching. Exactly one goroutine reads
 // the connection at a time from here on, because two concurrent readers would
 // shred the frame boundaries.
@@ -725,8 +755,9 @@ func nodeJSONToNodes(in []proto.NodeJSON) []node.Node {
 // Watch returns a channel of index updates pushed by the server.
 //
 // Each value is the batch one filesystem change produced, with fully qualified
-// paths: "win/Documents/x.txt", not "Documents/x.txt". The channel is shared 閳?// calling Watch twice returns the same channel rather than splitting the
-// updates 閳?and it is closed when the viewer is.
+// paths: "win/Documents/x.txt", not "Documents/x.txt". The channel is shared —
+// calling Watch twice returns the same channel rather than splitting the
+// updates — and it is closed when the viewer is.
 //
 // The first call starts a background reader, because a push arrives on the
 // server's schedule rather than in answer to anything. From then on a call's own
@@ -758,20 +789,35 @@ func Match(target, path string) bool {
 
 // Close ends the connection and closes the event channel, so a caller ranging
 // over it is released rather than left waiting for ever.
+//
+// It is safe to call more than once — a second close reports nothing and closes
+// nothing — and safe to call while a batch is being published: the channel is
+// closed exactly once and no send can follow it.
 func (v *Viewer) Close() error {
 	v.mu.Lock()
-	if v.events != nil {
+	already := v.closed
+	if v.events != nil && !v.closed {
+		v.closed = true
 		close(v.events)
 		v.events = nil
+	} else {
+		v.closed = true
 	}
 	v.mu.Unlock()
+	if already {
+		// A second close has nothing left to close, and the socket's own
+		// "already closed" error is not a failure of this call. Reporting it
+		// would make Close fail for a caller that closed on one path and
+		// deferred a close on another — which is ordinary.
+		return nil
+	}
 	return v.conn.Close()
 }
 
 // splitPath turns a user-facing path into the (client, path) pair the protocol
 // carries.
 //
-// A bare name is a client and its path is empty 閳?"" addresses the top level.
+// A bare name is a client and its path is empty — "" addresses the top level.
 // The split happens once, on the first separator: everything after it belongs
 // to the client's own namespace, where a separator is an ordinary path
 // character rather than something the viewer should interpret.

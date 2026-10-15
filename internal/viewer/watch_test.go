@@ -26,7 +26,7 @@ func sendEvent(c *proto.Conn, nodes ...proto.NodeJSON) error {
 //
 // The event placed between the request and its reply is the case that matters.
 // A viewer that reads frames in a fixed sequence would take that event for the
-// reply 鈥?the listing's own test asserts the right shape by decoding the body,
+// reply — the listing's own test asserts the right shape by decoding the body,
 // so it would fail loudly rather than quietly, but only if it is exercised.
 func startPushServer(t *testing.T) string {
 	t.Helper()
@@ -135,7 +135,7 @@ func TestViewerWatchDeliversPushWithoutACall(t *testing.T) {
 //
 // It is the failure a fixed frame sequence produces: the event would be read as
 // the listing's answer, and the listing would then be decoded from an event body
-// 鈥?either an error about the wrong kind, or, worse, an empty listing that looks
+// — either an error about the wrong kind, or, worse, an empty listing that looks
 // like a successful answer.
 func TestViewerListIgnoresAnEventInFlight(t *testing.T) {
 	addr := startPushServer(t)
@@ -243,6 +243,60 @@ func TestViewerCloseClosesTheEventChannel(t *testing.T) {
 		case <-deadline:
 			t.Fatal("the event channel was not closed by Close")
 		}
+	}
+}
+
+// TestViewerCloseIsSafeWhileBatchesAreArriving pins the two things Close has to
+// get right when it races a push.
+//
+// The first is that no batch is ever offered to a closed channel. That is a
+// panic, not a lost update, and it killed the process rather than the call: the
+// decision used to be made in two steps — read the channel under the lock, then
+// send to it after releasing the lock — and a Close landing in between closed
+// the channel underneath the send.
+//
+// The second is that closing twice, and pushing after Close, are both no-ops
+// rather than a double close or a send on a closed channel. A caller that closes
+// on one path and defers a close on another is ordinary.
+//
+// It cannot prove the absence of the race — only repeated runs with -race can
+// lean on it — so it drives the two against each other hard and then asserts the
+// properties that must hold either way.
+func TestViewerCloseIsSafeWhileBatchesAreArriving(t *testing.T) {
+	addr := startPushServer(t)
+	v, err := viewer.Dial(addr)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	events := v.Watch()
+	awaitEvent(t, events, "win/Documents/pushed.txt")
+
+	// Drain in the background so emit is free to keep making its decision, and
+	// so the channel cannot fill up and hide the send behind the default arm.
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for range events {
+		}
+	}()
+
+	// Close repeatedly while the reader is still delivering batches.
+	closes := make(chan error, 4)
+	for i := 0; i < 4; i++ {
+		go func() { closes <- v.Close() }()
+	}
+	for i := 0; i < 4; i++ {
+		<-closes
+	}
+	select {
+	case <-drained:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the event channel was not closed, so a ranging caller would have waited for ever")
+	}
+
+	// Close once more: a second close of the same channel would panic.
+	if err := v.Close(); err != nil {
+		t.Fatalf("a second Close: %v", err)
 	}
 }
 
