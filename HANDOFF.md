@@ -248,7 +248,14 @@
 7. `client.Options.Batch` 默认 **500**；一个 `KindTreeBatch` 信封编码后必须 < `proto.MaxPayload/2`，否则要拆分。
 8. `Router.Send` 的 `ctx` **只覆盖首帧等待**；`Query.Read` 用 30s；离线靠注册表查表**立即**判定，不靠超时。
 9. Review Focus 2 的测试按平台分叉：Linux `chmod 0500` 目录；Windows 对已存在文件设只读属性；两者都断言返回错误且目标未被修改。
-10. 保留 `FS.Create` 与 `KindCreate`（Milestone B 需要），并在 Task 9 的 CLI 里加 `peerfold touch PATH` 给它一个真实消费者。
+10. 保留 `FS.Create`（并让 Task 9 的 CLI 里有 `peerfold touch PATH` 给它一个真实消费者）。
+    **更正（2026-10-15 核过）**：这一条原来还写着"与 `KindCreate`"，而
+    **`KindCreate` 从来不存在** —— `proto` 的 Kind 表里只有
+    `hello/tree_batch/tree_done/event/list/list_ok/read/read_ok/write/write_ok/
+    mkdir/rename/remove`。建文件走的是 `KindWrite` 的 `WriteModePut`（"不存在就
+    创建"）。而且 `peerfold touch` **从没被任何一个任务指派实现**，所以 `FS.Create`
+    到今天仍是零生产调用。写在这里是因为这个错说法已经误导过一次（挂载层设计
+    文档里我据此写过"需要一个新能力"，后来才发现空 `put` 就够了）。
 11. `Put` 走 `WriteAll`（临时文件 + 原子 rename），**绝不** Create 后流式写，避免留下半截目标文件。
 
 ### 6.2 执行阶段
