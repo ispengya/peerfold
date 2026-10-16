@@ -9,6 +9,7 @@
 package mount
 
 import (
+	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -18,6 +19,17 @@ import (
 	"peerfold/internal/node"
 	"peerfold/internal/viewer"
 )
+
+// Lock_t is the byte-lock shape cgofuse uses for its optional Lock callback.
+// This mount does not implement byte locking, so the adapter accepts the value
+// without depending on cgofuse's internal name.
+type Lock_t struct {
+	Type   int16
+	Whence int16
+	Start  int64
+	Len    int64
+	Pid    int
+}
 
 // cgofuseHost adapts the operation core to fuse.FileSystemInterface.
 //
@@ -34,6 +46,35 @@ import (
 type cgofuseHost struct {
 	fuse.FileSystemBase
 	m *Mount
+	// host is needed by the mount's invalidation hook, which tells the kernel to
+	// forget a cached entry. Without the back reference the hook cannot call
+	// Notify, and a write can create a file that Windows continues to report as
+	// missing until the next listing.
+	host *fuse.FileSystemHost
+}
+
+var (
+	hostTraceMu sync.Mutex
+	hostTrace   func(op, result, path string)
+)
+
+func SetHostTrace(fn func(op, result, path string)) {
+	hostTraceMu.Lock()
+	defer hostTraceMu.Unlock()
+	hostTrace = fn
+}
+
+func traceCall(name, result, path string) {
+	hostTraceMu.Lock()
+	fn := hostTrace
+	hostTraceMu.Unlock()
+	if fn != nil {
+		fn(name, result, path)
+	}
+}
+
+func (h *cgofuseHost) trace(op, path, result string) {
+	traceCall(op, result, path)
 }
 
 // The compile-time proof that the adapter is usable as a filesystem. It is the
@@ -59,8 +100,21 @@ func intToStat(in *Stat) fuse.Stat_t {
 	// to 1970, which is the kind of mistake a test that only checks the field is
 	// non-zero would not catch -- so the test checks the value.
 	t := fuse.NewTimespec(time.Unix(in.Mtime, 0))
+	mode := in.Mode
+	if mode&modeTypeMask == modeDir {
+		// The mount's namespace is writable through the owning client; the owner's
+		// read-only bits do not mean the federation cannot create a child there.
+		// WinFsp checks this bit before it calls Create, so dropping it would turn
+		// every create into an access denial before the operation core ran.
+		mode |= fuse.S_IWUSR
+	} else if mode&modeTypeMask == 0 {
+		// The root's configured mode is permission bits only, so it carries no
+		// type field. A root reported without S_IFDIR makes Windows treat the
+		// mount point as a file and refuse the whole mount.
+		mode |= fuse.S_IFDIR | fuse.S_IWUSR
+	}
 	return fuse.Stat_t{
-		Mode:  in.Mode,
+		Mode:  mode,
 		Nlink: in.Nlink,
 		Size:  in.Size,
 		Atim:  t,
@@ -77,15 +131,22 @@ func intToStat(in *Stat) fuse.Stat_t {
 // the host would have to build a second Mount to do either, and that second Mount
 // would not be the one the kernel is talking to.
 func NewHost(caller Caller, opts Options) (*fuse.FileSystemHost, *Mount) {
+	traceCall("NewHost", "enter", "")
 	m := New(caller, opts)
 	h := &cgofuseHost{m: m}
 	host := fuse.NewFileSystemHost(h)
+	h.host = host
 
 	// Windows caches directory entries for the life of the handle, so a peer that
 	// connects or disconnects is invisible until the cache is dropped. ReaddirPlus
 	// hands the kernel each entry's attributes along with its name, which is both
 	// a round trip saved per file and the only way the listing can carry a mode.
 	host.SetCapReaddirPlus(true)
+	// Access in the adapter is a harmless success for Windows metadata requests.
+	// With this capability enabled, cgofuse lets Windows ask about DELETE_OK
+	// before it replaces or removes a name, which is the path that decides
+	// whether an ordinary editor save reaches this filesystem's Rename callback.
+	host.SetCapDeleteAccess(true)
 
 	// The invalidation hook. This is the one kernel-cache primitive FUSE offers,
 	// and it is the reason the core keeps a table of the paths it has handed out:
@@ -131,20 +192,20 @@ type viewerCaller struct {
 // connection.
 func NewViewerCaller(v *viewer.Viewer) Caller { return &viewerCaller{v: v} }
 
-func (c *viewerCaller) List(path string) ([]node.Node, error) { return c.v.List(path) }
+func (c *viewerCaller) List(path string) ([]node.Node, error) { return c.v.List(toIndexPath(path)) }
 
 func (c *viewerCaller) Read(path string, off int64, n int) ([]byte, error) {
-	return c.v.Read(path, off, n)
+	return c.v.Read(toIndexPath(path), off, n)
 }
 
-func (c *viewerCaller) Put(path string, r io.Reader) error { return c.v.Put(path, r) }
+func (c *viewerCaller) Put(path string, r io.Reader) error { return c.v.Put(toIndexPath(path), r) }
 
-func (c *viewerCaller) Mkdir(path string) error { return c.v.Mkdir(path) }
+func (c *viewerCaller) Mkdir(path string) error { return c.v.Mkdir(toIndexPath(path)) }
 
-func (c *viewerCaller) Remove(path string) error { return c.v.Remove(path) }
+func (c *viewerCaller) Remove(path string) error { return c.v.Remove(toIndexPath(path)) }
 
 func (c *viewerCaller) Rename(oldPath, newPath string) error {
-	return c.v.Rename(oldPath, newPath)
+	return c.v.Rename(toIndexPath(oldPath), toIndexPath(newPath))
 }
 
 // Watch translates the viewer's event channel into the core's batch channel.
@@ -194,11 +255,28 @@ func (h *cgofuseHost) Destroy() {
 }
 
 func (h *cgofuseHost) Getattr(path string, st *fuse.Stat_t, fh uint64) int {
+	h.trace("Getattr", path, "enter")
+	if h.m.pendingCreate(path) {
+		// A newly created or currently open file is not always in the server's
+		// index yet: Create has only opened the operation handle, while Put
+		// happens later at flush/release. WinFsp asks for attributes immediately
+		// after Create, so answering ENOENT there makes the whole open appear not
+		// to exist even though Create succeeded. The index is authoritative
+		// everywhere else, so this answers the immediate pending window only.
+		var core Stat
+		if code := h.m.pendingStat(path, fh, &core); code == 0 {
+			*st = intToStat(&core)
+			h.trace("Getattr", path, "pending=1")
+			return 0
+		}
+	}
 	var core Stat
 	if code := h.m.Getattr(path, &core, fh); code != 0 {
+		h.trace("Getattr", path, fmt.Sprintf("status=%d", code))
 		return code
 	}
 	*st = intToStat(&core)
+	h.trace("Getattr", path, "status=0")
 	return 0
 }
 
@@ -254,17 +332,50 @@ func (h *cgofuseHost) Statfs(path string, st *fuse.Statfs_t) int {
 // invisible: both orders compile when the types happen to agree, which they do
 // for the handle alone and do not for the pair.
 func (h *cgofuseHost) Open(path string, flags int) (int, uint64) {
+	h.trace("Open", path, fmt.Sprintf("flags=%#x", flags))
 	handle, code := h.m.Open(path, isReadOnlyFlags(flags))
+	h.trace("Open", path, fmt.Sprintf("status=%d handle=%d", code, failureHandle(code, handle)))
+	if handle == 0 {
+		return code, noHandle
+	}
 	return code, failureHandle(code, handle)
 }
 
 func (h *cgofuseHost) Opendir(path string) (int, uint64) {
+	h.trace("Opendir", path, "enter")
+	if h.m.pendingDirectory(path) {
+		// A newly created directory is not in the server's index yet: the wire
+		// learns about it through the client's watcher. WinFsp opens it
+		// immediately after Mkdir, so answering ENOENT there makes the create
+		// appear to fail even though the operation core accepted it.
+		h.trace("Opendir", path, "pending=1")
+		handle, code := h.m.newPendingDirectoryHandle(path)
+		return code, failureHandle(code, handle)
+	}
 	handle, code := h.m.Opendir(path)
+	h.trace("Opendir", path, fmt.Sprintf("status=%d handle=%d", code, failureHandle(code, handle)))
 	return code, failureHandle(code, handle)
 }
 
 func (h *cgofuseHost) Create(path string, flags int, mode uint32) (int, uint64) {
-	handle, code := h.m.Create(path, mode)
+	// WinFsp sends O_CREAT|O_RDWR|O_TRUNC in Create's flags, but cgofuse's
+	// Windows build calls that third bit O_EXCL. This adapter only needs the
+	// access bits, and O_TRUNC is deliberately ignored: the operation core
+	// creates or opens a whole-file handle and performs truncation through
+	// Truncate, so translating the flag here would not change the operation.
+	h.trace("Create", path, "enter")
+	flags &^= fuse.O_EXCL | fuse.O_TRUNC | fuse.O_CREAT
+	handle, code := h.m.Create(path, mode, isReadOnlyFlags(flags))
+	h.trace("Create", path, fmt.Sprintf("status=%d handle=%d", code, failureHandle(code, handle)))
+	if code == 0 {
+		// A new name is now in the index. Windows keeps a negative lookup cached,
+		// so the kernel must be told to forget it before the file can be opened or
+		// stat'ed by the program that created it.
+		if h.host != nil {
+			h.host.Notify(path, fuse.NOTIFY_CREATE)
+		}
+	}
+	h.trace("Create", path, fmt.Sprintf("notify=%t", code == 0 && h.host != nil))
 	return code, failureHandle(code, handle)
 }
 
@@ -308,7 +419,10 @@ func (h *cgofuseHost) Read(path string, buff []byte, ofst int64, fh uint64) int 
 }
 
 func (h *cgofuseHost) Write(path string, buff []byte, ofst int64, fh uint64) int {
-	return h.m.Write(path, buff, ofst, fh)
+	h.trace("Write", path, fmt.Sprintf("off=%d len=%d fh=%d", ofst, len(buff), fh))
+	n := h.m.Write(path, buff, ofst, fh)
+	h.trace("Write", path, fmt.Sprintf("n=%d", n))
+	return n
 }
 
 func (h *cgofuseHost) Truncate(path string, size int64, fh uint64) int {
@@ -319,7 +433,12 @@ func (h *cgofuseHost) Fsync(path string, datasync bool, fh uint64) int {
 	return h.m.Fsync(path, datasync, fh)
 }
 
-func (h *cgofuseHost) Flush(path string, fh uint64) int { return h.m.Flush(path, fh) }
+func (h *cgofuseHost) Flush(path string, fh uint64) int {
+	h.trace("Flush", path, fmt.Sprintf("fh=%d", fh))
+	code := h.m.Flush(path, fh)
+	h.trace("Flush", path, fmt.Sprintf("status=%d", code))
+	return code
+}
 
 func (h *cgofuseHost) Release(path string, fh uint64) int { return h.m.Release(path, fh) }
 
@@ -344,10 +463,22 @@ func (h *cgofuseHost) Unlink(path string) int { return h.m.Unlink(path) }
 
 func (h *cgofuseHost) Rmdir(path string) int { return h.m.Rmdir(path) }
 
-func (h *cgofuseHost) Mkdir(path string, mode uint32) int { return h.m.Mkdir(path, mode) }
+func (h *cgofuseHost) Mkdir(path string, mode uint32) int {
+	h.trace("Mkdir", path, "enter")
+	code := h.m.Mkdir(path, mode)
+	h.trace("Mkdir", path, fmt.Sprintf("status=%d", code))
+	if code == 0 && h.host != nil {
+		h.host.Notify(path, fuse.NOTIFY_CREATE)
+	}
+	h.trace("Mkdir", path, fmt.Sprintf("notify=%t", code == 0 && h.host != nil))
+	return code
+}
 
 func (h *cgofuseHost) Rename(oldpath string, newpath string) int {
-	return h.m.Rename(oldpath, newpath)
+	h.trace("Rename", oldpath, "enter")
+	code := h.m.Rename(oldpath, newpath)
+	h.trace("Rename", oldpath, fmt.Sprintf("new=%s status=%d", newpath, code))
+	return code
 }
 
 // Getxattr answers "no such attribute" rather than the base class's ENOSYS.
@@ -370,3 +501,231 @@ func (h *cgofuseHost) Getxattr(path string, name string) (int, []byte) {
 // zero return with no calls is the empty list, and it is what keeps a copying tool
 // from concluding the filesystem cannot be read from.
 func (h *cgofuseHost) Listxattr(path string, fill func(name string) bool) int { return 0 }
+
+// Chmod, Chown, and Access are no-ops for a different reason from the rest of
+// the base class. Windows can issue them as part of an ordinary create, and
+// WinFsp turns an ENOSYS from any of them into a failed create before the mount
+// gets to write the file. The federation does not preserve those attributes, so
+// success means "the request is harmless here" rather than "this filesystem
+// implemented it".
+func (h *cgofuseHost) Chmod(path string, mode uint32) int {
+	h.trace("Chmod", path, "0")
+	return 0
+}
+
+func (h *cgofuseHost) Chown(path string, uid, gid uint32) int {
+	h.trace("Chown", path, "0")
+	return 0
+}
+
+func (h *cgofuseHost) Access(path string, mask uint32) int {
+	h.trace("Access", path, "0")
+	return 0
+}
+
+// Symlink creation is refused explicitly rather than falling through to the base
+// class's ENOSYS. Windows reports ENOSYS from this callback as STATUS_NOT_
+// SUPPORTED, and the Win32 layer turns that into a missing path, so a refusal
+// that cannot be told apart from a failed save is the wrong answer.
+func (h *cgofuseHost) Symlink(target string, newpath string) int {
+	h.trace("Symlink", newpath, "-EOPNOTSUPP")
+	return -EOPNOTSUPP
+}
+
+func (h *cgofuseHost) Link(oldpath, newpath string) int {
+	h.trace("Link", newpath, "-EOPNOTSUPP")
+	return -EOPNOTSUPP
+}
+
+// Getpath reports the case of a path that Windows has normalized. This mount
+// does not maintain a separate display name, so the requested path is the honest
+// answer, and returning ENOSYS here would make Windows report a missing path
+// before an ordinary write can reach the mount.
+func (h *cgofuseHost) Getpath(path string, fh uint64) (int, string) {
+	h.trace("Getpath", path, "0")
+	return 0, path
+}
+
+// Chflags, Utimens, and the two timestamp setters are issued by Windows as part
+// of an ordinary create. WinFsp turns an ENOSYS into a failed create before the
+// mount gets to write the file, so they report harmless success instead.
+func (h *cgofuseHost) Utimens(path string, tmsp []fuse.Timespec) int {
+	h.trace("Utimens", path, "0")
+	return 0
+}
+
+func (h *cgofuseHost) Chflags(path string, flags uint32) int {
+	h.trace("Chflags", path, "0")
+	return 0
+}
+
+func (h *cgofuseHost) Setcrtime(path string, tmsp fuse.Timespec) int {
+	h.trace("Setcrtime", path, "0")
+	return 0
+}
+
+func (h *cgofuseHost) Setchgtime(path string, tmsp fuse.Timespec) int {
+	h.trace("Setchgtime", path, "0")
+	return 0
+}
+
+func (h *cgofuseHost) Setvolume(path string, label string) int {
+	h.trace("Setvolume", path, "0")
+	return 0
+}
+
+func (h *cgofuseHost) SetvolumeLabel(path string, label string) int { return 0 }
+
+func (h *cgofuseHost) Setea(path string, name string, value []byte, flags int) int {
+	h.trace("Setea", path, "0")
+	return 0
+}
+
+func (h *cgofuseHost) Setea2(path string, name string, value []byte, flags int, fi *FileInfo_t) int {
+	h.trace("Setea2", path, "0")
+	return 0
+}
+
+func (h *cgofuseHost) Setea3(path string, name string, value []byte, flags int, fi *FileInfo_t) int {
+	h.trace("Setea3", path, "0")
+	return 0
+}
+
+func (h *cgofuseHost) Getpath3(path string, fh uint64) (int, string) {
+	h.trace("Getpath3", path, "0")
+	return 0, path
+}
+
+// FileInfo_t is the open-file shape cgofuse passes to the optional create/open
+// callbacks. This mount does not use it, so it is an empty local type rather
+// than a cgofuse dependency.
+type FileInfo_t struct{}
+
+func (h *cgofuseHost) Getvolume(path string, st *fuse.Statfs_t) int {
+	h.trace("Getvolume", path, "0")
+	return 0
+}
+
+// Security is the opaque Windows security descriptor shape cgofuse passes to
+// the optional security callbacks. This mount has no ACL model, so it is an
+// empty local type rather than a cgofuse dependency.
+type Security struct{}
+
+// EaInfo is the opaque Windows extended-attribute information shape cgofuse
+// passes to the optional EA callbacks. This mount has no extended attributes,
+// so it is an empty local type rather than a cgofuse dependency.
+type EaInfo struct{}
+
+func (h *cgofuseHost) Setsecurity(path string, security *Security, flags int) int {
+	h.trace("Setsecurity", path, "-EOPNOTSUPP")
+	return -EOPNOTSUPP
+}
+
+func (h *cgofuseHost) Getsecurity(path string, security *Security) int {
+	h.trace("Getsecurity", path, "-EOPNOTSUPP")
+	return -EOPNOTSUPP
+}
+
+func (h *cgofuseHost) Getsecuritybyname(path string, security *Security) int {
+	h.trace("Getsecuritybyname", path, "-EOPNOTSUPP")
+	return -EOPNOTSUPP
+}
+
+// Getea, Listea, Geteainfo, Seteainfo, and Setea2 are no-ops because Windows
+// can ask for extended attributes as part of an ordinary create and WinFsp
+// turns ENOSYS from those callbacks into a failed create. This mount has no
+// extended attributes, so the harmless success is the answer that keeps the
+// save alive.
+func (h *cgofuseHost) Getea(path string, name string) (int, []byte) {
+	h.trace("Getea", path, "-ENOATTR")
+	return -ENOATTR, nil
+}
+
+func (h *cgofuseHost) Listea(path string, fill func(name string) bool) int {
+	h.trace("Listea", path, "0")
+	return 0
+}
+
+func (h *cgofuseHost) Geteainfo(path string, info *EaInfo) int {
+	h.trace("Geteainfo", path, "0")
+	return 0
+}
+
+func (h *cgofuseHost) Seteainfo(path string, info *EaInfo) int {
+	h.trace("Seteainfo", path, "0")
+	return 0
+}
+
+func (h *cgofuseHost) Utimens3(path string, tmsp []fuse.Timespec, fh uint64) int {
+	h.trace("Utimens3", path, "0")
+	return 0
+}
+
+func (h *cgofuseHost) Chmod3(path string, mode uint32, fh uint64) int {
+	h.trace("Chmod3", path, "0")
+	return 0
+}
+
+func (h *cgofuseHost) Chown3(path string, uid, gid, fh uint32) int {
+	h.trace("Chown3", path, "0")
+	return 0
+}
+
+func (h *cgofuseHost) Setchgtime3(path string, tmsp fuse.Timespec, fh uint64) int {
+	h.trace("Setchgtime3", path, "0")
+	return 0
+}
+
+func (h *cgofuseHost) Setcrtime3(path string, tmsp fuse.Timespec, fh uint64) int {
+	h.trace("Setcrtime3", path, "0")
+	return 0
+}
+
+func (h *cgofuseHost) Setbkuptime3(path string, tmsp fuse.Timespec, fh uint64) int {
+	h.trace("Setbkuptime3", path, "0")
+	return 0
+}
+
+// Mknod is left to the base class: this mount creates files through the create
+// callback and never receives a raw node creation.
+func (h *cgofuseHost) Mknod(path string, mode uint32, dev uint64) int {
+	h.trace("Mknod", path, "-ENOSYS")
+	return -ENOSYS
+}
+
+// Lock, Flock, Setxattr, Removexattr, and the Windows metadata callbacks below
+// accept the request and discard it because Windows issues them as part of
+// ordinary writes and creates, and WinFsp turns ENOSYS into a failed write or
+// create before the mount's own path runs. The federation does not preserve
+// locks or those attributes, so harmless success is the answer that keeps an
+// editor's save alive.
+func (h *cgofuseHost) Lock(path string, cmd int, lock *Lock_t, fh uint64) int {
+	h.trace("Lock", path, "0")
+	return 0
+}
+
+func (h *cgofuseHost) Flock(path string, cmd int, fh uint64) int {
+	h.trace("Flock", path, "0")
+	return 0
+}
+
+// Bmap is left to the base class: Windows does not issue block mapping for this
+// filesystem's ordinary writes, and the mount has no block device semantics.
+func (h *cgofuseHost) Bmap(path string, blocksize uint64, idx *uint64) int {
+	h.trace("Bmap", path, "-ENOSYS")
+	return -ENOSYS
+}
+
+// Setxattr and Removexattr accept the request and discard it because Windows
+// can attach extended attributes as part of a create, and WinFsp treats ENOSYS
+// from these callbacks as a failure of the whole create. This mount has no
+// extended attributes, so the harmless success is what keeps the save alive.
+func (h *cgofuseHost) Setxattr(path string, name string, value []byte, flags int) int {
+	h.trace("Setxattr", path, "0")
+	return 0
+}
+
+func (h *cgofuseHost) Removexattr(path string, name string) int {
+	h.trace("Removexattr", path, "0")
+	return 0
+}

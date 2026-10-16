@@ -2,6 +2,7 @@ package mount
 
 import (
 	"log"
+	"strings"
 
 	"peerfold/internal/node"
 )
@@ -113,7 +114,12 @@ func (m *Mount) watchLoop(done chan struct{}, exited chan struct{}) {
 				return
 			default:
 			}
-			m.applyEvent(b)
+			if m.applyEvent(b) {
+				m.setDisconnected(true)
+				log.Printf("mount: the server withdrew an owner's tree; the tree is " +
+					"stale until a reconnect")
+				return
+			}
 		}
 	}
 }
@@ -124,7 +130,7 @@ func (m *Mount) watchLoop(done chan struct{}, exited chan struct{}) {
 // anything else on hand, so applying it is strictly better than dropping it --
 // the stale flag records that something was missed, not that what arrived is
 // suspect.
-func (m *Mount) applyEvent(b Batch) {
+func (m *Mount) applyEvent(b Batch) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -146,17 +152,23 @@ func (m *Mount) applyEvent(b Batch) {
 		m.lastSeq = b.Seq
 	}
 
+	withdrawn := false
 	for _, n := range b.Nodes {
+		delete(m.pendingPaths, n.Path)
 		if n.Kind == node.KindDeleted {
 			// The tombstone is kept rather than the entry being deleted: see the
 			// comment on Mount.events. Deleting it would make the deletion
 			// indistinguishable from a path that was never mentioned, and the
 			// next listing would bring it back.
 			m.events[n.Path] = node.Node{Path: n.Path, Kind: node.KindDeleted}
+			if n.Path != "" && !strings.Contains(n.Path, "/") {
+				withdrawn = true
+			}
 			continue
 		}
 		m.events[n.Path] = n
 	}
+	return withdrawn
 }
 
 // eventFor returns this mount's most recent information about a path, if any.

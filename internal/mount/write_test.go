@@ -13,7 +13,7 @@ import (
 
 func TestCreateMakesAWritableHandle(t *testing.T) {
 	m := newTestMount(t)
-	fh, code := m.Create("/new.txt", 0o644)
+	fh, code := m.Create("/new.txt", 0o644, OReadWrite)
 	if code != 0 {
 		t.Fatalf("Create = %d", code)
 	}
@@ -40,7 +40,7 @@ func TestCreateOnAnExistingName(t *testing.T) {
 	// The core's own behaviour: a Put replaces the target, so Create has to
 	// decide the policy, and the answer is that an existing file is opened rather
 	// than refused, because cgofuse calls Create for O_CREAT on an existing path.
-	fh, code := m.Create("/a.txt", 0o644)
+	fh, code := m.Create("/a.txt", 0o644, OReadWrite)
 	if code != 0 {
 		t.Fatalf("Create over an existing file = %d, want 0", code)
 	}
@@ -53,14 +53,14 @@ func TestCreateOnAnExistingName(t *testing.T) {
 func TestCreateOnSymlinkIsElooped(t *testing.T) {
 	m := newTestMount(t)
 	fakeOf(t, m).addSymlink("/link")
-	if _, code := m.Create("/link", 0o644); code != -ELOOP {
+	if _, code := m.Create("/link", 0o644, OReadWrite); code != -ELOOP {
 		t.Errorf("Create(symlink) = %d, want -ELOOP", code)
 	}
 }
 
 func TestCreateInMissingParent(t *testing.T) {
 	m := newTestMount(t)
-	if _, code := m.Create("/nope/x.txt", 0o644); code != -ENOENT {
+	if _, code := m.Create("/nope/x.txt", 0o644, OReadWrite); code != -ENOENT {
 		t.Errorf("Create(missing parent) = %d, want -ENOENT", code)
 	}
 }
@@ -70,7 +70,7 @@ func TestCreateInMissingParent(t *testing.T) {
 func TestCreateUnderAFile(t *testing.T) {
 	m := newTestMount(t)
 	fakeOf(t, m).addFile("/a.txt", 5)
-	if _, code := m.Create("/a.txt/x", 0o644); code != -ENOTDIR {
+	if _, code := m.Create("/a.txt/x", 0o644, OReadWrite); code != -ENOTDIR {
 		t.Errorf("Create(file/x) = %d, want -ENOTDIR", code)
 	}
 }
@@ -328,11 +328,18 @@ func TestFlushPathFlushesEveryHandleOnThePath(t *testing.T) {
 	f.addFile("/a.txt", 0)
 	f.setContent("/a.txt", nil)
 
-	fh1, _ := m.Open("/a.txt", OReadWrite)
-	fh2, _ := m.Open("/a.txt", OReadWrite)
+	fh1, code1 := m.Open("/a.txt", OReadWrite)
+	fh2, code2 := m.Open("/a.txt", OReadWrite)
+	if code1 != 0 || code2 != 0 {
+		t.Fatalf("Open = (%d, %d), want both 0", code1, code2)
+	}
 	h1, _ := m.handle(fh1)
 	h2, _ := m.handle(fh2)
 	m.mu.Lock()
+	if h1 == nil || h2 == nil {
+		m.mu.Unlock()
+		t.Fatal("flushPath fixture did not create both open handles")
+	}
 	h1.write(0, []byte("one"))
 	h2.write(0, []byte("two"))
 	m.mu.Unlock()

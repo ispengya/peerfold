@@ -520,6 +520,15 @@ func (f *fakeCaller) callIndex(want string) int {
 	return -1
 }
 
+func (f *fakeCaller) callsWithPrefix(prefix string) bool {
+	for _, c := range f.callLog() {
+		if strings.HasPrefix(c, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func (f *fakeCaller) callLog() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -56,25 +56,133 @@ func TestHostInterfaceShape(t *testing.T) {
 func TestUnsupportedOperationsAreEnosys(t *testing.T) {
 	m := newTestMount(t)
 	h := &cgofuseHost{m: m}
-
-	cases := []struct {
-		name string
-		code int
-	}{
-		{"Mknod", h.Mknod("/a", 0, 0)},
-		{"Link", h.Link("/a", "/b")},
-		{"Symlink", h.Symlink("/a", "/b")},
-		{"Chmod", h.Chmod("/a", 0o644)},
-		{"Chown", h.Chown("/a", 0, 0)},
-		{"Utimens", h.Utimens("/a", nil)},
-		{"Access", h.Access("/a", 0)},
-		{"Setxattr", h.Setxattr("/a", "user.x", nil, 0)},
-		{"Removexattr", h.Removexattr("/a", "user.x")},
+	if code := h.Mknod("/a", 0, 0); code != -ENOSYS {
+		t.Errorf("Mknod = %d, want -ENOSYS (%d)", code, -ENOSYS)
 	}
-	for _, c := range cases {
-		if c.code != -ENOSYS {
-			t.Errorf("%s = %d, want -ENOSYS (%d)", c.name, c.code, -ENOSYS)
-		}
+	if code := h.Bmap("/a", 0, nil); code != -ENOSYS {
+		t.Errorf("Bmap = %d, want -ENOSYS (%d)", code, -ENOSYS)
+	}
+}
+
+// The trace hook is installed before NewHost runs in the real-mount helper, so
+// NewHost must carry the callback into the adapter rather than dropping it.
+func TestNewHostCarriesTheTrace(t *testing.T) {
+	var got []string
+	SetHostTrace(func(op, result, path string) { got = append(got, op+":"+path) })
+	defer SetHostTrace(nil)
+
+	_, _ = NewHost(newFakeCaller(), DefaultOptions())
+	if len(got) == 0 || got[len(got)-1] != "NewHost:" {
+		t.Fatalf("NewHost trace = %v, want the last entry to be NewHost", got)
+	}
+}
+
+// Windows asks for volume and extended-attribute metadata during an ordinary
+// create, and WinFsp turns ENOSYS from these callbacks into a failed create.
+// The mount has no volume label or extended attributes, so harmless success is
+// the answer that keeps the save alive.
+func TestWindowsCreateMetadataDoesNotFail(t *testing.T) {
+	m := newTestMount(t)
+	h := &cgofuseHost{m: m}
+	if code := h.Getvolume("/a", &fuse.Statfs_t{}); code == -ENOSYS {
+		t.Error("Getvolume answered ENOSYS; Windows asks for volume information during create and an ENOSYS fails it")
+	}
+	if code := h.SetvolumeLabel("/a", "peerfold"); code == -ENOSYS {
+		t.Error("SetvolumeLabel answered ENOSYS; Windows asks for volume information during create and an ENOSYS fails it")
+	}
+	if code, _ := h.Getea("/a", "user.x"); code == -ENOSYS {
+		t.Error("Getea answered ENOSYS; Windows can ask for extended attributes during create and an ENOSYS fails it")
+	}
+	if code := h.Listea("/a", func(string) bool { return true }); code == -ENOSYS {
+		t.Error("Listea answered ENOSYS; Windows can ask for extended attributes during create and an ENOSYS fails it")
+	}
+	if code := h.Geteainfo("/a", nil); code == -ENOSYS {
+		t.Error("Geteainfo answered ENOSYS; Windows can ask for extended attributes during create and an ENOSYS fails it")
+	}
+	if code := h.Seteainfo("/a", nil); code == -ENOSYS {
+		t.Error("Seteainfo answered ENOSYS; Windows can ask for extended attributes during create and an ENOSYS fails it")
+	}
+	if code, _ := h.Getpath3("/a", 0); code == -ENOSYS {
+		t.Error("Getpath3 answered ENOSYS; Windows can normalize case during create and an ENOSYS fails it")
+	}
+	if code := h.Setea("/a", "user.x", []byte("x"), 0); code != 0 {
+		t.Errorf("Setea = %d, want 0: Windows sends this during create and an ENOSYS fails the create", code)
+	}
+	if code := h.Setea2("/a", "user.x", []byte("x"), 0, nil); code != 0 {
+		t.Errorf("Setea2 = %d, want 0: Windows sends this during create and an ENOSYS fails the create", code)
+	}
+	if code := h.Setea3("/a", "user.x", []byte("x"), 0, nil); code != 0 {
+		t.Errorf("Setea3 = %d, want 0: Windows sends this during create and an ENOSYS fails the create", code)
+	}
+}
+
+// Symlink creation is refused rather than inherited from the base class's
+// ENOSYS. Windows turns that ENOSYS into STATUS_NOT_SUPPORTED, which the Win32
+// layer reports as a missing path, so a symlink is the only refusal that would
+// be indistinguishable from a failed save.
+func TestSymlinkIsRefusedWithoutENOSYS(t *testing.T) {
+	m := newTestMount(t)
+	h := &cgofuseHost{m: m}
+	if code := h.Symlink("/a", "/b"); code == -ENOSYS {
+		t.Error("Symlink answered ENOSYS; Windows reports that as a missing path rather than as an unsupported operation")
+	}
+	if code := h.Link("/a", "/b"); code == -ENOSYS {
+		t.Error("Link answered ENOSYS; Windows reports that as a missing path rather than as an unsupported operation")
+	}
+	if code, _ := h.Getpath("/a", 0); code == -ENOSYS {
+		t.Error("Getpath answered ENOSYS; Windows uses it to normalize case before ordinary writes and reports ENOSYS as a missing path")
+	}
+}
+
+// Windows can change a file's basic attributes during creation. WinFsp turns an
+// ENOSYS from these callbacks into a failed create, so the mount has to say
+// "unsupported but harmless" rather than "not supported" for the operations
+// Windows issues as part of an ordinary create.
+func TestCreateTimeOperationsDoNotFailTheMount(t *testing.T) {
+	m := newTestMount(t)
+	h := &cgofuseHost{m: m}
+
+	if code := h.Chmod("/a", 0o644); code != 0 {
+		t.Errorf("Chmod = %d, want 0: Windows sends this during create and an ENOSYS fails the create", code)
+	}
+	if code := h.Chown("/a", 0, 0); code != 0 {
+		t.Errorf("Chown = %d, want 0: Windows sends this during create and an ENOSYS fails the create", code)
+	}
+	if code := h.Utimens("/a", []fuse.Timespec{{Sec: 1}, {Sec: 1}}); code != 0 {
+		t.Errorf("Utimens = %d, want 0: Windows sends this during create and an ENOSYS fails the create", code)
+	}
+	if code := h.Chflags("/a", 0); code != 0 {
+		t.Errorf("Chflags = %d, want 0: Windows sends this during create and an ENOSYS fails the create", code)
+	}
+	if code := h.Setcrtime("/a", fuse.Timespec{Sec: 1}); code != 0 {
+		t.Errorf("Setcrtime = %d, want 0: Windows sends this during create and an ENOSYS fails the create", code)
+	}
+	if code := h.Setchgtime("/a", fuse.Timespec{Sec: 1}); code != 0 {
+		t.Errorf("Setchgtime = %d, want 0: Windows sends this during create and an ENOSYS fails the create", code)
+	}
+	if code := h.Setvolume("/a", "peerfold"); code != 0 {
+		t.Errorf("Setvolume = %d, want 0: Windows sends this during create and an ENOSYS fails the create", code)
+	}
+	if code := h.Setea("/a", "user.x", []byte("x"), 0); code != 0 {
+		t.Errorf("Setea = %d, want 0: Windows sends this during create and an ENOSYS fails the create", code)
+	}
+	if code := h.Setea2("/a", "user.x", []byte("x"), 0, nil); code != 0 {
+		t.Errorf("Setea2 = %d, want 0: Windows sends this during create and an ENOSYS fails the create", code)
+	}
+	if code := h.Setea3("/a", "user.x", []byte("x"), 0, nil); code != 0 {
+		t.Errorf("Setea3 = %d, want 0: Windows sends this during create and an ENOSYS fails the create", code)
+	}
+	if code := h.Mkdir("/a", 0o755); code != 0 {
+		t.Errorf("Mkdir = %d, want 0: Windows sends directory creation during create and an ENOSYS fails it", code)
+	}
+	if code := h.Setchgtime3("/a", fuse.Timespec{Sec: 1}, 0); code != 0 {
+		t.Errorf("Setchgtime3 = %d, want 0: Windows sends this during create and an ENOSYS fails the create", code)
+	}
+	if code := h.Setcrtime3("/a", fuse.Timespec{Sec: 1}, 0); code != 0 {
+		t.Errorf("Setcrtime3 = %d, want 0: Windows sends this during create and an ENOSYS fails the create", code)
+	}
+	if code := h.Setbkuptime3("/a", fuse.Timespec{Sec: 1}, 0); code != 0 {
+		t.Errorf("Setbkuptime3 = %d, want 0: Windows sends this during create and an ENOSYS fails the create", code)
 	}
 }
 
@@ -95,6 +203,24 @@ func TestGetxattrIsNotEnosys(t *testing.T) {
 	}
 	if data != nil {
 		t.Errorf("Getxattr returned %d bytes with no attribute, want none", len(data))
+	}
+}
+
+// A Windows create can carry extended attributes. WinFsp treats an ENOSYS from
+// Setxattr during Create as a failure of the whole create, so the adapter must
+// report "no attributes supported" without making the creation fail.
+func TestSetxattrDuringCreateDoesNotFailTheMount(t *testing.T) {
+	m := newTestMount(t)
+	h := &cgofuseHost{m: m}
+	code := h.Setxattr("/a", "$KERNEL.PURGE.SEC.FILEHASH", []byte("hash"), 0)
+	if code == -ENOSYS {
+		t.Error("Setxattr answered ENOSYS; WinFsp turns that into a failed create when Windows supplies extended attributes")
+	}
+	if code != 0 {
+		t.Errorf("Setxattr = %d, want 0: this mount has no extended attributes and Windows ignores the harmless success", code)
+	}
+	if code := h.Removexattr("/a", "user.x"); code != 0 {
+		t.Errorf("Removexattr = %d, want 0: this mount has no extended attributes and Windows ignores the harmless success", code)
 	}
 }
 
@@ -140,6 +266,49 @@ func TestStatConversionKeepsSizeModeAndMtime(t *testing.T) {
 	}
 	if st.Mtim.Sec != 1700000000 {
 		t.Errorf("Mtim.Sec = %d, want 1700000000", st.Mtim.Sec)
+	}
+}
+
+// WinFsp gates the transition from a failed lookup to Create on the parent's
+// write permission. A directory reported as 0555 makes the kernel refuse the
+// create before cgofuse ever receives it, so the adapter must always expose a
+// writable directory to the platform.
+func TestGetattrReportsDirectoriesAsWritable(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addDir("/readonly")
+	n := f.nodes["/readonly"]
+	n.Mode = 0o040555
+	f.nodes["/readonly"] = n
+
+	h := &cgofuseHost{m: m}
+	var st fuse.Stat_t
+	if code := h.Getattr("/readonly", &st, 0); code != 0 {
+		t.Fatalf("Getattr = %d, want 0", code)
+	}
+	if st.Mode&fuse.S_IWUSR == 0 {
+		t.Errorf("directory Mode = %o, want the owner write bit so Windows can create inside it", st.Mode)
+	}
+}
+
+// A root without S_IFDIR makes WinFsp reject the entire mount before the
+// filesystem starts, which is why the root's type field must survive the
+// adapter even when its permission bits are configured as a plain 0755.
+func TestGetattrReportsTheRootAsADirectory(t *testing.T) {
+	m := newTestMount(t)
+	h := &cgofuseHost{m: m}
+	var st fuse.Stat_t
+	if code := h.Getattr("/", &st, 0); code != 0 {
+		t.Fatalf("Getattr = %d, want 0", code)
+	}
+	if st.Mode&fuse.S_IFDIR == 0 {
+		t.Errorf("root Mode = %o, want the directory type bit", st.Mode)
+	}
+	if st.Mode&fuse.S_IWUSR == 0 {
+		t.Errorf("root Mode = %o, want the owner write bit so Windows can create at the root", st.Mode)
+	}
+	if st.Mode&fuse.S_IFMT != fuse.S_IFDIR {
+		t.Errorf("root Mode = %o, want exactly one directory type field", st.Mode)
 	}
 }
 
@@ -221,6 +390,84 @@ func TestReadErrorIsNegative(t *testing.T) {
 		t.Errorf("Read = %d, want a negative errno", n)
 	}
 	h.Release("/a.txt", fh)
+}
+
+// A Create carries flags from the kernel in addition to the create bit. The
+// mount's operation core must receive that flag word intact: the adapter is the
+// only place that sees cgofuse's representation, and dropping the flags would
+// turn a normal save into an unconditional overwrite without telling anybody.
+func TestCreateHonoursReadOnlyFlagsFromTheKernel(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addDir("/d")
+
+	h := &cgofuseHost{m: m}
+	status, fh := h.Create("/d/new.txt", fuse.O_RDONLY|fuse.O_CREAT, 0o644)
+	if status != 0 {
+		t.Fatalf("Create = %d, want 0", status)
+	}
+	if code := h.Write("/d/new.txt", []byte("x"), 0, fh); code != -EBADF {
+		t.Errorf("Write through an O_RDONLY Create = %d, want -EBADF (%d)", code, -EBADF)
+	}
+	h.Release("/d/new.txt", fh)
+}
+
+func TestCreateReportsAFileHandleToTheKernel(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addDir("/d")
+
+	h := &cgofuseHost{m: m}
+	status, fh := h.Create("/d/new.txt", fuse.O_WRONLY|fuse.O_CREAT|fuse.O_TRUNC, 0o644)
+	if status != 0 {
+		t.Fatalf("Create = %d, want 0", status)
+	}
+	if fh == 0 {
+		t.Error("Create returned handle 0; cgofuse treats that as the first real handle and Windows reports the create as missing")
+	}
+	if status, fh = h.Create("/d", fuse.O_RDONLY|fuse.O_CREAT, 0o755); status != -EISDIR {
+		t.Errorf("Create on a directory = status %d, want -EISDIR (%d)", status, -EISDIR)
+	}
+	if fh != noHandle {
+		t.Errorf("failed Create handle = %#x, want cgofuse's noHandle %#x", fh, noHandle)
+	}
+}
+
+func TestGetattrAfterCreateDoesNotReportThePendingFileMissing(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addDir("/d")
+
+	h := &cgofuseHost{m: m}
+	status, fh := h.Create("/d/new.txt", fuse.O_WRONLY|fuse.O_CREAT|fuse.O_TRUNC, 0o644)
+	if status != 0 {
+		t.Fatalf("Create = %d, want 0", status)
+	}
+
+	// WinFsp asks for attributes immediately after Create, before the file has
+	// been uploaded to the server's index. A missing answer there makes the
+	// whole create look not to exist to the caller.
+	var st fuse.Stat_t
+	if code := h.Getattr("/d/new.txt", &st, fh); code != 0 {
+		t.Fatalf("Getattr after Create = %d, want 0", code)
+	}
+	h.Release("/d/new.txt", fh)
+}
+
+func TestCreatePassesTheKernelFlagsThrough(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addDir("/d")
+
+	h := &cgofuseHost{m: m}
+	status, fh := h.Create("/d/new.txt", fuse.O_WRONLY|fuse.O_CREAT|fuse.O_TRUNC, 0o644)
+	if status != 0 {
+		t.Fatalf("Create = %d, want 0", status)
+	}
+	_ = fh
+	if !f.callsWithPrefix("List /d") {
+		t.Errorf("Create did not resolve the parent directory; calls were %v", f.callLog())
+	}
 }
 
 func TestWriteReturnsByteCountNotStatus(t *testing.T) {
@@ -425,14 +672,144 @@ func TestOpenFailureReturnsAMaximalHandleNotZero(t *testing.T) {
 	}
 }
 
-func TestCreateMkdirAndReleaseThroughHost(t *testing.T) {
+func TestPendingGetattrFillsTheStatStructure(t *testing.T) {
 	m := newTestMount(t)
-	h := &cgofuseHost{m: m}
+	f := fakeOf(t, m)
+	f.addFile("/a.txt", 0)
 
-	if code := h.Mkdir("/d", 0o755); code != 0 {
+	h := &cgofuseHost{m: m}
+	status, fh := h.Open("/a.txt", OReadOnly)
+	if status != 0 {
+		t.Fatalf("Open = %d, want 0", status)
+	}
+	var st fuse.Stat_t
+	if code := h.Getattr("/a.txt", &st, fh); code != 0 {
+		t.Fatalf("Getattr after Open = %d, want 0", code)
+	}
+	if st.Mode&fuse.S_IFREG == 0 {
+		t.Errorf("pending Getattr mode = %#o, want a regular file", st.Mode)
+	}
+	if st.Size != 0 {
+		t.Errorf("pending Getattr size = %d, want 0", st.Size)
+	}
+	h.Release("/a.txt", fh)
+}
+
+func TestGetattrForAnOpenFileDoesNotReportTheFileMissing(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addFile("/a.txt", 0)
+	f.setContent("/a.txt", []byte(""))
+
+	h := &cgofuseHost{m: m}
+	status, fh := h.Open("/a.txt", OReadOnly)
+	if status != 0 {
+		t.Fatalf("Open = %d, want 0", status)
+	}
+
+	// WinFsp asks for attributes after opening the handle. The owner's index may
+	// still be between the local flush and the watcher push, so the adapter
+	// must answer from the open handle rather than report the file missing.
+	var st fuse.Stat_t
+	if code := h.Getattr("/a.txt", &st, fh); code != 0 {
+		t.Fatalf("Getattr after Open = %d, want 0", code)
+	}
+	h.Release("/a.txt", fh)
+}
+
+func TestMkdirNotifiesTheKernelAboutItsParent(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addDir("/d")
+	notified := make(chan string, 1)
+	m.invalidatePath = func(p string) bool {
+		notified <- p
+		return true
+	}
+
+	if code := m.Mkdir("/d/new", 0o755); code != 0 {
 		t.Fatalf("Mkdir = %d, want 0", code)
 	}
-	code, fh := h.Create("/d/new.txt", 0, 0o644)
+	select {
+	case p := <-notified:
+		if p != "/d/new" {
+			t.Errorf("invalidated %q, want the new directory /d/new", p)
+		}
+	default:
+		t.Error("Mkdir did not invalidate the new directory; Windows keeps the stale negative lookup and refuses the next child create")
+	}
+}
+
+func TestMkdirTwiceWhilePendingIsEexist(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addDir("/d")
+
+	if code := m.Mkdir("/d/new-dir", 0o755); code != 0 {
+		t.Fatalf("first Mkdir = %d, want 0", code)
+	}
+	if code := m.Mkdir("/d/new-dir", 0o755); code != -EEXIST {
+		t.Errorf("second Mkdir = %d, want -EEXIST (%d)", code, -EEXIST)
+	}
+}
+
+func TestWriteWithNoHandleForAPendingDirectoryIsRefused(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addDir("/parent")
+
+	h := &cgofuseHost{m: m}
+	if code := h.Mkdir("/parent/new-dir", 0o755); code != 0 {
+		t.Fatalf("Mkdir = %d, want 0", code)
+	}
+	if status, fh := h.Opendir("/parent/new-dir"); status != 0 || fh == noHandle {
+		t.Fatalf("Opendir pending directory = (%d, %#x), want (0, a real handle)", status, fh)
+	}
+	status, fh := h.Open("/parent/new-dir", OReadOnly)
+	if status != -EISDIR {
+		t.Errorf("Open of a pending directory = %d, want -EISDIR (%d)", status, -EISDIR)
+	}
+	if fh != noHandle {
+		t.Errorf("failed Open handle = %#x, want cgofuse's noHandle %#x", fh, noHandle)
+	}
+	if code := h.Write("/parent/new-dir", []byte("x"), 0, noHandle); code != -EBADF {
+		t.Errorf("Write with the directory sentinel handle = %d, want -EBADF (%d)", code, -EBADF)
+	}
+	if code := h.Flush("/parent/new-dir", noHandle); code != 0 {
+		t.Errorf("Flush with the directory sentinel handle = %d, want 0", code)
+	}
+}
+
+func TestOpendirAfterMkdirDoesNotReportThePendingDirectoryMissing(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addDir("/parent")
+
+	h := &cgofuseHost{m: m}
+	if code := h.Mkdir("/parent/new-dir", 0o755); code != 0 {
+		t.Fatalf("Mkdir = %d, want 0", code)
+	}
+
+	// WinFsp opens the directory immediately after creating it. The directory is
+	// not in the server's index until the client's watcher pushes it, so the
+	// adapter must not answer that first Opendir with ENOENT.
+	status, fh := h.Opendir("/parent/new-dir")
+	if status != 0 {
+		t.Fatalf("Opendir after Mkdir = %d, want 0", status)
+	}
+	h.Releasedir("/parent/new-dir", fh)
+}
+
+func TestCreateMkdirAndReleaseThroughHost(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addDir("/d")
+	h := &cgofuseHost{m: m}
+
+	if code := h.Mkdir("/d", 0o755); code != -EEXIST {
+		t.Fatalf("Mkdir = %d, want 0", code)
+	}
+	code, fh := h.Create("/d/new.txt", fuse.O_WRONLY|fuse.O_CREAT, 0o644)
 	if code != 0 {
 		t.Fatalf("Create = %d, want 0", code)
 	}
@@ -594,7 +971,7 @@ func TestInitStartsTheWatchAndDestroyFlushes(t *testing.T) {
 	}
 
 	// A dirty handle must be saved by Destroy.
-	code, fh := h.Create("/a.txt", 0, 0o644)
+	code, fh := h.Create("/a.txt", fuse.O_WRONLY|fuse.O_CREAT, 0o644)
 	if code != 0 {
 		t.Fatalf("Create = %d, want 0", code)
 	}

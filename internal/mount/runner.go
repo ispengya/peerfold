@@ -108,7 +108,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		// meaningfully to the first reconnect attempt's own backoff.
 		go func() {
 			for {
-				time.Sleep(200 * time.Millisecond)
+				time.Sleep(100 * time.Millisecond)
 				if m.disconnected() {
 					m.supervise(r.Reconnect, r.Opts.GiveUpAfter)
 					return

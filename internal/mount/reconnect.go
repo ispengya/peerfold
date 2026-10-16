@@ -196,6 +196,9 @@ func (m *Mount) discardDirtyOnDisconnect() {
 	for _, h := range m.files {
 		if !h.isClean() {
 			paths = append(paths, h.path)
+			h.version++
+			h.dirtyVersion = h.version
+			h.dirty = false
 			buf := h.content()
 			for i := range buf {
 				buf[i] = 0
@@ -207,8 +210,13 @@ func (m *Mount) discardDirtyOnDisconnect() {
 	hook := m.onDiscard
 	m.mu.Unlock()
 
-	if hook != nil {
-		for _, p := range paths {
+	seen := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		if _, once := seen[p]; once {
+			continue
+		}
+		seen[p] = struct{}{}
+		if hook != nil {
 			hook(p)
 		}
 	}

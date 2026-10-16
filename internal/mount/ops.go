@@ -3,6 +3,8 @@ package mount
 import (
 	stdpath "path"
 	"sort"
+	"strings"
+	"time"
 
 	"peerfold/internal/node"
 )
@@ -67,6 +69,21 @@ type Statfs struct {
 // something is a directory makes the kernel try to list it, so an unknown kind is
 // safer described as a file that will fail to read than as a directory whose
 // listing will fail.
+// toIndexPath converts a FUSE absolute path into the index format that
+// splitPath() in internal/viewer expects. Clean() and lookup() work in FUSE's
+// world (absolute, leading slash), and the test fake Caller works in the same
+// world, but viewerCaller's methods are the real boundary where paths must be
+// converted to index format (no leading slash) before reaching the wire.
+//
+// The two conventions meet exactly there, in viewerCaller's methods; every
+// layer below (viewer, server, index) works in the relative format.
+func toIndexPath(p string) string {
+	if p == "/" || p == "" {
+		return ""
+	}
+	return strings.TrimPrefix(p, "/")
+}
+
 func typeBits(kind node.Kind) uint32 {
 	switch kind {
 	case node.KindDir:
@@ -131,14 +148,10 @@ func (m *Mount) Getattr(path string, st *Stat, fh uint64) int {
 // Readdir lists one directory.
 //
 // The two dot entries are synthesised here because the caller's List returns real
-// entries only. Their stat is nil, which is what cgofuse's own examples pass and
-// what the host adapter turns into a NULL stat pointer, saving a Getattr per
-// entry.
-//
-// They are named "./" and "../" rather than "." and "..". The FUSE protocol
-// carries no distinction -- the name is a name -- but the convention in this
-// library is the slashed form, and matching it keeps the mount's listings
-// byte-identical to the ones its own examples produce.
+// entries only. They are named "." and "..", which is what WinFsp expects from a
+// directory enumeration; the host adapter passes the name through unchanged. Their
+// stat is nil, which saves a Getattr per entry and is what cgofuse's own examples
+// pass.
 //
 // The off parameter is accepted and ignored, which is what cgofuse's
 // documentation and both its example filesystems do. It is a resume hint: a
@@ -163,10 +176,10 @@ func (m *Mount) Readdir(path string, fill func(name string, st *Stat, off int64)
 	// make a directory appear to shuffle for no reason the user can see.
 	sort.Slice(children, func(i, j int) bool { return children[i].Path < children[j].Path })
 
-	if !fill("./", nil, 0) {
+	if !fill(".", nil, 0) {
 		return 0
 	}
-	if !fill("../", nil, 0) {
+	if !fill("..", nil, 0) {
 		return 0
 	}
 	for _, c := range children {
@@ -251,6 +264,12 @@ func (m *Mount) Open(path string, mode int) (uint64, int) {
 	if err != nil {
 		return 0, -EINVAL
 	}
+	// A directory opened through the file-open callback must be refused before
+	// cgofuse writes a handle into WinFsp's per-open context. Opendir owns
+	// directory handles; Open must not invent one.
+	if m.pendingDirectory(cleaned) && m.isDirPath(cleaned) {
+		return 0, -EISDIR
+	}
 	n, code := m.lookup(cleaned)
 	if code != 0 {
 		return 0, code
@@ -288,6 +307,66 @@ func (m *Mount) Open(path string, mode int) (uint64, int) {
 // core does not keep per-directory state yet -- the listing is fetched afresh
 // each time -- but the handle is still allocated so that a released directory is
 // tracked the same way a released file is.
+// newPendingDirectoryHandle allocates a handle for a directory created through
+// this mount but not yet present in the server's index.
+//
+// It is deliberately separate from Opendir: the normal path resolves the
+// directory through the wire, while this one is the narrow post-Mkdir window
+// where the client has not pushed the new node yet.
+// isDirPath reports whether the pending name is a directory rather than a file.
+func (m *Mount) isDirPath(path string) bool {
+	cleaned, err := Clean(path)
+	if err != nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, h := range m.files {
+		if h.path == cleaned && h.kind == node.KindDir {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Mount) pendingDirectory(path string) bool {
+	cleaned, err := Clean(path)
+	if err != nil {
+		return false
+	}
+	if m.offline() {
+		return false
+	}
+	m.mu.Lock()
+	if _, pending := m.pendingPaths[cleaned]; pending {
+		m.mu.Unlock()
+		return true
+	}
+	var open bool
+	for _, h := range m.files {
+		if h.path == cleaned {
+			open = true
+			break
+		}
+	}
+	m.mu.Unlock()
+	return open
+}
+
+func (m *Mount) newPendingDirectoryHandle(path string) (uint64, int) {
+	cleaned, err := Clean(path)
+	if err != nil {
+		return 0, -EINVAL
+	}
+	if m.offline() {
+		return 0, -EIO
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	fh := m.newHandleLocked(cleaned, node.KindDir)
+	return fh, 0
+}
+
 func (m *Mount) Opendir(path string) (uint64, int) {
 	cleaned, err := Clean(path)
 	if err != nil {
@@ -465,6 +544,44 @@ func (m *Mount) readTarget(path string, fh uint64) (readSnapshot, int) {
 	return readSnapshot{path: cleaned, kind: n.Kind, size: n.Size}, 0
 }
 
+// pendingStat reports attributes for a path whose handle exists before the
+// owner's index has caught up.
+//
+// It is not a general-purpose stat: lookup remains authoritative for every path
+// once the index has an answer. This exists for WinFsp's immediate attribute
+// query after Create/Open, where ENOENT would fail a successful operation.
+func (m *Mount) pendingStat(path string, fh uint64, st *Stat) int {
+	cleaned, err := Clean(path)
+	if err != nil {
+		return -EINVAL
+	}
+	m.mu.Lock()
+	h, ok := m.files[fh]
+	if !ok || h.path != cleaned {
+		for _, candidate := range m.files {
+			if candidate.path == cleaned {
+				h, ok = candidate, true
+				break
+			}
+		}
+	}
+	var mode uint32
+	var size int64
+	if ok {
+		mode = modeRegular
+		if h.kind == node.KindDir {
+			mode = modeDir
+		}
+		size = h.size
+		m.noteInodeLocked(fh, cleaned)
+		m.mu.Unlock()
+		*st = Stat{Mode: mode, Size: size, Mtime: time.Now().Unix(), Nlink: 1}
+		return 0
+	}
+	m.mu.Unlock()
+	return -ENOENT
+}
+
 // ---------------------------------------------------------------- the write path
 
 // Create opens a path for writing, making a handle whether or not the file
@@ -478,13 +595,56 @@ func (m *Mount) readTarget(path string, fh uint64) (readSnapshot, int) {
 // A symlink at the path is refused with ELOOP, the same as everywhere else. A
 // directory is EISDIR, because a writable handle on a directory would have to
 // answer writes that have no meaning.
-func (m *Mount) Create(path string, mode uint32) (uint64, int) {
+// pendingCreate reports whether a handle is currently open at the path but the
+// index does not know the file yet.
+//
+// It is used only by the adapter's immediate post-create attribute query. The
+// wire is authoritative for every other lookup, so a stale pending handle must
+// not answer ordinary reads, opens, or listings.
+func (m *Mount) pendingCreate(path string) bool {
+	cleaned, err := Clean(path)
+	if err != nil {
+		return false
+	}
+	if m.offline() {
+		return false
+	}
+	m.mu.Lock()
+	if _, pending := m.pendingPaths[cleaned]; pending {
+		m.mu.Unlock()
+		return true
+	}
+	var open bool
+	for _, h := range m.files {
+		if h.path == cleaned {
+			open = true
+			break
+		}
+	}
+	m.mu.Unlock()
+	if open {
+		// An open handle makes the immediate post-open attribute query the owner's
+		// authoritative answer rather than a stale negative lookup. This is the
+		// same window as a newly created name, and the adapter uses it only for
+		// the one callback WinFsp issues immediately after Create/Open.
+		return true
+	}
+	return false
+}
+
+func (m *Mount) Create(path string, mode uint32, access int) (uint64, int) {
 	if m.offline() {
 		return 0, -EIO
 	}
 	cleaned, err := Clean(path)
 	if err != nil {
 		return 0, -EINVAL
+	}
+	// A directory opened through the file-open callback must be refused before
+	// cgofuse writes a handle into WinFsp's per-open context. Opendir owns
+	// directory handles; Open must not invent one.
+	if m.pendingDirectory(cleaned) && m.isDirPath(cleaned) {
+		return 0, -EISDIR
 	}
 	// The parent lookup enforces the shape of the path: a missing parent is
 	// ENOENT and a parent that is a file is ENOTDIR. It runs first so a refused
@@ -515,6 +675,7 @@ func (m *Mount) Create(path string, mode uint32) (uint64, int) {
 	defer m.mu.Unlock()
 	fh := m.newHandleLocked(cleaned, node.KindFile)
 	h, _ := m.files[fh]
+	h.readOnly = access != OReadWrite
 	if lookupCode == 0 {
 		// The file is already there. The index's size is recorded as both the
 		// current length and the pre-modification length, so a later truncation
@@ -559,7 +720,18 @@ func (m *Mount) Write(path string, buf []byte, off int64, fh uint64) int {
 	h, ok := m.files[fh]
 	if !ok {
 		m.mu.Unlock()
+		// WinFsp can hand the directory's sentinel handle to a write after the
+		// directory was opened without a real file handle. There is no content
+		// to attach that write to, and passing the sentinel into the path
+		// fallback would fail before the path could be resolved.
+		if fh == noHandle {
+			return -EBADF
+		}
 		return m.writeThroughPath(path, buf, off)
+	}
+	if h.kind == node.KindDir {
+		m.mu.Unlock()
+		return -EISDIR
 	}
 	if h.readOnly {
 		m.mu.Unlock()
@@ -804,6 +976,13 @@ func (m *Mount) Fsync(path string, datasync bool, fh uint64) int {
 // stays open elsewhere, so it is not the last chance -- but it is a chance, and
 // it is cheap when the handle is clean.
 func (m *Mount) Flush(path string, fh uint64) int {
+	// A directory handle has no buffered bytes. The sentinel handle WinFsp uses
+	// for the directory-open probe must be ignored rather than treated as an
+	// unknown file handle, or a later write can be routed through the path
+	// fallback before Windows has resolved the new directory.
+	if fh == noHandle {
+		return 0
+	}
 	return m.flush(fh)
 }
 
@@ -856,6 +1035,15 @@ func (m *Mount) Mkdir(path string, mode uint32) int {
 	if err != nil {
 		return -EINVAL
 	}
+	m.mu.Lock()
+	_, alreadyPending := m.pendingPaths[cleaned]
+	m.mu.Unlock()
+	if alreadyPending {
+		// The directory was created by this mount and has not been pushed back
+		// by its owner yet. A second Mkdir for that name must behave like a
+		// repeated create, not like a fresh lookup into a stale index.
+		return -EEXIST
+	}
 	// The parent lookup enforces the shape: a missing parent is ENOENT and a
 	// parent that is a file is ENOTDIR.
 	if _, _, code := m.lookupParent(cleaned); code != 0 {
@@ -872,6 +1060,15 @@ func (m *Mount) Mkdir(path string, mode uint32) int {
 	}
 	if err := m.call().Mkdir(cleaned); err != nil {
 		return errnoFor(err)
+	}
+	m.mu.Lock()
+	m.pendingPaths[cleaned] = struct{}{}
+	m.mu.Unlock()
+	// A new name has appeared, and the kernel may have cached a negative lookup
+	// for it. Invalidating the new path keeps Windows from rejecting the first
+	// attribute query or child lookup with a stale "not found".
+	if m.invalidatePath != nil {
+		m.invalidatePath(cleaned)
 	}
 	return 0
 }
@@ -977,6 +1174,21 @@ func (m *Mount) Rmdir(path string) int {
 	if cleaned == "/" {
 		return -EPERM
 	}
+	m.mu.Lock()
+	_, pending := m.pendingPaths[cleaned]
+	m.mu.Unlock()
+	if pending {
+		// The directory was created through this mount but has not reached the
+		// owner's index yet. Removing it through the wire would be an ENOENT
+		// even though the caller is removing the directory it just created.
+		if err := m.call().Remove(cleaned); err != nil && errnoFor(err) != -ENOENT {
+			return errnoFor(err)
+		}
+		m.mu.Lock()
+		delete(m.pendingPaths, cleaned)
+		m.mu.Unlock()
+		return 0
+	}
 	n, code := m.lookup(cleaned)
 	if code != 0 {
 		return code
@@ -1031,8 +1243,17 @@ func (m *Mount) Rename(oldPath, newPath string) int {
 		// alone, so nothing is done and nothing is reported.
 		return 0
 	}
-	if _, present := m.kindAt(oldClean); !present {
-		return -ENOENT
+	// A name created through this mount may not be in the owner's index yet.
+	// The editor's temp-file rename arrives in that window, and resolving the
+	// source through the wire would report ENOENT even though the caller just
+	// created it.
+	m.mu.Lock()
+	_, sourcePending := m.pendingPaths[oldClean]
+	m.mu.Unlock()
+	if !sourcePending {
+		if _, present := m.kindAt(oldClean); !present {
+			return -ENOENT
+		}
 	}
 	if _, _, code := m.lookupParent(newClean); code != 0 {
 		return code
@@ -1080,5 +1301,7 @@ func (m *Mount) Rename(oldPath, newPath string) int {
 			m.cache.dropOpenLocked(h.fh)
 		}
 	}
+	delete(m.pendingPaths, oldClean)
+	delete(m.pendingPaths, newClean)
 	return 0
 }

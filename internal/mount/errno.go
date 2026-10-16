@@ -23,20 +23,21 @@ import (
 // EPERM=1 ENOENT=2 EIO=5 EBADF=9 EACCES=13 EEXIST=17 EXDEV=18 ENOTDIR=20
 // EISDIR=21 EINVAL=22 ENOSPC=28 ENOSYS=40 ENOTEMPTY=41 ENOATTR=120 ELOOP=114.
 const (
-	EPERM     = 1
-	ENOENT    = 2
-	EIO       = 5
-	EBADF     = 9
-	EACCES    = 13
-	EEXIST    = 17
-	EXDEV     = 18
-	ENOTDIR   = 20
-	EISDIR    = 21
-	EINVAL    = 22
-	ENOSPC    = 28
-	ENOSYS    = 40
-	ENOTEMPTY = 41
-	ELOOP     = 114
+	EPERM      = 1
+	ENOENT     = 2
+	EIO        = 5
+	EBADF      = 9
+	EACCES     = 13
+	EEXIST     = 17
+	EXDEV      = 18
+	ENOTDIR    = 20
+	EISDIR     = 21
+	EINVAL     = 22
+	ENOSPC     = 28
+	ENOSYS     = 40
+	ENOTEMPTY  = 41
+	EOPNOTSUPP = 130
+	ELOOP      = 114
 	// ENOATTR is what a getxattr for a missing attribute must return. It is
 	// cgofuse's name for ENODATA on every platform it builds for, and 120 is its
 	// value on both -- the same 120 that a Linux kernel would call something else

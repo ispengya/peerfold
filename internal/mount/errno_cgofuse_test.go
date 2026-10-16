@@ -39,6 +39,7 @@ func TestErrnosMatchCgofuse(t *testing.T) {
 		{"ENOSPC", ENOSPC, fuse.ENOSPC},
 		{"ENOSYS", ENOSYS, fuse.ENOSYS},
 		{"ENOTEMPTY", ENOTEMPTY, fuse.ENOTEMPTY},
+		{"EOPNOTSUPP", EOPNOTSUPP, fuse.EOPNOTSUPP},
 		{"ELOOP", ELOOP, fuse.ELOOP},
 		{"ENOATTR", ENOATTR, fuse.ENOATTR},
 	}

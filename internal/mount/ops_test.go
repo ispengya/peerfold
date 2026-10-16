@@ -199,7 +199,7 @@ func TestReaddirListsChildrenPlusDots(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("Readdir = %d", code)
 	}
-	want := map[string]bool{"./": true, "../": true, "a.txt": true, "b.txt": true}
+	want := map[string]bool{".": true, "..": true, "a.txt": true, "b.txt": true}
 	for _, n := range names {
 		if !want[n] {
 			t.Errorf("unexpected entry %q", n)
@@ -242,7 +242,7 @@ func TestReaddirOrderIsStable(t *testing.T) {
 		}
 	}
 	// The dots are first, then the names in order.
-	want := []string{"./", "../", "a", "b", "c", "d"}
+	want := []string{".", "..", "a", "b", "c", "d"}
 	for i := range want {
 		if i >= len(first) || first[i] != want[i] {
 			t.Fatalf("listing = %v, want %v", first, want)
@@ -304,7 +304,7 @@ func TestReaddirDotsHaveNoStat(t *testing.T) {
 
 	seen := map[string]bool{}
 	m.Readdir("/d", func(name string, st *Stat, off int64) bool {
-		if name == "./" || name == "../" {
+		if name == "." || name == ".." {
 			seen[name] = true
 			if st != nil {
 				t.Errorf("%s carried a stat, want nil", name)
@@ -314,7 +314,7 @@ func TestReaddirDotsHaveNoStat(t *testing.T) {
 		}
 		return true
 	}, 0, 0)
-	if !seen["./"] || !seen["../"] {
+	if !seen["."] || !seen[".."] {
 		t.Errorf("the dots were not both listed: %v", seen)
 	}
 }
@@ -375,7 +375,7 @@ func TestReaddirEmptyDirectory(t *testing.T) {
 	}, 0, 0); code != 0 {
 		t.Fatalf("Readdir = %d", code)
 	}
-	if len(names) != 2 || names[0] != "./" || names[1] != "../" {
+	if len(names) != 2 || names[0] != "." || names[1] != ".." {
 		t.Errorf("listing = %v, want exactly the dots", names)
 	}
 }

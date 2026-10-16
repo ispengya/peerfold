@@ -2,7 +2,17 @@
 /peerfold
 /peerfold.exe
 
-# Scratch files used to pass multi-line messages to git commit.
+# Local test and diagnostic output. The repository should never publish raw
+# command output, temporary binaries, or e2e traces.
+/.artifacts/
+zz_*.out
+zz_*.err
+zz_*.log
+zz_*.txt
+zz_*.test
+zz_*.exe
+zz_*.ps1
+
 # Scratch files used to pass multi-line messages to git commit.
 commitmsg*
 nobom*

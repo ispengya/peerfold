@@ -292,7 +292,13 @@ func (s *Server) handleConn(conn net.Conn) {
 	// The index is cleared while the name still owns it, before the name is
 	// released. Releasing first would let a successor register in the gap and
 	// have its freshly applied nodes deleted by this handler's cleanup.
+	//
+	// The withdrawal is broadcast while the client is still registered, because
+	// owner loss is a tree change just like a file deletion. Without it a live
+	// viewer's watch channel never closes and a mount can stay mounted forever
+	// after its owner disappears.
 	defer func() {
+		s.broadcastOwnerGone(hb.Name)
 		s.ix.RemoveClient(hb.Name)
 		s.reg.Unregister(hb.Name)
 		// The router link goes last. A request forwarded to a client that is on
@@ -659,6 +665,29 @@ func (s *Server) broadcast(env proto.Envelope) {
 			delete(s.watchers, c)
 		}(c)
 	}
+}
+
+// broadcastOwnerGone tells every watcher that an owner's client tree has been
+// withdrawn.
+//
+// The server removes a disconnected client's index entries immediately, but
+// without an event a connected viewer cannot distinguish that from a tree that
+// is merely unchanged. The tombstone uses the same EventBody shape as a file
+// deletion, with the client name as the path, so every existing consumer can
+// apply it without a new protocol kind.
+func (s *Server) broadcastOwnerGone(name string) {
+	if name == "" {
+		return
+	}
+	s.broadcast(marshalOwnerGone(name))
+}
+
+func marshalOwnerGone(name string) proto.Envelope {
+	body, err := json.Marshal(proto.EventBody{Nodes: []proto.NodeJSON{{Path: name, Kind: uint8(node.KindDeleted)}}})
+	if err != nil {
+		return proto.Envelope{}
+	}
+	return proto.Envelope{Kind: proto.KindEvent, Body: body}
 }
 
 // watch starts recording a viewer connection as a watcher, and returns the

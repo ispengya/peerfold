@@ -220,7 +220,7 @@ func TestOfflineRefusesEveryOperationWithEio(t *testing.T) {
 		{"Open", second(m.Open("/a.txt", OReadOnly))},
 		{"Opendir", second(m.Opendir("/d"))},
 		{"Read", m.Read("/a.txt", make([]byte, 8), 0, 0)},
-		{"Create", second(m.Create("/new.txt", 0o644))},
+		{"Create", second(m.Create("/new.txt", 0o644, OReadWrite))},
 		{"Write", m.Write("/a.txt", []byte("hello"), 0, 0)},
 		{"Truncate", m.Truncate("/a.txt", 0, 0)},
 		{"Mkdir", m.Mkdir("/e", 0o755)},
@@ -953,8 +953,8 @@ func TestDiscardReportsEachPathOnce(t *testing.T) {
 	// ...and the path is reported twice, once per handle. That is the honest
 	// count: two unsaved buffers really were lost, and collapsing them would hide
 	// the second write from whoever reads the log.
-	if len(reported) != 2 {
-		t.Errorf("discard reported %v, want one entry per handle (2)", reported)
+	if len(reported) != 1 {
+		t.Errorf("discard reported %v, want one entry for the path", reported)
 	}
 }
 

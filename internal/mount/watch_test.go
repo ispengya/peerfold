@@ -190,6 +190,28 @@ func TestDeletedEntryIsNotResurrectedByAListing(t *testing.T) {
 
 // ------------------------------------------------------------------- drops
 
+// An owner tombstone is the server saying that a whole client tree has been
+// withdrawn. It must stop the watch, because a live viewer connection would
+// otherwise leave the mount mounted forever after its owner disappeared.
+func TestOwnerWithdrawalEndsTheWatch(t *testing.T) {
+	f := newFakeCaller()
+	f.watchForTest()
+	m := New(f, DefaultOptions())
+	m.startWatch()
+	defer m.stopWatch()
+
+	f.emit(1, node.Node{Path: "owner", Kind: node.KindDeleted})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if m.disconnected() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("an owner tombstone did not mark the mount disconnected; the supervisor never starts and the mount never unmounts")
+}
+
 // The whole point of counting events: if the transport drops some, nothing else
 // in the system notices, because a drop is not an error.
 func TestASequenceGapIsDetected(t *testing.T) {

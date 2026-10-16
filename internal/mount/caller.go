@@ -144,6 +144,12 @@ type Mount struct {
 	// would resurrect it.
 	events map[string]node.Node
 
+	// pendingPaths records names this mount itself created but whose owning
+	// client has not pushed them back yet. It exists only for the adapter's
+	// immediate post-create lookup; every other path still resolves through the
+	// caller.
+	pendingPaths map[string]struct{}
+
 	// lastSeq is the sequence number of the last numbered batch. A jump means the
 	// transport dropped events, which is what isStale records.
 	lastSeq uint64
@@ -195,12 +201,13 @@ type Mount struct {
 // reaches the owner.
 func New(caller Caller, opts Options) *Mount {
 	return &Mount{
-		caller: caller,
-		opts:   opts,
-		files:  map[uint64]*openFile{},
-		cache:  newChunkCache(opts.BufferLimit, opts.BufferTotal),
-		events: map[string]node.Node{},
-		handed: map[string]struct{}{},
+		caller:       caller,
+		opts:         opts,
+		files:        map[uint64]*openFile{},
+		cache:        newChunkCache(opts.BufferLimit, opts.BufferTotal),
+		events:       map[string]node.Node{},
+		pendingPaths: map[string]struct{}{},
+		handed:       map[string]struct{}{},
 	}
 }
 

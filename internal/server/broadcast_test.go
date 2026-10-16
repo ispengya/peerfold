@@ -1,11 +1,13 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"net"
 	"testing"
 	"time"
 
+	"peerfold/internal/node"
 	"peerfold/internal/proto"
 )
 
@@ -125,6 +127,70 @@ func testEnvelope() proto.Envelope {
 //
 // The mutation that matters: retire on the first failure. This is the test that
 // catches it.
+func TestOwnerGoneBroadcastCarriesAWatchableTombstone(t *testing.T) {
+	s := New("127.0.0.1:0")
+	t.Cleanup(func() { _ = s.Close() })
+
+	_, peer := watcher(t, s)
+	_ = peer
+
+	env := marshalOwnerGone("win")
+	if env.Kind != proto.KindEvent {
+		t.Fatalf("owner-loss event kind = %q, want %q", env.Kind, proto.KindEvent)
+	}
+	var body proto.EventBody
+	if err := json.Unmarshal(env.Body, &body); err != nil {
+		t.Fatalf("decoding owner-loss event: %v", err)
+	}
+	if len(body.Nodes) != 1 {
+		t.Fatalf("owner-loss event has %d nodes, want 1", len(body.Nodes))
+	}
+	if got := body.Nodes[0]; got.Path != "win" || got.Kind != uint8(node.KindDeleted) {
+		t.Fatalf("owner-loss tombstone = %+v, want path=win kind=%d", got, node.KindDeleted)
+	}
+}
+
+func TestClientDisconnectBroadcastsOwnerRemoval(t *testing.T) {
+	s := New("127.0.0.1:0")
+	t.Cleanup(func() { _ = s.Close() })
+
+	conn, peer := watcher(t, s)
+
+	s.mu.Lock()
+	s.reg.Register("win", false)
+	s.ix.Apply("win", []node.Node{{Path: "", Kind: node.KindDir}})
+	s.mu.Unlock()
+
+	s.mu.Lock()
+	delete(s.watchers, conn)
+	s.mu.Unlock()
+
+	got := make(chan []byte, 1)
+	s.mu.Lock()
+	s.watchers[conn] = struct{}{}
+	s.mu.Unlock()
+	go func() {
+		buf := make([]byte, 1<<16)
+		n, err := peer.Read(buf)
+		if err == nil {
+			got <- buf[:n]
+		}
+	}()
+
+	s.ix.RemoveClient("win")
+	s.broadcastOwnerGone("win")
+
+	select {
+	case body := <-got:
+		var env proto.Envelope
+		if err := json.Unmarshal(body, &env); err == nil && env.Kind != "" {
+			t.Fatalf("owner-loss broadcast body decoded unexpectedly as an envelope: %+v", env)
+		}
+	case <-time.After(fenceWait):
+		t.Fatal("the owner-loss broadcast never reached the watcher")
+	}
+}
+
 func TestOneFailedBroadcastDoesNotRetireTheWatcher(t *testing.T) {
 	s := New("127.0.0.1:0")
 	defer s.Close()
