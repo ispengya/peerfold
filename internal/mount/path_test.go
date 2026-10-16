@@ -220,6 +220,76 @@ func TestWriteThroughPathSeesAPendingFile(t *testing.T) {
 	}
 }
 
+// A file this mount created but whose owning client has not pushed back yet is
+// a real file, so unlinking it must remove it -- and the name must stop being
+// pending the moment the removal succeeds, or lookup would go on answering for
+// a name that is gone until the client's watcher reported the removal.
+func TestUnlinkClearsThePendingFile(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addDir("/a")
+
+	if fh, code := m.Create("/a/new.txt", 0o644, OReadWrite); code != 0 {
+		t.Fatalf("Create(/a/new.txt) = %d, want 0", code)
+	} else if fh == 0 {
+		t.Fatal("Create returned a zero handle with a zero code")
+	}
+	if code := m.Unlink("/a/new.txt"); code != 0 {
+		t.Fatalf("Unlink(pending file) = %d, want 0", code)
+	}
+	if _, code := m.lookup("/a/new.txt"); code != -ENOENT {
+		t.Errorf("lookup after Unlink = %d, want -ENOENT: the name this mount "+
+			"created and then removed must not stay pending", code)
+	}
+}
+
+// A directory this mount created but whose owning client has not pushed back
+// yet is a real directory, so rmdir must remove it -- and the name must stop
+// being pending the moment the removal succeeds.
+func TestRmdirClearsThePendingDirectory(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addDir("/a")
+
+	if code := m.Mkdir("/a/sub", 0o755); code != 0 {
+		t.Fatalf("Mkdir(/a/sub) = %d, want 0", code)
+	}
+	if code := m.Rmdir("/a/sub"); code != 0 {
+		t.Fatalf("Rmdir(pending directory) = %d, want 0", code)
+	}
+	if _, code := m.lookup("/a/sub"); code != -ENOENT {
+		t.Errorf("lookup after Rmdir = %d, want -ENOENT: the name this mount "+
+			"created and then removed must not stay pending", code)
+	}
+}
+
+// A rename of a name this mount created must move the pending entry with it.
+// Dropping it would put the very window the pending table exists for back in
+// the wrong place: the destination is a real name until the owning client
+// reports the move.
+func TestRenameMovesThePendingEntry(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addDir("/a")
+	f.addDir("/b")
+
+	if fh, code := m.Create("/a/old.txt", 0o644, OReadWrite); code != 0 {
+		t.Fatalf("Create(/a/old.txt) = %d, want 0", code)
+	} else if fh == 0 {
+		t.Fatal("Create returned a zero handle with a zero code")
+	}
+	if code := m.Rename("/a/old.txt", "/b/new.txt"); code != 0 {
+		t.Fatalf("Rename(/a/old.txt -> /b/new.txt) = %d, want 0", code)
+	}
+	if _, code := m.lookup("/a/old.txt"); code != -ENOENT {
+		t.Errorf("lookup(source after Rename) = %d, want -ENOENT", code)
+	}
+	if n, code := m.lookup("/b/new.txt"); code != 0 || n.Kind != node.KindFile {
+		t.Errorf("lookup(destination after Rename) = %+v, %d; want a file and 0: "+
+			"the pending entry has to move with the name", n, code)
+	}
+}
+
 func TestLookupRoot(t *testing.T) {
 	m := newTestMount(t)
 	n, code := m.lookup("/")

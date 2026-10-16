@@ -1176,22 +1176,37 @@ func (m *Mount) Unlink(path string) int {
 		return -EPERM
 	}
 	// The kind is read through kindAt rather than lookup, so that a symlink is
-	// visible instead of being refused with ELOOP.
+	// visible instead of being refused with ELOOP. The pending table is
+	// consulted when the index has no answer: a name this mount just created
+	// is a real file until the owning client reports it, and removing it
+	// through the wire is the same ENOENT the index would give.
 	kind, present := m.kindAt(cleaned)
 	if !present {
-		return -ENOENT
-	}
-	if kind == node.KindDir {
+		m.mu.Lock()
+		pendingKind, pending := m.pendingPaths[cleaned]
+		m.mu.Unlock()
+		if !pending {
+			return -ENOENT
+		}
+		if pendingKind != node.KindFile {
+			return -EISDIR
+		}
+	} else if kind == node.KindDir {
 		return -EISDIR
 	}
 	if code := m.flushPath(cleaned); code != 0 {
 		return code
 	}
-	if err := m.call().Remove(cleaned); err != nil {
+	if err := m.call().Remove(cleaned); err != nil && errnoFor(err) != -ENOENT {
 		return errnoFor(err)
 	}
 	m.mu.Lock()
 	m.dropHandlesFor(cleaned)
+	// A file this mount created is no longer pending under a name that has
+	// been removed. Without this lookup would go on answering for the deleted
+	// name until the owning client's watcher reported the removal, which is
+	// the exact window the tombstone exists to close.
+	delete(m.pendingPaths, cleaned)
 	m.mu.Unlock()
 	return 0
 }
@@ -1288,14 +1303,24 @@ func (m *Mount) Rename(oldPath, newPath string) int {
 	// A name created through this mount may not be in the owner's index yet.
 	// The editor's temp-file rename arrives in that window, and resolving the
 	// source through the wire would report ENOENT even though the caller just
-	// created it.
+	// created it. The wire call below is skipped for the same reason: the
+	// owner does not know either name yet.
 	m.mu.Lock()
-	_, sourcePending := m.pendingPaths[oldClean]
+	sourceKind, sourcePending := m.pendingPaths[oldClean]
+	_, targetIsPending := m.pendingPaths[newClean]
 	m.mu.Unlock()
 	if !sourcePending {
 		if _, present := m.kindAt(oldClean); !present {
 			return -ENOENT
 		}
+	}
+	// The destination must be free or a file. A directory is EISDIR: renaming
+	// a file onto a directory is a refusal on every filesystem. The lookup
+	// below settles whether the name exists at all, and the pending table is
+	// consulted too, because a name this mount just created is a real
+	// directory until the owning client reports it.
+	if n, code := m.lookup(newClean); code == 0 && n.Kind == node.KindDir {
+		return -EISDIR
 	}
 	if _, _, code := m.lookupParent(newClean); code != 0 {
 		return code
@@ -1309,8 +1334,14 @@ func (m *Mount) Rename(oldPath, newPath string) int {
 	if code := m.flushPath(newClean); code != 0 {
 		return code
 	}
-	if err := m.call().Rename(oldClean, newClean); err != nil {
-		return errnoFor(err)
+	// The wire is authoritative for a name it knows. A name this mount just
+	// created is not in the index yet, so the owner cannot rename it either:
+	// asking would be an ENOENT that is the same answer the pending table
+	// already gave, and the local move below is the truth.
+	if !sourcePending && !targetIsPending {
+		if err := m.call().Rename(oldClean, newClean); err != nil {
+			return errnoFor(err)
+		}
 	}
 
 	// Both paths' handles are updated in one lock acquisition, so a concurrent
@@ -1343,7 +1374,13 @@ func (m *Mount) Rename(oldPath, newPath string) int {
 			m.cache.dropOpenLocked(h.fh)
 		}
 	}
+	// The source's name now lives at the destination. A destination this mount
+	// created keeps its own entry only if it was the one being replaced; a
+	// rename onto a free name leaves the destination pending, and dropping it
+	// would put the very window this table exists for back in the wrong place.
+	if sourcePending {
+		m.pendingPaths[newClean] = sourceKind
+	}
 	delete(m.pendingPaths, oldClean)
-	delete(m.pendingPaths, newClean)
 	return 0
 }
