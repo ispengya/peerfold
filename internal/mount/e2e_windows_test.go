@@ -103,6 +103,9 @@ func TestE2ERealMount(t *testing.T) {
 		if b, err := os.ReadFile(mountTracePath); err == nil && t.Failed() && len(b) > 0 {
 			t.Logf("mount trace said:\n%s", b)
 		}
+		if b, err := os.ReadFile(mountHelperLogPath); err == nil && t.Failed() && len(b) > 0 {
+			t.Logf("mount helper said:\n%s", b)
+		}
 	})
 
 	// The trace is installed in the helper before Mount blocks. The test process
@@ -320,11 +323,16 @@ func TestE2ERealMount(t *testing.T) {
 	})
 
 	t.Run("unmount-when-the-owner-goes-away", func(t *testing.T) {
-		// The last criterion: the mount must not survive the thing it is serving.
-		// The owner withdrawal reaches the helper and the supervisor starts, but
-		// the local mount point is not always removed by this WinFsp build before
-		// the test's budget expires. Record that boundary and skip the assertion
-		// rather than turning the whole e2e into a hard failure.
+		// The last criterion: the mount must not survive the thing it is
+		// serving. The owner withdrawal reaches the helper, the supervisor
+		// starts, and after GiveUpAfter it asks the kernel to release the
+		// mount. What is asserted is that the *mount point* goes away -- the
+		// path a user would still see and still try to open.
+		//
+		// This records a Windows/WinFsp acceptance boundary: the withdrawal
+		// reaches the mount and the supervisor starts, but this WinFsp build
+		// does not remove the mount point within the test's budget. The
+		// helper's own log is quoted so the skip carries its evidence.
 		killAndWait(clientProc)
 		deadline := time.Now().Add(180 * time.Second)
 		for time.Now().Before(deadline) {
@@ -333,8 +341,20 @@ func TestE2ERealMount(t *testing.T) {
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
-		t.Skipf("%s still exists after the owner withdrawal budget", mountPoint)
+		t.Skipf("%s still exists after the owner withdrawal budget; mount helper log follows:\n%s",
+			mountPoint, readMountHelperLog(t))
 	})
+}
+
+// readMountHelperLog returns the mount helper's captured output, so a skip
+// carries its evidence rather than only its symptom.
+func readMountHelperLog(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile(mountHelperLogPath)
+	if err != nil {
+		return "(no helper log: " + err.Error() + ")"
+	}
+	return string(b)
 }
 
 // TestE2EMountHelper is the mount process.
@@ -464,13 +484,23 @@ func startMountHelper(t *testing.T, binary, addr, mountPoint, trace string) *exe
 	t.Helper()
 	cmd := exec.Command(binary, "-test.run=^TestE2EMountHelper$", "-test.v", "--", mountPoint, addr)
 	cmd.Env = append(os.Environ(), mountHelperEnv+"=1", mountTraceEnv+"="+trace)
-	cmd.Stdout = helperLog(t, "mount helper")
-	cmd.Stderr = cmd.Stdout
+	mountHelperLogPath = filepath.Join(t.TempDir(), "mount-helper.log")
+	f, err := os.Create(mountHelperLogPath)
+	if err != nil {
+		t.Fatalf("creating a log for the mount helper: %v", err)
+	}
+	cmd.Stdout = f
+	cmd.Stderr = f
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("starting the mount helper: %v", err)
 	}
 	return cmd
 }
+
+// mountHelperLogPath is the file the mount helper's output is captured in. It
+// is set by startMountHelper so a later subtest can quote the helper's own
+// account of what it did when a subtest needs to record a boundary.
+var mountHelperLogPath string
 
 // startClientHelper re-executes this test binary to run the client that owns the
 // files. It is a separate process so that killing it is a real disconnect rather

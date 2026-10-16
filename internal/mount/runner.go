@@ -94,12 +94,22 @@ func (r *Runner) Run(ctx context.Context) error {
 	// second time.
 	defer m.flushAllHandles()
 
-	if r.Reconnect != nil {
-		// The supervisor unmounts by itself once the owner has been gone for
-		// Opts.GiveUpAfter, and that is what the hook is for: this layer does not
-		// know what unmounting is, and the core does not want to.
-		m.onGiveUp = func() { host.Unmount() }
+	// The supervisor unmounts by itself once the owner has been gone for
+	// Opts.GiveUpAfter, and that is what the hook is for: this layer does not
+	// know what unmounting is, and the core does not want to. The hook is
+	// installed regardless of whether a redialler exists, so a mount with no
+	// way back never survives its owner as a log line with a mount point still
+	// attached to it.
+	//
+	// The bool is logged rather than dropped: a false means the kernel refused
+	// the release, which is the difference between a mount that went away and a
+	// mount that is still there holding a path every program will now block on.
+	m.onGiveUp = func() {
+		log.Printf("mount: releasing %s; the kernel answered %t",
+			r.Mount, host.Unmount())
+	}
 
+	if r.Reconnect != nil {
 		// supervise is only meaningful once the connection is actually gone, and
 		// there is no event for "it just died" that this layer can subscribe to --
 		// the watch loop discovers it and sets the flag. Polling for the flag is
@@ -110,6 +120,8 @@ func (r *Runner) Run(ctx context.Context) error {
 			for {
 				time.Sleep(100 * time.Millisecond)
 				if m.disconnected() {
+					log.Printf("mount: %s is disconnected; the supervisor is retrying "+
+						"the connection", r.Mount)
 					m.supervise(r.Reconnect, r.Opts.GiveUpAfter)
 					return
 				}
@@ -145,7 +157,9 @@ func (r *Runner) Run(ctx context.Context) error {
 	// Mount blocks here until the filesystem goes away. File IO has to come from
 	// another process while this is running: a read of the mount point from this
 	// process deadlocks, because the request would need this goroutine to serve
-	// it.
+	// it. What "goes away" means is the platform's: WinFsp removes the mount
+	// point itself, and the return value is how this layer learns the kernel is
+	// no longer asking.
 	if !host.Mount(r.Mount, mountArgs(r.Opts)) {
 		return errStr("mount: " + r.Mount + " could not be mounted")
 	}

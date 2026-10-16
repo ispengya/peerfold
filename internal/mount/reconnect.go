@@ -76,6 +76,7 @@ func (m *Mount) supervise(rc Reconnector, giveUp time.Duration) {
 	if wait <= 0 {
 		wait = time.Millisecond
 	}
+	log.Printf("mount: the supervisor will retry the connection for %v", giveUp)
 
 	for {
 		c, err := rc()
@@ -128,7 +129,14 @@ func (m *Mount) gaveUp(last error) {
 	m.mu.Unlock()
 	if hook != nil {
 		hook()
+		return
 	}
+	// A Mount built by a test has no host, and a Runner that never wired the
+	// hook is the same shape. Without this the give-up is a log line and the
+	// mount point stays mounted, which is the failure this whole path exists
+	// to prevent.
+	log.Printf("mount: nothing is installed to release the mount point; it will " +
+		"stay mounted until this process exits")
 }
 
 // adopt installs a reconnected caller and makes the mount describe it.
