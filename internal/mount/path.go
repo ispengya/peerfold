@@ -148,6 +148,34 @@ func (m *Mount) lookup(p string) (node.Node, int) {
 		}
 		return n, 0
 	}
+	if n, ok := m.pendingNode(cleaned); ok {
+		// This name was created by this mount and the owning client has not
+		// reported it back yet. The index does not know it, but Windows is
+		// already using it: a fresh Mkdir or Create is revalidated by the
+		// kernel before the client's watcher has had a chance to push the new
+		// node to the server. Answering ENOENT here makes the first child
+		// create in a just-made directory fail with a path that looks missing,
+		// even though the caller just made it. The index stays authoritative
+		// everywhere else; this covers only the window the mount itself owns.
+		//
+		// The parent still has to resolve, for the same reason a parent has to
+		// resolve everywhere else: the index answers ENOENT for a path whose
+		// parent does not exist, and a pending name must not override that.
+		if parent, _, err := SplitParent(cleaned); err == nil {
+			if _, code := m.lookup(parent); code != 0 {
+				if code == -ENOTDIR {
+					// A component of the parent path is a file, so this path
+					// sits beneath a file. The index answers ENOENT for that,
+					// because it inspects only the node at each path; the two
+					// answers describe the same situation, and ENOTDIR is the
+					// one that tells the caller what is actually wrong.
+					code = -ENOENT
+				}
+				return node.Node{}, code
+			}
+		}
+		return n, 0
+	}
 	parent, base, err := SplitParent(cleaned)
 	if err != nil {
 		return node.Node{}, -EINVAL
@@ -181,6 +209,25 @@ func (m *Mount) lookup(p string) (node.Node, int) {
 	// successfully, so the parent is a real directory and the name is simply
 	// absent.
 	return node.Node{}, -ENOENT
+}
+
+// pendingNode reports whether this path is a name the mount itself created but
+// whose owning client has not pushed back yet, and what it is.
+//
+// It is deliberately separate from pendingCreate/pendingDirectory in ops.go:
+// those exist for the adapter's immediate post-create callbacks and are keyed
+// on "a handle is open here"; this one is about the *path*, and is consulted by
+// lookup, which every resolving operation shares. A name is a directory if it
+// was made with Mkdir and a file if it was made with Create; the two are not
+// both recorded, so the answer cannot be ambiguous.
+func (m *Mount) pendingNode(cleaned string) (node.Node, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	kind, ok := m.pendingPaths[cleaned]
+	if !ok {
+		return node.Node{}, false
+	}
+	return node.Node{Path: cleaned, Kind: kind}, true
 }
 
 // childNamed finds the child whose base name is name.

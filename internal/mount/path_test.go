@@ -75,6 +75,151 @@ func TestLookupMissingAndNotDir(t *testing.T) {
 	}
 }
 
+// A name this mount created but whose owning client has not pushed back yet is
+// not in the index, but it is a real directory in the namespace Windows is
+// already using. Windows revalidates the new path -- and every path beneath it
+// -- immediately after Mkdir succeeds, before the client's watcher has had a
+// chance to report the new node to the server. Answering ENOENT there makes the
+// first child create in a freshly created directory fail with a path that looks
+// missing, even though the caller just created it.
+func TestLookupSeesAPendingDirectory(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addDir("/a")
+
+	if code := m.Mkdir("/a/sub", 0o755); code != 0 {
+		t.Fatalf("Mkdir(/a/sub) = %d, want 0", code)
+	}
+
+	if n, code := m.lookup("/a/sub"); code != 0 || n.Kind != node.KindDir {
+		t.Errorf("lookup(pending directory) = %+v, %d; want a directory and 0", n, code)
+	}
+	// The pending name is a real directory, so a path beneath it is a path
+	// beneath a directory -- the same walk the index would answer once the
+	// owner's push arrived.
+	if _, code := m.lookup("/a/sub/child.txt"); code != -ENOENT {
+		t.Errorf("lookup(child of pending directory) = %d, want -ENOENT for the "+
+			"missing child itself, not for its (existing) parent", code)
+	}
+	// A name that is genuinely absent under the pending directory is still
+	// ENOENT, so the pending window does not invent entries.
+	if _, code := m.lookup("/a/sub/deeper/nope.txt"); code != -ENOENT {
+		t.Errorf("lookup(missing child of pending directory) = %d, want -ENOENT", code)
+	}
+}
+
+// A name this mount created but whose owning client has not pushed back yet is
+// a real directory, so listing it must not answer ENOTDIR. The listing is
+// empty because the owner has not reported any children yet, but empty is a
+// directory listing, and ENOTDIR is not.
+func TestReaddirSeesAPendingDirectory(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addDir("/a")
+
+	if code := m.Mkdir("/a/sub", 0o755); code != 0 {
+		t.Fatalf("Mkdir(/a/sub) = %d, want 0", code)
+	}
+
+	var names []string
+	if code := m.Readdir("/a/sub", func(name string, st *Stat, off int64) bool {
+		names = append(names, name)
+		return true
+	}, 0, 0); code != 0 {
+		t.Errorf("Readdir(pending directory) = %d, want 0", code)
+	}
+	if len(names) != 2 || names[0] != "." || names[1] != ".." {
+		t.Errorf("Readdir(pending directory) = %v, want the two dot entries and "+
+			"nothing else: the owner has not reported any children yet", names)
+	}
+}
+
+// A file this mount created but whose owning client has not pushed back yet is
+// a real file in the namespace Windows is already using. Windows revalidates
+// the new path immediately after Create succeeds, before the client's watcher
+// has reported it; answering ENOENT there makes the open appear not to exist
+// even though Create succeeded a moment ago.
+func TestOpenSeesAPendingFile(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addDir("/a")
+
+	if fh, code := m.Create("/a/new.txt", 0o644, OReadWrite); code != 0 {
+		t.Fatalf("Create(/a/new.txt) = %d, want 0", code)
+	} else if fh == 0 {
+		t.Fatal("Create returned a zero handle with a zero code")
+	}
+
+	if fh, code := m.Open("/a/new.txt", OReadOnly); code != 0 {
+		t.Errorf("Open(pending file) = %d, want 0: the name this mount just "+
+			"created is a real file until the owner's push arrives", code)
+	} else if fh == 0 {
+		t.Error("Open returned a zero handle with a zero code")
+	}
+	// The pending name is a real file, so a path beneath it is a path beneath a
+	// file, and ENOTDIR is the answer -- the same as for a file the index knows
+	// about.
+	if _, code := m.Open("/a/new.txt/child", OReadOnly); code != -ENOTDIR {
+		t.Errorf("Open(beneath a pending file) = %d, want -ENOTDIR", code)
+	}
+	// A name that is genuinely absent is still ENOENT, so the pending window
+	// does not invent files.
+	if _, code := m.Open("/a/still-missing.txt", OReadOnly); code != -ENOENT {
+		t.Errorf("Open(missing file) = %d, want -ENOENT", code)
+	}
+}
+
+// A file this mount created but whose owning client has not pushed back yet is
+// a real file, so a stat must not answer ENOENT. Windows asks for attributes
+// immediately after Create, and ENOENT there makes the whole open appear not to
+// exist even though Create succeeded.
+func TestGetattrSeesAPendingFile(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addDir("/a")
+
+	if fh, code := m.Create("/a/new.txt", 0o644, OReadWrite); code != 0 {
+		t.Fatalf("Create(/a/new.txt) = %d, want 0", code)
+	} else if fh == 0 {
+		t.Fatal("Create returned a zero handle with a zero code")
+	}
+
+	var st Stat
+	if code := m.Getattr("/a/new.txt", &st, 0); code != 0 {
+		t.Errorf("Getattr(pending file) = %d, want 0", code)
+	}
+	if st.Size != 0 || st.Mode&modeTypeMask != modeRegular {
+		t.Errorf("Getattr(pending file) = %+v, want an empty regular file", st)
+	}
+}
+
+// A file this mount created but whose owning client has not pushed back yet is
+// a real file, so writing to it by path -- which cgofuse can deliver after a
+// connection was replaced -- must not answer ENOENT.
+func TestWriteThroughPathSeesAPendingFile(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addDir("/a")
+
+	if fh, code := m.Create("/a/new.txt", 0o644, OReadWrite); code != 0 {
+		t.Fatalf("Create(/a/new.txt) = %d, want 0", code)
+	} else if fh == 0 {
+		t.Fatal("Create returned a zero handle with a zero code")
+	}
+
+	// The write arrives with a handle the mount does not recognise -- which is
+	// what cgofuse delivers after a connection was replaced, and the reason the
+	// path fallback exists. The directory sentinel (noHandle) is deliberately
+	// not that case: it has no path to resolve and is refused with EBADF by
+	// TestWriteWithNoHandleForAPendingDirectoryIsRefused.
+	if n := m.Write("/a/new.txt", []byte("hello"), 0, 9999); n != 5 {
+		t.Errorf("Write(pending file, unknown handle) = %d, want 5", n)
+	}
+	if got := f.data["/a/new.txt"]; string(got) != "hello" {
+		t.Errorf("the owner's copy is %q, want %q", got, "hello")
+	}
+}
+
 func TestLookupRoot(t *testing.T) {
 	m := newTestMount(t)
 	n, code := m.lookup("/")

@@ -131,6 +131,13 @@ func (m *Mount) Getattr(path string, st *Stat, fh uint64) int {
 	if code != 0 {
 		return code
 	}
+	// The index does not carry a mode beyond the type, and Windows refuses an
+	// open whose reported mode lacks the bit the open asked for -- which is how
+	// a file the owner recorded as 0644 became unopenable through the mount.
+	// The owner's own read-only choice is preserved on the owner's disk; the
+	// mount is a federation surface, and every node it reports is readable,
+	// writable and traversable by the caller.
+	n.Mode |= 0o700
 	m.mu.Lock()
 	if h, ok := m.handle(fh); ok && h.dirty {
 		n.Size = h.size
@@ -184,6 +191,12 @@ func (m *Mount) Readdir(path string, fill func(name string, st *Stat, off int64)
 	}
 	for _, c := range children {
 		st := statFor(c)
+		// Every child is reported with owner read, write and execute, the same
+		// widening Getattr applies: Windows refuses an open with access denied
+		// when the reported mode lacks the bit the open asked for, and a
+		// directory listing is where the kernel caches the mode the next open
+		// will be checked against.
+		st.Mode |= 0o700
 		if c.Kind == node.KindSymlink {
 			// Visible, but flagged. The mount layer refuses to open it and a
 			// caller that stats it gets ELOOP, so a listing that passed it off as
@@ -266,10 +279,30 @@ func (m *Mount) Open(path string, mode int) (uint64, int) {
 	}
 	// A directory opened through the file-open callback must be refused before
 	// cgofuse writes a handle into WinFsp's per-open context. Opendir owns
-	// directory handles; Open must not invent one.
+	// directory handles; Open must not invent one. A pending name this mount
+	// just created with Mkdir is a directory even though the index has not
+	// caught up, so the pending table is consulted first.
 	if m.pendingDirectory(cleaned) && m.isDirPath(cleaned) {
 		return 0, -EISDIR
 	}
+	// The parent lookup enforces the shape of the path: a missing parent is
+	// ENOENT and a parent that is a file is ENOTDIR. lookup's own ENOTDIR only
+	// covers the immediate parent, so a path beneath a file further up -- which
+	// the index answers ENOENT for -- is caught here instead, and the two agree
+	// on the answer: this path sits beneath a file. ENOENT is not refused here:
+	// the leaf lookup below settles whether the name exists, and a pending
+	// name's parent resolves through the pending table even though the index
+	// has not caught up.
+	if _, _, code := m.lookupParent(cleaned); code == -ENOTDIR {
+		return 0, code
+	}
+	// The whole path is then resolved, because lookupParent sees only the
+	// parent: a symlink or a directory at the *leaf* is invisible to it. This
+	// is the same call the create and read paths make, so the refusals agree.
+	//
+	// The lookup cannot move after the lock. It lists through the caller, and
+	// holding the mount's lock while waiting on the wire is the deadlock this
+	// package avoids everywhere else.
 	n, code := m.lookup(cleaned)
 	if code != 0 {
 		return 0, code
@@ -568,9 +601,9 @@ func (m *Mount) pendingStat(path string, fh uint64, st *Stat) int {
 	var mode uint32
 	var size int64
 	if ok {
-		mode = modeRegular
+		mode = modeRegular | 0o700
 		if h.kind == node.KindDir {
-			mode = modeDir
+			mode = modeDir | 0o700
 		}
 		size = h.size
 		m.noteInodeLocked(fh, cleaned)
@@ -667,15 +700,18 @@ func (m *Mount) Create(path string, mode uint32, access int) (uint64, int) {
 	if lookupCode == 0 && existing.Kind == node.KindDir {
 		return 0, -EISDIR
 	}
-	if lookupCode == 0 && existing.Kind == node.KindDir {
-		return 0, -EISDIR
-	}
-
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	fh := m.newHandleLocked(cleaned, node.KindFile)
 	h, _ := m.files[fh]
 	h.readOnly = access != OReadWrite
+	if lookupCode != 0 {
+		// The name is not in the index: this is a create, and the new name is
+		// pending until the owning client reports it back. Windows revalidates
+		// it through the mount before that push arrives, and an ENOENT there
+		// makes the open the caller just performed appear not to exist.
+		m.pendingPaths[cleaned] = node.KindFile
+	}
 	if lookupCode == 0 {
 		// The file is already there. The index's size is recorded as both the
 		// current length and the pre-modification length, so a later truncation
@@ -720,10 +756,10 @@ func (m *Mount) Write(path string, buf []byte, off int64, fh uint64) int {
 	h, ok := m.files[fh]
 	if !ok {
 		m.mu.Unlock()
-		// WinFsp can hand the directory's sentinel handle to a write after the
-		// directory was opened without a real file handle. There is no content
-		// to attach that write to, and passing the sentinel into the path
-		// fallback would fail before the path could be resolved.
+		// The directory sentinel WinFsp can hand here has no content and no
+		// path that resolves, so it is the same EBADF a genuinely unknown
+		// handle gets. Every other unknown handle takes the path form, which
+		// is how a write survives a replaced connection.
 		if fh == noHandle {
 			return -EBADF
 		}
@@ -776,13 +812,19 @@ func (m *Mount) writeThroughPath(path string, buf []byte, off int64) int {
 	h, _ := m.files[fh]
 	h.size = n.Size
 	h.contentSize = n.Size
+	_, pending := m.pendingPaths[cleaned]
 	m.mu.Unlock()
-
-	if err := m.loadContent(h); err != nil {
-		m.mu.Lock()
-		m.closeHandle(fh)
-		m.mu.Unlock()
-		return errnoFor(err)
+	// The owner's bytes are loaded so a partial write does not become the whole
+	// file. A name this mount just created has no owner bytes to load -- the
+	// read would fail -- and the empty buffer it would leave behind is exactly
+	// the truth: the write below is the whole of the file.
+	if !pending {
+		if err := m.loadContent(h); err != nil {
+			m.mu.Lock()
+			m.closeHandle(fh)
+			m.mu.Unlock()
+			return errnoFor(err)
+		}
 	}
 
 	m.mu.Lock()
@@ -1062,7 +1104,7 @@ func (m *Mount) Mkdir(path string, mode uint32) int {
 		return errnoFor(err)
 	}
 	m.mu.Lock()
-	m.pendingPaths[cleaned] = struct{}{}
+	m.pendingPaths[cleaned] = node.KindDir
 	m.mu.Unlock()
 	// A new name has appeared, and the kernel may have cached a negative lookup
 	// for it. Invalidating the new path keeps Windows from rejecting the first

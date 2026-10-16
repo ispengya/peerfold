@@ -102,17 +102,21 @@ func intToStat(in *Stat) fuse.Stat_t {
 	t := fuse.NewTimespec(time.Unix(in.Mtime, 0))
 	mode := in.Mode
 	if mode&modeTypeMask == modeDir {
-		// The mount's namespace is writable through the owning client; the owner's
-		// read-only bits do not mean the federation cannot create a child there.
-		// WinFsp checks this bit before it calls Create, so dropping it would turn
-		// every create into an access denial before the operation core ran.
-		mode |= fuse.S_IWUSR
+		// The mount's namespace is writable through the owning client; the
+		// owner's read-only bits do not mean the federation cannot create a
+		// child there.
 	} else if mode&modeTypeMask == 0 {
 		// The root's configured mode is permission bits only, so it carries no
 		// type field. A root reported without S_IFDIR makes Windows treat the
 		// mount point as a file and refuse the whole mount.
-		mode |= fuse.S_IFDIR | fuse.S_IWUSR
+		mode |= fuse.S_IFDIR
 	}
+	// Every node is reported with owner read, write and execute. The owner's
+	// own read-only choice is preserved on the owner's disk; the mount is a
+	// federation surface, and Windows refuses an open with access denied when
+	// the reported mode lacks the bit the open asked for -- which is how a
+	// file whose owner recorded mode 0644 became unopenable through the mount.
+	mode |= fuse.S_IRWXU
 	return fuse.Stat_t{
 		Mode:  mode,
 		Nlink: in.Nlink,

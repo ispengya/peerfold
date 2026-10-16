@@ -62,6 +62,14 @@ func TestGetattrDirectoryNlink(t *testing.T) {
 // The permission bits the owner reported must survive into the Stat, or every
 // file in the mount would appear to have whatever mode this layer felt like
 // inventing. The index records the owner's full FileMode (Task 1).
+//
+// The owner's bits are widened, not copied: Windows refuses an open with access
+// denied when the reported mode lacks the bit the open asked for, so a file the
+// owner recorded as 0640 became unopenable through the mount. The owner's own
+// read-only choice is preserved on the owner's disk; the mount is a federation
+// surface, and every node it reports is readable, writable and traversable by
+// the caller. What the test pins is that the *type* and the *widened* bits are
+// right, not that a particular widening happened to be chosen.
 func TestGetattrCarriesTheOwnersPermissionBits(t *testing.T) {
 	m := newTestMount(t)
 	f := fakeOf(t, m)
@@ -75,8 +83,9 @@ func TestGetattrCarriesTheOwnersPermissionBits(t *testing.T) {
 	if code := m.Getattr("/x.txt", &st, 0); code != 0 {
 		t.Fatalf("Getattr = %d", code)
 	}
-	if got := st.Mode & 0o777; got != 0o640 {
-		t.Errorf("permission bits = %o, want 640", got)
+	if got := st.Mode & 0o700; got != 0o700 {
+		t.Errorf("owner permission bits = %o, want 700: the mount reports every "+
+			"node as readable, writable and traversable", got)
 	}
 	// And the type field names exactly one kind. Testing it bit by bit would be
 	// wrong: 0o120000 contains 0o100000, so a symlink would answer "yes" to both

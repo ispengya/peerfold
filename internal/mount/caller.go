@@ -145,10 +145,12 @@ type Mount struct {
 	events map[string]node.Node
 
 	// pendingPaths records names this mount itself created but whose owning
-	// client has not pushed them back yet. It exists only for the adapter's
-	// immediate post-create lookup; every other path still resolves through the
-	// caller.
-	pendingPaths map[string]struct{}
+	// client has not pushed them back yet, and what each one is. It exists for
+	// the immediate post-create window -- Windows revalidates a new path through
+	// the mount before the client's watcher has reported it to the server -- and
+	// for the adapter's immediate post-create callbacks. Every other path still
+	// resolves through the caller.
+	pendingPaths map[string]node.Kind
 
 	// lastSeq is the sequence number of the last numbered batch. A jump means the
 	// transport dropped events, which is what isStale records.
@@ -206,7 +208,7 @@ func New(caller Caller, opts Options) *Mount {
 		files:        map[uint64]*openFile{},
 		cache:        newChunkCache(opts.BufferLimit, opts.BufferTotal),
 		events:       map[string]node.Node{},
-		pendingPaths: map[string]struct{}{},
+		pendingPaths: map[string]node.Kind{},
 		handed:       map[string]struct{}{},
 	}
 }
