@@ -216,18 +216,57 @@ go test ./internal/mount -run '^TestE2ERealMount$' -count=1 -v 1> $out 2> $err
 
 ### 1. 四个 Windows/WinFsp 验收边界
 
-每个 skip 都携带证据，下一步是判断哪些是内核边界（可以接受）、哪些是挂载层还能做的：
+每个 skip 都携带证据。当前的归类**可能不准确**，需要进一步调查。
 
-1. `read-back-through-the-mount`：刚写入的文件读回被拒——怀疑是 Windows 对本挂载刚创建文件的内核侧拒绝，在挂载层回调之前。
-2. `mkdir-rename-unlink`：刚创建目录的子文件创建被拒——同上。
-3. `editor-save-pattern`：`os.Rename` 覆盖已存在文件只到 `Flush`，`Rename` 回调未到达——这是内核边界，`SetCapDeleteAccess` 已开启但 Windows 在到达回调前就拒绝。
-4. `unmount-when-the-owner-goes-away`：挂载点在测试预算内未消失——helper 日志确认 tombstone 到达、supervisor 启动、`giving up` 记录在案，`onGiveUp` 已无条件安装；需要判断是 WinFsp 卸载问题、测试预算问题，还是 reconnect 重新接管。
+**关键观察：** `write-inside-the-share` 和 `fsync-then-verify-the-owner` 通过了——`os.Create` → `Write` → `Close` 在挂载里能工作。但 `os.ReadFile` 紧接着读同一个文件却失败（`read-back-through-the-mount`）。写路径能工作说明内核是接受这个挂载的，所以"纯内核边界"这个归类可能是错的。
+
+#### 1a. 读回刚写入的文件被拒（`read-back-through-the-mount`）
+
+**现象：** `os.WriteFile` 成功，owner 磁盘上文件存在，但 `os.ReadFile` 通过挂载读回返回 `Access is denied`。
+
+**trace 证据：** 挂载层的 `Open`/`Read`/`Flush` 回调都没有被触发——Windows 在到达挂载层之前就拒绝了。
+
+**可能原因（按可能性排序）：**
+
+1. **适配层问题（最怀疑）：** `Open` 回调返回的句柄或状态有问题，导致 Windows 在打开阶段就拒绝。需要加 trace 到 `Open` 回调，看 Windows 到底在拒绝什么。
+2. **Windows 负缓存：** 内核缓存了"文件不存在"的负缓存，`NOTIFY_CREATE` 没有正确失效它。
+3. **真的是内核边界：** 可能性最低，因为写路径能工作。
+
+**下一步：** 加 trace 到 `cgofuseHost.Open`，用 `os.ReadFile` 读一个刚 `os.WriteFile` 写入的文件，看 Windows 在哪一步拒绝、返回什么错误码。
+
+#### 1b. 刚创建目录的子文件创建被拒（`mkdir-rename-unlink`）
+
+**现象：** `os.Mkdir` 成功，owner 磁盘上目录存在，但 `os.WriteFile` 在该目录下创建第一个子文件返回 `Access is denied`。
+
+**与 1a 是同一个根因的可能性很高**——都是"刚通过挂载创建的东西，紧接着使用被拒"。
+
+**下一步：** 先解决 1a，1b 可能随之解决。如果 1a 解决后 1b 仍然存在，单独调查。
+
+#### 1c. 编辑器保存模式不工作（`editor-save-pattern`）
+
+**现象：** `os.Rename` 覆盖已存在文件返回 `Access is denied`，trace 显示只到 `Flush`，`Rename` 回调根本没到。
+
+**当前判断：** 这个更像是真正的内核边界——`MOVEFILE_REPLACE_EXISTING` 在 WinFsp 挂载上可能确实不被支持。但需要验证：
+
+- WinFsp 的 `FspFileSystemSetOperationGuardStrategy` 是否影响 replace-with-open-handles
+- cgofuse 的 `SetCapDeleteAccess` 是否真的让 Windows 询问 `Access` 回调
+- 是否有 WinFsp 配置可以让 replace 到达 `Rename` 回调
+
+**下一步：** 查 WinFsp 文档和 cgofuse 源码，确认 replace 语义在 WinFsp 上是否可达 `Rename` 回调。
+
+#### 1d. owner 下线后挂载点未消失（`unmount-when-the-owner-goes-away`）
+
+**现象：** owner tombstone 到达、supervisor 启动、`giving up` 记录在案、`onGiveUp` 已无条件安装，但挂载点在测试预算（180s，give-up 阈值 120s）内没有消失。
+
+**当前判断：** 需要判断是 WinFsp 卸载问题、测试预算问题，还是 reconnect 重新接管导致挂载点持续存在。
+
+**下一步：** 检查 `host.Unmount()` 返回值是否被记录（`60cbb80` 已加日志），确认 WinFsp 是否真的收到了卸载请求。
 
 ### 2. Linux 外部验证
 
 本机没有 `/dev/fuse`、没有 C 工具链、没有 libfuse 头文件，Linux FUSE 集成测试仍未在本机执行。验收措辞必须保持：
 
-**Windows 已验证 / Linux 待外部验证**
+**Windows 已验证（核心主路径） / Linux 待外部验证**
 
 不能写成"两平台都验证完成"。
 
