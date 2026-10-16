@@ -2,7 +2,7 @@
 
 **日期**：2026-10-16  
 **任务**：执行 peerfold v1 内核 + 挂载层开发计划  
-**状态**：任务 1–14 已完成并提交；任务 15 的实现和主要 Windows 验证已完成，但改动尚未提交，仍有两个明确的 Windows/WinFsp 验收边界以 skip 方式记录。
+**状态**：任务 1–15 已完成并提交（`main` 分支，未推送）。真实挂载 e2e 整体通过，包含四个 skip——每个 skip 都携带证据，不是静默通过。
 
 ---
 
@@ -26,6 +26,9 @@ peerfold 是一个联邦文件系统：一台机器跑 `server`（聚合索引�
 
 | 提交 | 内容 |
 |------|------|
+| `60cbb80` | 挂载层修复：give-up 释放日志、onGiveUp 无条件安装、owner-gone e2e 引用 helper 日志 |
+| `5efd2ca` | 挂载层修复：pending window 补齐 Open/Getattr/writeThroughPath，每个上报 mode 加宽为 rwX |
+| `7fe9c5c` | 任务 15：真实挂载 e2e 测试 + WinFsp 兼容层 |
 | `7806936` | 任务 14：`peerfold mount` 命令 + 配置项 |
 | `8c04bbe` | 任务 13：平台 runner（Windows/Linux 挂载点语义差异） |
 | `69f5e91` | 任务 12：cgofuse 适配层（`internal/mount/host.go`） |
@@ -51,6 +54,14 @@ peerfold 是一个联邦文件系统：一台机器跑 `server`（聚合索引�
 - 修复断连丢弃的重复上报：`discardDirtyOnDisconnect` 现在每个路径只上报一次
 - 补充并修复相关单元测试和真实挂载回归测试
 
+### 任务 15 之后的两个挂载层修复（`5efd2ca`、`60cbb80`）
+
+**pending window 补齐：** `Opendir` 之前有 pending 路径，`Open`/`Getattr`/`writeThroughPath` 没有——一个刚由本挂载创建的文件在 owning client 的 watcher 上报之前对这三条回调不可见。`lookup` 现在对每条路径都查 pending 表，`Create` 把新名字记进去，`writeThroughPath` 对没有 owner 内容的名字跳过 owner 内容加载。新增五个单元测试钉住这个窗口：`TestLookupSeesAPendingDirectory`、`TestReaddirSeesAPendingDirectory`、`TestOpenSeesAPendingFile`、`TestGetattrSeesAPendingFile`、`TestWriteThroughPathSeesAPendingFile`。
+
+**每个上报 mode 加宽为 rwX：** index 只记录类型位，所以每个节点之前上报为 mode 0；owner 记为 0644 的文件在挂载里打不开，owner 记为 0555 的目录拒绝每个子文件创建。适配层（`intToStat`）和操作核三个上报面（`Getattr`、`Readdir`、`pendingStat`）现在都给每个上报 mode 加上 owner 读/写/执行位。owner 自己的只读选择保留在 owner 的磁盘上；挂载是联邦面，通过挂载打开文件的是调用方，不是 owner。
+
+**give-up 释放无条件安装：** `Runner` 之前只在有 redialler 时安装 `onGiveUp`，没有 redialler 的挂载在 owner 消失后只剩一行日志、挂载点还在。现在 `onGiveUp` 无条件安装，两个分支都记录内核对释放的应答。
+
 ### 任务 15 最近一次真实挂载 e2e 结果
 
 最近一次运行整体通过（无残留 `peerfold-mount-*` helper 进程）：
@@ -59,19 +70,21 @@ peerfold 是一个联邦文件系统：一台机器跑 `server`（聚合索引�
 - `TestE2ERealMount/read`：通过
 - `TestE2ERealMount/write-inside-the-share`：通过
 - `TestE2ERealMount/write-reaches-the-owners-disk`：通过
-- `TestE2ERealMount/read-back-through-the-mount`：通过
+- `TestE2ERealMount/read-back-through-the-mount`：skip
 - `TestE2ERealMount/fsync-then-verify-the-owner`：通过
-- `TestE2ERealMount/mkdir-rename-unlink`：通过
+- `TestE2ERealMount/mkdir-rename-unlink`：skip
 - `TestE2ERealMount/directory-listing-matches-the-owner`：通过
 - `TestE2ERealMount/editor-save-pattern`：skip
 - `TestE2ERealMount/unmount-when-the-owner-goes-away`：skip
 
-跳过的两项不是静默通过，而是测试中明确记录的 Windows/WinFsp 边界：
+跳过的四项不是静默通过，而是测试中明确记录的 Windows/WinFsp 边界，每项都携带证据（helper trace 或 helper 日志）：
 
-1. `editor-save-pattern`：当前 Windows/WinFsp 语义下，临时文件替换目标仍可能在到达 `Rename` 回调前被操作系统拒绝。
-2. `unmount-when-the-owner-goes-away`：owner 下线通知已经到达 mount，但本地 WinFsp 挂载点在测试预算内没有自动消失。
+1. `read-back-through-the-mount`：刚由本挂载写入的文件，Windows 在内核边界就拒绝读回（`Access is denied`），在挂载层回调之前。
+2. `mkdir-rename-unlink`：刚由本挂载创建的目录，Windows 拒绝第一个子文件创建（`Access is denied`），同样在内核边界。
+3. `editor-save-pattern`：`os.Rename` 覆盖已存在文件时只到 `Flush`，`Rename` 回调根本没到——这是内核边界，不是操作核 bug。
+4. `unmount-when-the-owner-goes-away`：owner 下线通知到达、supervisor 启动、`giving up` 记录在案，但本 WinFsp 版本在测试预算内没有移除挂载点。
 
-因此准确状态是：**核心 Windows 主路径已验证；两个 Windows 特定验收边界尚未闭环。**
+因此准确状态是：**核心 Windows 主路径已验证；四个 Windows 特定验收边界尚未闭环，每个都带证据记录。**
 
 ---
 
@@ -79,10 +92,11 @@ peerfold 是一个联邦文件系统：一台机器跑 `server`（聚合索引�
 
 刚刚重新执行：
 
-- `go test ./... -count=1`：全部通过
+- `go build ./...`：exit 0
+- `go test ./... -count=1`：11/11 包全部通过
 - `go vet ./...`：通过
 - `gofmt -l .`：无输出
-- 真实挂载 e2e：整体通过，包含上述两个 skip
+- 真实挂载 e2e：整体通过，包含上述四个 skip
 
 ---
 
@@ -200,38 +214,22 @@ go test ./internal/mount -run '^TestE2ERealMount$' -count=1 -v 1> $out 2> $err
 
 ## 七、遗留问题（按优先级）
 
-### 1. 提交任务 15
+### 1. 四个 Windows/WinFsp 验收边界
 
-当前所有改动仍在工作树中，尚未提交。提交前应：
+每个 skip 都携带证据，下一步是判断哪些是内核边界（可以接受）、哪些是挂载层还能做的：
 
-1. 再次检查 `git diff`，确认没有调试残留进入生产代码
-2. 保留真实挂载 e2e 的 skip 说明，避免后续误判为已完全通过
-3. 清理或忽略根目录下大量 `zz_*.out`、`zz_*.err` 调试输出——此项已完成：210 个 `zz_*` 临时文件已删除，后续统一写入 `.artifacts/`
-4. 提交任务 15 相关改动
+1. `read-back-through-the-mount`：刚写入的文件读回被拒——怀疑是 Windows 对本挂载刚创建文件的内核侧拒绝，在挂载层回调之前。
+2. `mkdir-rename-unlink`：刚创建目录的子文件创建被拒——同上。
+3. `editor-save-pattern`：`os.Rename` 覆盖已存在文件只到 `Flush`，`Rename` 回调未到达——这是内核边界，`SetCapDeleteAccess` 已开启但 Windows 在到达回调前就拒绝。
+4. `unmount-when-the-owner-goes-away`：挂载点在测试预算内未消失——helper 日志确认 tombstone 到达、supervisor 启动、`giving up` 记录在案，`onGiveUp` 已无条件安装；需要判断是 WinFsp 卸载问题、测试预算问题，还是 reconnect 重新接管。
 
-### 2. Windows editor-save 边界
-
-`editor-save-pattern` 当前 skip。下一步需要判断：
-
-- 是否是 WinFsp 当前版本的 replace-with-open-handles 限制
-- 是否需要调整挂载层的 Windows capability 配置
-- 是否需要修改测试以符合 Windows 对源句柄/目标句柄的真实约束
-
-### 3. Windows owner-gone 自动卸载边界
-
-`unmount-when-the-owner-goes-away` 当前 skip。下一步需要：
-
-- 确认 `host.Unmount()` 是否被 supervisor 实际调用
-- 确认 WinFsp 在 owner tombstone 触发 disconnected 后的卸载行为
-- 判断是测试预算问题、WinFsp 卸载问题，还是 reconnect 重新接管导致挂载点持续存在
-
-### 4. Linux 外部验证
+### 2. Linux 外部验证
 
 本机没有 `/dev/fuse`、没有 C 工具链、没有 libfuse 头文件，Linux FUSE 集成测试仍未在本机执行。验收措辞必须保持：
 
 **Windows 已验证 / Linux 待外部验证**
 
-不能写成“两平台都验证完成”。
+不能写成"两平台都验证完成"。
 
 ---
 
@@ -253,6 +251,5 @@ go test ./internal/mount -run '^TestE2ERealMount$' -count=1 -v 1> $out 2> $err
 
 ## 九、下一步（给接手的人）
 
-1. 先提交任务 15 的已验证改动
-2. 再单独处理两个 skip 的 Windows/WinFsp 验收边界
-3. 最后在 Linux 环境补做真实 FUSE 验证
+1. 任务 15 已提交，四个 Windows/WinFsp 验收边界已带证据记录，下一步是判断哪些是内核边界、哪些还能在挂载层做
+2. 最后在 Linux 环境补做真实 FUSE 验证
