@@ -9,6 +9,11 @@ HANDOFF.md
 # Design specs, plans, and local docs. Working documents, not deliverables.
 /docs/
 
+# Tooling and agent skill files. Not part of the project.
+/.agents/
+/.claude/
+skills-lock.json
+
 # Local test and diagnostic output. The repository should never publish raw
 # command output, temporary binaries, or e2e traces.
 /.artifacts/
