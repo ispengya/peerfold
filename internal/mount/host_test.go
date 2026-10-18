@@ -291,6 +291,27 @@ func TestGetattrReportsDirectoriesAsWritable(t *testing.T) {
 	}
 }
 
+// The adapter must widen the mode to owner, group and world together, not just
+// the owner. This mount sets no uid/gid, so WinFsp's user-mode library maps
+// uid=0 to the "Nobody" SID (S-1-5-0) that never matches the caller's token;
+// the only ACE that can grant the caller access is the world (Everyone,
+// S-1-1-0) ACE, which carries the world permission bits. Widening owner alone
+// (0700) leaves the world bits at zero, so an open of a freshly created file is
+// refused with ACCESS_DENIED before any FUSE callback runs.
+func TestIntToStatWidensToWorldReadWriteExecute(t *testing.T) {
+	in := Stat{Mode: modeRegular | 0o600, Size: 1, Mtime: 1700000000, Nlink: 1}
+	st := intToStat(&in)
+	if st.Mode&fuse.S_IRWXU != fuse.S_IRWXU {
+		t.Errorf("owner bits = %o, want rwx", st.Mode&fuse.S_IRWXU)
+	}
+	if st.Mode&fuse.S_IRWXG != fuse.S_IRWXG {
+		t.Errorf("group bits = %o, want rwx", st.Mode&fuse.S_IRWXG)
+	}
+	if st.Mode&fuse.S_IRWXO != fuse.S_IRWXO {
+		t.Errorf("world bits = %o, want rwx: the caller reaches the mount as the world principal", st.Mode&fuse.S_IRWXO)
+	}
+}
+
 // A root without S_IFDIR makes WinFsp reject the entire mount before the
 // filesystem starts, which is why the root's type field must survive the
 // adapter even when its permission bits are configured as a plain 0755.

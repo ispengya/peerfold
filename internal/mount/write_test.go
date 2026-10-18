@@ -50,6 +50,150 @@ func TestCreateOnAnExistingName(t *testing.T) {
 	}
 }
 
+// A newly created file remains pending until the owning client's watcher pushes
+// it back. The real Windows read-back failure was not an isolated read path: the
+// open that wrote the file returned before the server's index had the new name,
+// and the next path lookup had to survive that exact window. This pins the
+// operation core's contract rather than a helper process's timing.
+func TestReadThroughPendingCreateAfterFlush(t *testing.T) {
+	m := newTestMount(t)
+	fh, code := m.Create("/fresh.txt", 0o644, OReadWrite)
+	if code != 0 {
+		t.Fatalf("Create = %d", code)
+	}
+	if n := m.Write("/fresh.txt", []byte("fresh"), 0, fh); n != 5 {
+		t.Fatalf("Write = %d, want 5", n)
+	}
+	if code := m.Flush("/fresh.txt", fh); code != 0 {
+		t.Fatalf("Flush = %d", code)
+	}
+	if code := m.Release("/fresh.txt", fh); code != 0 {
+		t.Fatalf("Release = %d", code)
+	}
+
+	// The watcher has not delivered the index update yet, but the owner's
+	// underlying store now has the bytes. That is the hand-off Windows
+	// revalidates across immediately after a create-and-close.
+	f := fakeOf(t, m)
+	f.addContent("/fresh.txt", []byte("fresh"))
+	if _, code := m.lookup("/fresh.txt"); code != 0 {
+		t.Fatalf("lookup(fresh.txt) = %d, want 0 while the create is pending", code)
+	}
+	buf := make([]byte, 5)
+	if n := m.Read("/fresh.txt", buf, 0, noHandle); n != 5 || string(buf) != "fresh" {
+		t.Fatalf("Read = %d %q, want 5 %q", n, buf, "fresh")
+	}
+}
+
+// The pending-content window must not answer after the owner's watcher has
+// reported the path: the index is authoritative once it has an entry, and a
+// body retained here would keep serving stale bytes after a peer changed the
+// file.
+func TestPendingContentStopsAnsweringAfterTheWatcherReports(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+
+	fh, code := m.Create("/fresh.txt", 0o644, OReadWrite)
+	if code != 0 {
+		t.Fatalf("Create = %d", code)
+	}
+	if n := m.Write("/fresh.txt", []byte("mounted"), 0, fh); n != 7 {
+		t.Fatalf("Write = %d, want 7", n)
+	}
+	if code := m.Flush("/fresh.txt", fh); code != 0 {
+		t.Fatalf("Flush = %d", code)
+	}
+	m.Release("/fresh.txt", fh)
+
+	// The owner and watcher have caught up. The pending body is now stale and
+	// must be dropped, not merely shadowed.
+	f.addContent("/fresh.txt", []byte("owner"))
+	m.applyEvent(Batch{Nodes: []node.Node{{Path: "/fresh.txt", Kind: node.KindFile, Size: 5}}})
+
+	m.mu.Lock()
+	_, stillPendingContent := m.pendingContent["/fresh.txt"]
+	_, stillPendingPath := m.pendingPaths["/fresh.txt"]
+	m.mu.Unlock()
+	if stillPendingContent || stillPendingPath {
+		t.Fatalf("pending state survived the watcher event: paths=%v content=%v", m.pendingPaths, m.pendingContent)
+	}
+
+	buf := make([]byte, 5)
+	if n := m.Read("/fresh.txt", buf, 0, noHandle); n != 5 || string(buf) != "owner" {
+		t.Fatalf("Read = %d %q, want the watcher's 5 %q", n, buf, "owner")
+	}
+}
+
+// Windows can re-open a just-created path before its owning client's watcher
+// reports the index update. The second write must carry the first upload forward,
+// or the next whole-file Put would replace the file with only the second write.
+func TestCreateSeedsAPendingNameFromTheLastUpload(t *testing.T) {
+	m := newTestMount(t)
+	fh, code := m.Create("/fresh.txt", 0o644, OReadWrite)
+	if code != 0 {
+		t.Fatalf("Create = %d", code)
+	}
+	if n := m.Write("/fresh.txt", []byte("first"), 0, fh); n != 5 {
+		t.Fatalf("Write = %d, want 5", n)
+	}
+	if code := m.Flush("/fresh.txt", fh); code != 0 {
+		t.Fatalf("Flush = %d", code)
+	}
+	m.Release("/fresh.txt", fh)
+
+	reopened, code := m.Create("/fresh.txt", 0o644, OReadWrite)
+	if code != 0 {
+		t.Fatalf("re-Create = %d", code)
+	}
+	h, ok := m.handle(reopened)
+	if !ok {
+		t.Fatal("re-Create returned a handle that does not exist")
+	}
+	if got := h.content(); string(got) != "first" {
+		t.Fatalf("reopened buffer = %q, want %q", got, "first")
+	}
+}
+
+func TestPendingCreateReadsBackAndExtendsWithoutTheIndex(t *testing.T) {
+	m := newTestMount(t)
+	fh, code := m.Create("/fresh.txt", 0o644, OReadWrite)
+	if code != 0 {
+		t.Fatalf("Create = %d", code)
+	}
+	if n := m.Write("/fresh.txt", []byte("first"), 0, fh); n != 5 {
+		t.Fatalf("first Write = %d, want 5", n)
+	}
+	if code := m.Flush("/fresh.txt", fh); code != 0 {
+		t.Fatalf("Flush = %d", code)
+	}
+	m.Release("/fresh.txt", fh)
+
+	buf := make([]byte, 5)
+	if n := m.Read("/fresh.txt", buf, 0, noHandle); n != 5 || string(buf) != "first" {
+		t.Fatalf("read-back = %d %q, want 5 %q", n, buf, "first")
+	}
+
+	fh2, code := m.Create("/fresh.txt", 0o644, OReadWrite)
+	if code != 0 {
+		t.Fatalf("second Create = %d", code)
+	}
+	if n := m.Write("/fresh.txt", []byte("x"), 5, fh2); n != 1 {
+		t.Fatalf("second Write = %d, want 1", n)
+	}
+	if code := m.Flush("/fresh.txt", fh2); code != 0 {
+		t.Fatalf("second Flush = %d", code)
+	}
+	m.Release("/fresh.txt", fh2)
+
+	f := fakeOf(t, m)
+	f.mu.Lock()
+	body := append([]byte(nil), f.data["/fresh.txt"]...)
+	f.mu.Unlock()
+	if string(body) != "firstx" {
+		t.Fatalf("owner body = %q, want %q", body, "firstx")
+	}
+}
+
 func TestCreateOnSymlinkIsElooped(t *testing.T) {
 	m := newTestMount(t)
 	fakeOf(t, m).addSymlink("/link")

@@ -115,9 +115,15 @@ func (m *Mount) watchLoop(done chan struct{}, exited chan struct{}) {
 			default:
 			}
 			if m.applyEvent(b) {
-				m.setDisconnected(true)
-				log.Printf("mount: the server withdrew an owner's tree; the tree is " +
-					"stale until a reconnect")
+				// An owner tombstone is not a lost connection: the server is still
+				// reachable, it has simply withdrawn the one tree this mount serves.
+				// A reconnect would succeed and leave the mount up with nothing to
+				// serve, so the response is to release the mount point rather than
+				// retry. It is deliberately not setDisconnected, which is the signal
+				// the reconnect supervisor polls for.
+				log.Printf("mount: the server withdrew an owner's tree; the mount " +
+					"point is being released")
+				m.releaseMountPoint()
 				return
 			}
 		}
@@ -155,6 +161,7 @@ func (m *Mount) applyEvent(b Batch) bool {
 	withdrawn := false
 	for _, n := range b.Nodes {
 		delete(m.pendingPaths, n.Path)
+		delete(m.pendingContent, n.Path)
 		if n.Kind == node.KindDeleted {
 			// The tombstone is kept rather than the entry being deleted: see the
 			// comment on Mount.events. Deleting it would make the deletion

@@ -111,12 +111,17 @@ func intToStat(in *Stat) fuse.Stat_t {
 		// mount point as a file and refuse the whole mount.
 		mode |= fuse.S_IFDIR
 	}
-	// Every node is reported with owner read, write and execute. The owner's
-	// own read-only choice is preserved on the owner's disk; the mount is a
-	// federation surface, and Windows refuses an open with access denied when
-	// the reported mode lacks the bit the open asked for -- which is how a
-	// file whose owner recorded mode 0644 became unopenable through the mount.
-	mode |= fuse.S_IRWXU
+	// Every node is reported with read, write and execute for owner, group and
+	// world. This mount does not set Uid or Gid, so WinFsp's user-mode library
+	// maps uid=0/gid=0 to a SID (S-1-5-0, "Nobody") that never matches the
+	// caller's token. The only ACE that can grant the caller access is the
+	// world (S-1-1-0, "Everyone") ACE, and it carries the world permission
+	// bits. Widening owner alone to 0700 leaves the world bits at zero, so an
+	// open of a freshly created file is refused with ACCESS_DENIED before it
+	// reaches any FUSE callback. The owner's own read-only choice is preserved
+	// on the owner's disk; the mount is a federation surface, and the caller
+	// goes through it as the world principal.
+	mode |= fuse.S_IRWXU | fuse.S_IRWXG | fuse.S_IRWXO
 	return fuse.Stat_t{
 		Mode:  mode,
 		Nlink: in.Nlink,

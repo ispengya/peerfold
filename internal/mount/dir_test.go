@@ -206,6 +206,44 @@ func TestRenameFile(t *testing.T) {
 	}
 }
 
+// A rename of a name this mount created and flushed must still reach the owner.
+// The pending table tracks "not in the index yet", which is not the same as "the
+// owner does not have it": a flush uploads the bytes, so the owner knows the
+// source and has to be asked to move it. Skipping the wire rename here would
+// leave the owner's tree holding the old name while the mount reports the new
+// one.
+func TestRenameOfAPendingFlushedFileReachesTheOwner(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addDir("/a")
+	f.addDir("/b")
+
+	fh, code := m.Create("/a/old.txt", 0o644, OReadWrite)
+	if code != 0 {
+		t.Fatalf("Create = %d", code)
+	}
+	if n := m.Write("/a/old.txt", []byte("moving"), 0, fh); n != 6 {
+		t.Fatalf("Write = %d, want 6", n)
+	}
+	if code := m.Flush("/a/old.txt", fh); code != 0 {
+		t.Fatalf("Flush = %d", code)
+	}
+	if code := m.Release("/a/old.txt", fh); code != 0 {
+		t.Fatalf("Release = %d", code)
+	}
+	if code := m.Rename("/a/old.txt", "/b/new.txt"); code != 0 {
+		t.Fatalf("Rename = %d", code)
+	}
+	// The owner's tree must hold the destination name and the content, or the
+	// mount and the owner have silently diverged.
+	if got := string(f.data["/b/new.txt"]); got != "moving" {
+		t.Errorf("the owner's /b/new.txt = %q, want moving", got)
+	}
+	if _, ok := f.data["/a/old.txt"]; ok {
+		t.Error("the owner still holds the old name after the rename")
+	}
+}
+
 // The case the design flagged as the one most likely to be missed: an editor
 // writes a temporary file, fsyncs it, renames it over the original, and never
 // releases it before the rename. The content must follow the name.

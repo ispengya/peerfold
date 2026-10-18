@@ -129,6 +129,13 @@ func statFor(n node.Node) Stat {
 func (m *Mount) Getattr(path string, st *Stat, fh uint64) int {
 	n, code := m.lookup(path)
 	if code != 0 {
+		if body, ok := m.pendingContentSnapshot(path); ok {
+			// A pending file may have no index entry yet. Its uploaded body is
+			// the truth until the watcher catches up, so a Getattr immediately
+			// after Flush reports the length Windows expects rather than ENOENT.
+			*st = Stat{Mode: modeRegular | 0o777, Size: int64(len(body)), Mtime: time.Now().Unix(), Nlink: 1}
+			return 0
+		}
 		return code
 	}
 	// The index does not carry a mode beyond the type, and Windows refuses an
@@ -136,8 +143,10 @@ func (m *Mount) Getattr(path string, st *Stat, fh uint64) int {
 	// a file the owner recorded as 0644 became unopenable through the mount.
 	// The owner's own read-only choice is preserved on the owner's disk; the
 	// mount is a federation surface, and every node it reports is readable,
-	// writable and traversable by the caller.
-	n.Mode |= 0o700
+	// writable and traversable by the caller. That is owner, group and world
+	// together, not the owner alone: the adapter does not set uid/gid, so the
+	// caller reaches the mount as the world principal.
+	n.Mode |= 0o777
 	m.mu.Lock()
 	if h, ok := m.handle(fh); ok && h.dirty {
 		n.Size = h.size
@@ -191,12 +200,12 @@ func (m *Mount) Readdir(path string, fill func(name string, st *Stat, off int64)
 	}
 	for _, c := range children {
 		st := statFor(c)
-		// Every child is reported with owner read, write and execute, the same
-		// widening Getattr applies: Windows refuses an open with access denied
-		// when the reported mode lacks the bit the open asked for, and a
-		// directory listing is where the kernel caches the mode the next open
-		// will be checked against.
-		st.Mode |= 0o700
+		// Every child is reported with read, write and execute for owner, group
+		// and world, the same widening Getattr applies: Windows refuses an open
+		// with access denied when the reported mode lacks the bit the open asked
+		// for, and a directory listing is where the kernel caches the mode the
+		// next open will be checked against.
+		st.Mode |= 0o777
 		if c.Kind == node.KindSymlink {
 			// Visible, but flagged. The mount layer refuses to open it and a
 			// caller that stats it gets ELOOP, so a listing that passed it off as
@@ -448,6 +457,15 @@ func (m *Mount) Read(path string, buf []byte, off int64, fh uint64) int {
 	if code != 0 {
 		return code
 	}
+	// A handle that is not dirty can still need the pending body: the path was
+	// uploaded, then Windows re-opened it before the watcher caught up. A dirty
+	// handle already carries its own buffer and is handled below.
+	if body, ok := m.pendingContentSnapshot(t.path); ok && t.kind == node.KindFile && t.content == nil {
+		if off >= int64(len(body)) {
+			return 0
+		}
+		return copy(buf, body[off:])
+	}
 
 	// A directory has no bytes. This is the read path's own check rather than
 	// relying on Open's, because a handle obtained from Opendir reaches here
@@ -572,9 +590,34 @@ func (m *Mount) readTarget(path string, fh uint64) (readSnapshot, int) {
 	}
 	n, code := m.lookup(cleaned)
 	if code != 0 {
+		if body, ok := m.pendingContentSnapshot(cleaned); ok {
+			// The body is already on the owner and the watcher has not caught
+			// up yet. Returning it as the dirty snapshot keeps this read from
+			// trying the stale index path while still honouring the write the
+			// caller just made.
+			return readSnapshot{path: cleaned, kind: node.KindFile, size: int64(len(body)), content: body}, 0
+		}
 		return readSnapshot{}, code
 	}
 	return readSnapshot{path: cleaned, kind: n.Kind, size: n.Size}, 0
+}
+
+// pendingContentSnapshot returns the last whole-file body uploaded for a path
+// this mount has created but whose owning client has not pushed back into the
+// index yet.
+//
+// It is a bounded read-back window, not a second authority: lookup still treats
+// the pending path as the authority for existence and kind, while content that
+// has already reached the owner is kept here so Windows can revalidate the
+// path immediately after Create/Flush without waiting for the watcher round trip.
+func (m *Mount) pendingContentSnapshot(path string) ([]byte, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	body, ok := m.pendingContent[path]
+	if !ok {
+		return nil, false
+	}
+	return append([]byte(nil), body...), true
 }
 
 // pendingStat reports attributes for a path whose handle exists before the
@@ -601,9 +644,9 @@ func (m *Mount) pendingStat(path string, fh uint64, st *Stat) int {
 	var mode uint32
 	var size int64
 	if ok {
-		mode = modeRegular | 0o700
+		mode = modeRegular | 0o777
 		if h.kind == node.KindDir {
-			mode = modeDir | 0o700
+			mode = modeDir | 0o777
 		}
 		size = h.size
 		m.noteInodeLocked(fh, cleaned)
@@ -719,6 +762,16 @@ func (m *Mount) Create(path string, mode uint32, access int) (uint64, int) {
 		h.size = existing.Size
 		h.contentSize = existing.Size
 	}
+	if body, ok := m.pendingContent[cleaned]; ok {
+		// A pending name can be reopened before the watcher catches up. Carry
+		// the last uploaded body into the new handle so a later partial write
+		// does not become the whole file. This is a load rather than a mutation:
+		// the handle stays clean until the caller writes.
+		h.writes[0] = append([]byte(nil), body...)
+		h.size = int64(len(body))
+		h.contentSize = int64(len(body))
+		h.dirtyVersion = h.version
+	}
 	return fh, 0
 }
 
@@ -756,14 +809,14 @@ func (m *Mount) Write(path string, buf []byte, off int64, fh uint64) int {
 	h, ok := m.files[fh]
 	if !ok {
 		m.mu.Unlock()
-		// The directory sentinel WinFsp can hand here has no content and no
-		// path that resolves, so it is the same EBADF a genuinely unknown
-		// handle gets. Every other unknown handle takes the path form, which
-		// is how a write survives a replaced connection.
-		if fh == noHandle {
-			return -EBADF
+		// A path-form write on a name whose index entry has not caught up still
+		// has to become a whole-file upload. writeThroughPath handles that via
+		// the pending table, so the fallback is reached below without holding
+		// the handle lock.
+		if fh != noHandle {
+			return m.writeThroughPath(path, buf, off)
 		}
-		return m.writeThroughPath(path, buf, off)
+		return -EBADF
 	}
 	if h.kind == node.KindDir {
 		m.mu.Unlock()
@@ -801,7 +854,15 @@ func (m *Mount) writeThroughPath(path string, buf []byte, off int64) int {
 	}
 	n, code := m.lookup(cleaned)
 	if code != 0 {
-		return code
+		if body, ok := m.pendingContentSnapshot(cleaned); ok {
+			// The watcher has not delivered the index entry yet, but this
+			// mount already uploaded the whole file. The body is the truth for
+			// this write-through window, so use it instead of failing ENOENT.
+			n = node.Node{Path: cleaned, Kind: node.KindFile, Size: int64(len(body))}
+			code = 0
+		} else {
+			return code
+		}
 	}
 	if n.Kind == node.KindDir {
 		return -EISDIR
@@ -813,6 +874,18 @@ func (m *Mount) writeThroughPath(path string, buf []byte, off int64) int {
 	h.size = n.Size
 	h.contentSize = n.Size
 	_, pending := m.pendingPaths[cleaned]
+	if body, ok := m.pendingContent[cleaned]; ok {
+		// A pending path's owner body, if any, is already known from the last
+		// upload. Seeding from it keeps the next whole-file write bounded to
+		// the bytes this mount just wrote instead of replacing the file with
+		// only the new range.
+		h.writes[0] = append([]byte(nil), body...)
+		h.size = int64(len(body))
+		h.contentSize = int64(len(body))
+		// The buffer now carries the owner's bytes. It is a load, not a
+		// mutation, so the handle stays clean until the caller writes.
+		h.dirtyVersion = h.version
+	}
 	m.mu.Unlock()
 	// The owner's bytes are loaded so a partial write does not become the whole
 	// file. A name this mount just created has no owner bytes to load -- the
@@ -1207,6 +1280,7 @@ func (m *Mount) Unlink(path string) int {
 	// name until the owning client's watcher reported the removal, which is
 	// the exact window the tombstone exists to close.
 	delete(m.pendingPaths, cleaned)
+	delete(m.pendingContent, cleaned)
 	m.mu.Unlock()
 	return 0
 }
@@ -1243,6 +1317,7 @@ func (m *Mount) Rmdir(path string) int {
 		}
 		m.mu.Lock()
 		delete(m.pendingPaths, cleaned)
+		delete(m.pendingContent, cleaned)
 		m.mu.Unlock()
 		return 0
 	}
@@ -1303,11 +1378,11 @@ func (m *Mount) Rename(oldPath, newPath string) int {
 	// A name created through this mount may not be in the owner's index yet.
 	// The editor's temp-file rename arrives in that window, and resolving the
 	// source through the wire would report ENOENT even though the caller just
-	// created it. The wire call below is skipped for the same reason: the
-	// owner does not know either name yet.
+	// created it. The pending table is therefore the authority for a pending
+	// source's existence; the wire is asked only when the source is not pending.
 	m.mu.Lock()
 	sourceKind, sourcePending := m.pendingPaths[oldClean]
-	_, targetIsPending := m.pendingPaths[newClean]
+	_, sourceFlushed := m.pendingContent[oldClean]
 	m.mu.Unlock()
 	if !sourcePending {
 		if _, present := m.kindAt(oldClean); !present {
@@ -1334,11 +1409,14 @@ func (m *Mount) Rename(oldPath, newPath string) int {
 	if code := m.flushPath(newClean); code != 0 {
 		return code
 	}
-	// The wire is authoritative for a name it knows. A name this mount just
-	// created is not in the index yet, so the owner cannot rename it either:
-	// asking would be an ENOENT that is the same answer the pending table
-	// already gave, and the local move below is the truth.
-	if !sourcePending && !targetIsPending {
+	// The wire is authoritative for a name the owner knows. A name in the index
+	// is known; a name this mount created becomes known when its create reaches
+	// the owner, which for a file is its flush -- and the flushes above have
+	// already run. The wire rename is skipped only for a pending file whose
+	// flush has not run: an owner that has genuinely never heard the name, where
+	// the wire would answer ENOENT and the local move below is the truth.
+	sourceOnOwner := !sourcePending || sourceFlushed
+	if sourceOnOwner {
 		if err := m.call().Rename(oldClean, newClean); err != nil {
 			return errnoFor(err)
 		}
@@ -1380,7 +1458,19 @@ func (m *Mount) Rename(oldPath, newPath string) int {
 	// would put the very window this table exists for back in the wrong place.
 	if sourcePending {
 		m.pendingPaths[newClean] = sourceKind
+		if body, ok := m.pendingContent[oldClean]; ok {
+			m.pendingContent[newClean] = append([]byte(nil), body...)
+		} else {
+			delete(m.pendingContent, newClean)
+		}
+	} else {
+		// The source was already in the index, so the destination is now an
+		// indexed name. A pending entry the destination carried -- a name this
+		// mount created that has just been replaced -- is stale and must go.
+		delete(m.pendingPaths, newClean)
+		delete(m.pendingContent, newClean)
 	}
 	delete(m.pendingPaths, oldClean)
+	delete(m.pendingContent, oldClean)
 	return 0
 }

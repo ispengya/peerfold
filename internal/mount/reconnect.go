@@ -115,15 +115,11 @@ func (m *Mount) supervise(rc Reconnector, giveUp time.Duration) {
 	}
 }
 
-// gaveUp unmounts the mount, after saying what the last failure was.
-//
-// The unmount goes through onGiveUp, which the host adapter installs, so this
-// layer does not need to know what unmounting is. A nil hook is tolerated because
-// a Mount built by a test has no host.
-func (m *Mount) gaveUp(last error) {
-	log.Printf("mount: giving up after %v of reconnect attempts; the last failure "+
-		"was %v. The mount point is being released", m.schedule().GiveUp, last)
-
+// releaseMountPoint asks the host to unmount, through the hook the runner
+// installs. It is the single place any give-up becomes an actual unmount, whether
+// the reason is "the server never came back" or "the server withdrew the owner's
+// tree". A nil hook is tolerated because a Mount built by a test has no host.
+func (m *Mount) releaseMountPoint() {
 	m.mu.Lock()
 	hook := m.onGiveUp
 	m.mu.Unlock()
@@ -137,6 +133,14 @@ func (m *Mount) gaveUp(last error) {
 	// to prevent.
 	log.Printf("mount: nothing is installed to release the mount point; it will " +
 		"stay mounted until this process exits")
+}
+
+// gaveUp unmounts the mount after the reconnect budget ran out, saying what the
+// last failure was.
+func (m *Mount) gaveUp(last error) {
+	log.Printf("mount: giving up after %v of reconnect attempts; the last failure "+
+		"was %v. The mount point is being released", m.schedule().GiveUp, last)
+	m.releaseMountPoint()
 }
 
 // adopt installs a reconnected caller and makes the mount describe it.

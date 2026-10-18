@@ -492,8 +492,13 @@ func startMountHelper(t *testing.T, binary, addr, mountPoint, trace string) *exe
 	cmd.Stdout = f
 	cmd.Stderr = f
 	if err := cmd.Start(); err != nil {
+		f.Close()
 		t.Fatalf("starting the mount helper: %v", err)
 	}
+	// The child has inherited its own copy of the handle; the parent's must be
+	// closed or the open handle keeps Windows from deleting the log at TempDir
+	// cleanup ("used by another process").
+	f.Close()
 	return cmd
 }
 

@@ -191,25 +191,30 @@ func TestDeletedEntryIsNotResurrectedByAListing(t *testing.T) {
 // ------------------------------------------------------------------- drops
 
 // An owner tombstone is the server saying that a whole client tree has been
-// withdrawn. It must stop the watch, because a live viewer connection would
-// otherwise leave the mount mounted forever after its owner disappeared.
-func TestOwnerWithdrawalEndsTheWatch(t *testing.T) {
+// withdrawn. It must release the mount point, not mark the connection lost: the
+// server is still reachable, so a reconnect would succeed and leave the mount up
+// with nothing to serve.
+func TestOwnerWithdrawalReleasesTheMount(t *testing.T) {
 	f := newFakeCaller()
 	f.watchForTest()
 	m := New(f, DefaultOptions())
+
+	released := make(chan struct{})
+	m.mu.Lock()
+	m.onGiveUp = func() { close(released) }
+	m.mu.Unlock()
+
 	m.startWatch()
 	defer m.stopWatch()
 
 	f.emit(1, node.Node{Path: "owner", Kind: node.KindDeleted})
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if m.disconnected() {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	select {
+	case <-released:
+	case <-time.After(5 * time.Second):
+		t.Fatal("an owner tombstone did not release the mount; the mount would " +
+			"stay mounted forever after its owner disappeared")
 	}
-	t.Fatal("an owner tombstone did not mark the mount disconnected; the supervisor never starts and the mount never unmounts")
 }
 
 // The whole point of counting events: if the transport drops some, nothing else

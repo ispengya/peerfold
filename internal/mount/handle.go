@@ -197,6 +197,13 @@ func (m *Mount) flush(fh uint64) int {
 	if h2, ok := m.files[fh]; ok {
 		h2.markFlushed(version)
 	}
+	// A pending path's owner body is the last whole-file upload. Keeping it lets
+	// the kernel revalidate the new name immediately after Windows has accepted
+	// the write, without waiting for the client's watcher round trip; the entry
+	// is dropped when the watcher finally reports the path.
+	if _, pending := m.pendingPaths[path]; pending {
+		m.pendingContent[path] = append([]byte(nil), body...)
+	}
 	return 0
 }
 

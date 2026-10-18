@@ -152,6 +152,13 @@ type Mount struct {
 	// resolves through the caller.
 	pendingPaths map[string]node.Kind
 
+	// pendingContent holds the last whole-file body uploaded for a pending file.
+	// It is bounded by the same write limits as ordinary handles and is dropped
+	// when the watcher reports the path or the path is removed. It exists so a
+	// just-created name can be read back immediately after the flush, before the
+	// owner's watcher has updated the index.
+	pendingContent map[string][]byte
+
 	// lastSeq is the sequence number of the last numbered batch. A jump means the
 	// transport dropped events, which is what isStale records.
 	lastSeq uint64
@@ -203,13 +210,14 @@ type Mount struct {
 // reaches the owner.
 func New(caller Caller, opts Options) *Mount {
 	return &Mount{
-		caller:       caller,
-		opts:         opts,
-		files:        map[uint64]*openFile{},
-		cache:        newChunkCache(opts.BufferLimit, opts.BufferTotal),
-		events:       map[string]node.Node{},
-		pendingPaths: map[string]node.Kind{},
-		handed:       map[string]struct{}{},
+		caller:         caller,
+		opts:           opts,
+		files:          map[uint64]*openFile{},
+		cache:          newChunkCache(opts.BufferLimit, opts.BufferTotal),
+		events:         map[string]node.Node{},
+		pendingPaths:   map[string]node.Kind{},
+		pendingContent: map[string][]byte{},
+		handed:         map[string]struct{}{},
 	}
 }
 
