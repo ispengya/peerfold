@@ -46,7 +46,7 @@ if ($confirm -ne 'y' -and $confirm -ne 'Y') {
     exit 0
 }
 
-$total = 7
+$total = 8
 
 # ── [1/6] Processes ──────────────────────────────────────────
 
@@ -121,7 +121,7 @@ if (Test-Path $bin) {
     NotFound $bin
 }
 
-# ── [6/7] Remove from PATH ───────────────────────────────────
+# ── [6/8] Remove from PATH ───────────────────────────────────
 
 Section 6 $total "Remove from system PATH"
 
@@ -134,9 +134,24 @@ if ($userPath -like "*$ProjectRoot*") {
     Ok "Not in PATH"
 }
 
-# ── [7/7] WinFsp ─────────────────────────────────────────────
+# ── [7/8] Remove auto-start entries ─────────────────────────
 
-Section 7 $total "Uninstall WinFsp"
+Section 7 $total "Remove auto-start registrations"
+
+$regBase = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+$peerfoldKeys = Get-ItemProperty -Path $regBase -ErrorAction SilentlyContinue | Get-Member -MemberType NoteProperty | Where-Object { $_.Name -like "peerfold-*" }
+if ($peerfoldKeys) {
+    foreach ($key in $peerfoldKeys) {
+        Remove-ItemProperty -Path $regBase -Name $key.Name -Force -ErrorAction SilentlyContinue
+        Ok "Removed auto-start: $($key.Name)"
+    }
+} else {
+    Ok "No auto-start entries found"
+}
+
+# ── [8/8] WinFsp ─────────────────────────────────────────────
+
+Section 8 $total "Uninstall WinFsp"
 
 $svc = Get-Service "WinFsp.Launcher" -ErrorAction SilentlyContinue
 if ($svc) {
