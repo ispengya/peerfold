@@ -84,9 +84,12 @@ func interactiveServer(in io.Reader, out, errw io.Writer) int {
 		return 0
 	}
 
-	// Foreground — run inline
+	// Foreground — record PID so status can see it, then run inline
+	writePID("server", os.Getpid())
 	fmt.Fprintf(out, "  [OK] Starting server on %s (Ctrl-C to stop)\n\n", listenFlag)
-	return cmdServer([]string{"--listen", listenFlag}, out, errw)
+	code := cmdServer([]string{"--listen", listenFlag}, out, errw)
+	clearPID("server")
+	return code
 }
 
 // interactiveClient guides the user through starting a client.
@@ -175,9 +178,12 @@ func interactiveClient(in io.Reader, out, errw io.Writer) int {
 		return 0
 	}
 
-	// Foreground — run inline
+	// Foreground — record PID so status can see it, then run inline
+	writePID(component, os.Getpid())
 	fmt.Fprintf(out, "  [OK] Starting client '%s' (Ctrl-C to stop)\n\n", cfg.ClientName)
-	return cmdClient(cliArgs[1:], out, errw)
+	code := cmdClient(cliArgs[1:], out, errw)
+	clearPID(component)
+	return code
 }
 
 // findSingleClientConfig finds a single existing client config file.
