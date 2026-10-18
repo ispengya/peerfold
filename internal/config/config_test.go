@@ -106,8 +106,11 @@ func TestConfigPaths(t *testing.T) {
 	if !filepath.IsAbs(serverPath) {
 		t.Fatalf("ServerPath() = %q, want an absolute path", serverPath)
 	}
-	if filepath.Base(serverPath) != "peerfold-server.json" {
-		t.Fatalf("ServerPath() = %q, want it to end in peerfold-server.json", serverPath)
+	if filepath.Base(serverPath) != "config.json" {
+		t.Fatalf("ServerPath() = %q, want it to end in config.json", serverPath)
+	}
+	if got := filepath.Base(filepath.Dir(serverPath)); got != "peerfold-server" {
+		t.Fatalf("ServerPath() = %q, want its parent directory to be %q, got %q", serverPath, "peerfold-server", got)
 	}
 
 	clientPath, err := config.ClientPath("alice")
@@ -117,11 +120,14 @@ func TestConfigPaths(t *testing.T) {
 	if !filepath.IsAbs(clientPath) {
 		t.Fatalf("ClientPath() = %q, want an absolute path", clientPath)
 	}
-	if filepath.Base(clientPath) != "peerfold-client-alice.json" {
-		t.Fatalf("ClientPath() = %q, want it to end in peerfold-client-alice.json", clientPath)
+	if filepath.Base(clientPath) != "config.json" {
+		t.Fatalf("ClientPath() = %q, want it to end in config.json", clientPath)
+	}
+	if got := filepath.Base(filepath.Dir(clientPath)); got != "peerfold-client-alice" {
+		t.Fatalf("ClientPath() = %q, want its parent directory to be %q, got %q", clientPath, "peerfold-client-alice", got)
 	}
 
-	// Two clients get two files, never one shared file.
+	// Two clients get two directories, never one shared directory.
 	other, err := config.ClientPath("bob")
 	if err != nil {
 		t.Fatalf("ClientPath(bob): %v", err)

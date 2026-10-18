@@ -7,21 +7,22 @@ import (
 	"path/filepath"
 )
 
-// Open returns an append-mode file for the named log, creating the per-user
-// peerfold-logs directory on first use. The returned file is the standard log
-// package's output; the caller closes it on exit.
+// Open returns an append-mode file at the given home-relative path, creating the
+// parent directory on first use. The returned file is the standard log package's
+// output; the caller closes it on exit.
 //
-// The name is a bare file name such as "server.log" or "client-alice.log".
-// Everything lives under one directory because the point is a fixed, findable
-// place rather than a hidden one per component.
-func Open(name string) (*os.File, error) {
+// The path is relative to the user's home directory and names both the owning
+// component's directory and the file, e.g. "peerfold-server/log.txt" or
+// "peerfold-client-alice/log.txt". Each component's log therefore lives inside
+// its own directory, next to its config.
+func Open(relPath string) (*os.File, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, err
 	}
-	dir := filepath.Join(home, "peerfold-logs")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	full := filepath.Join(home, relPath)
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 		return nil, err
 	}
-	return os.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	return os.OpenFile(full, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 }

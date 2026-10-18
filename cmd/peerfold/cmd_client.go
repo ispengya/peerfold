@@ -102,7 +102,7 @@ func cmdClient(args []string, stdout, stderr io.Writer) int {
 	// The always-on diagnostic log, one file per client so two clients on one
 	// machine do not write over each other. Like the server's, a failure to open
 	// it is not fatal.
-	if f, err := logging.Open("client-" + clientName + ".log"); err == nil {
+	if f, err := logging.Open("peerfold-client-" + clientName + "/log.txt"); err == nil {
 		log.SetOutput(f)
 		defer f.Close()
 	}

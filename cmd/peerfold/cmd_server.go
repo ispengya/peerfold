@@ -97,7 +97,7 @@ func cmdServerWith(args []string, stdout, stderr io.Writer, interrupt <-chan str
 	// under the user's home, so a run can be reconstructed without a flag. A
 	// failure to open it is not fatal -- the log is a convenience, not a
 	// dependency -- so the server runs on without file logging.
-	if f, err := logging.Open("server.log"); err == nil {
+	if f, err := logging.Open("peerfold-server/log.txt"); err == nil {
 		log.SetOutput(f)
 		defer f.Close()
 	}

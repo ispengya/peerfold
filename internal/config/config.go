@@ -95,22 +95,24 @@ func Save(path string, c Config) error {
 }
 
 // ServerPath returns the config path the server reads its listen address from: a
-// fixed file in the home directory.
+// config.json inside the server's own directory under the home directory.
 func ServerPath() (string, error) {
-	return homePath("peerfold-server.json")
+	return homePath("peerfold-server", "config.json")
 }
 
-// ClientPath returns the config path for the client named name: one file per
-// client, keyed by name, so several clients on one machine do not share a file.
+// ClientPath returns the config path for the client named name: one directory
+// per client, keyed by name, so several clients on one machine do not share a
+// file. The directory also holds the client's log, so everything one client
+// writes lives in one place.
 func ClientPath(name string) (string, error) {
-	return homePath("peerfold-client-" + name + ".json")
+	return homePath("peerfold-client-"+name, "config.json")
 }
 
-// homePath joins a bare file name onto the user's home directory.
-func homePath(name string) (string, error) {
+// homePath joins a directory and file name onto the user's home directory.
+func homePath(dir, name string) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, name), nil
+	return filepath.Join(home, dir, name), nil
 }
