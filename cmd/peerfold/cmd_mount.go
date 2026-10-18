@@ -124,7 +124,7 @@ func mountOptionsFrom(args []string) (mount.Options, string, string, string, err
 	// limits, so the three have to be resolved in one place.
 	path := *cfgPath
 	if path == "" {
-		p, err := config.DefaultPath()
+		p, err := config.ServerPath()
 		if err != nil {
 			return mount.Options{}, "", "", "", fmt.Errorf("locate config: %w", err)
 		}

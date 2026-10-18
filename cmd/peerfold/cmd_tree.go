@@ -44,7 +44,7 @@ func cmdTree(cmd string, args []string, stdin io.Reader, stdout, stderr io.Write
 func connect(cmd, cfgPath string, stderr io.Writer) (*viewer.Viewer, int, bool) {
 	path0 := cfgPath
 	if path0 == "" {
-		p, err := config.DefaultPath()
+		p, err := config.ServerPath()
 		if err != nil {
 			fmt.Fprintf(stderr, "%s: locate config: %v\n", cmd, err)
 			return nil, 1, false

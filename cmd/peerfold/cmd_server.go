@@ -71,7 +71,7 @@ func cmdServerWith(args []string, stdout, stderr io.Writer, interrupt <-chan str
 
 	path := *cfgPath
 	if path == "" {
-		p, err := config.DefaultPath()
+		p, err := config.ServerPath()
 		if err != nil {
 			fmt.Fprintf(stderr, "server: locate config: %v\n", err)
 			return 1

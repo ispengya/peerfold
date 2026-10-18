@@ -78,8 +78,9 @@ func Load(path string) (Config, error) {
 	return c, nil
 }
 
-// Save writes the config file, creating its parent directory if needed:
-// DefaultPath lives under a peerfold/ directory that may not exist yet.
+// Save writes the config file, creating its parent directory if needed: the
+// per-user config paths live directly in the home directory, which exists for a
+// real user but is still created defensively for a bare environment.
 func Save(path string, c Config) error {
 	if dir := filepath.Dir(path); dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -93,11 +94,23 @@ func Save(path string, c Config) error {
 	return os.WriteFile(path, append(b, '\n'), 0o644)
 }
 
-// DefaultPath returns the config path under os.UserConfigDir().
-func DefaultPath() (string, error) {
-	dir, err := os.UserConfigDir()
+// ServerPath returns the config path the server reads its listen address from: a
+// fixed file in the home directory.
+func ServerPath() (string, error) {
+	return homePath("peerfold-server.json")
+}
+
+// ClientPath returns the config path for the client named name: one file per
+// client, keyed by name, so several clients on one machine do not share a file.
+func ClientPath(name string) (string, error) {
+	return homePath("peerfold-client-" + name + ".json")
+}
+
+// homePath joins a bare file name onto the user's home directory.
+func homePath(name string) (string, error) {
+	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "peerfold", "config.json"), nil
+	return filepath.Join(home, name), nil
 }

@@ -17,8 +17,8 @@ func TestConfigDefaultListen(t *testing.T) {
 }
 
 func TestConfigSaveLoadRoundTrip(t *testing.T) {
-	// Parent directory does not exist: DefaultPath() lands under
-	// os.UserConfigDir(), which may not have a peerfold/ directory yet.
+	// Parent directory does not exist yet: Save creates it, and this exercises
+	// that path rather than writing into an existing directory.
 	path := filepath.Join(t.TempDir(), "peerfold", "config.json")
 	want := config.Config{
 		Listen:     ":7000",
@@ -98,18 +98,35 @@ func TestConfigLoadMissing(t *testing.T) {
 	}
 }
 
-func TestConfigDefaultPath(t *testing.T) {
-	p, err := config.DefaultPath()
+func TestConfigPaths(t *testing.T) {
+	serverPath, err := config.ServerPath()
 	if err != nil {
-		t.Fatalf("DefaultPath(): %v", err)
+		t.Fatalf("ServerPath(): %v", err)
 	}
-	if !filepath.IsAbs(p) {
-		t.Fatalf("DefaultPath() = %q, want an absolute path", p)
+	if !filepath.IsAbs(serverPath) {
+		t.Fatalf("ServerPath() = %q, want an absolute path", serverPath)
 	}
-	if filepath.Base(p) != "config.json" {
-		t.Fatalf("DefaultPath() = %q, want it to end in config.json", p)
+	if filepath.Base(serverPath) != "peerfold-server.json" {
+		t.Fatalf("ServerPath() = %q, want it to end in peerfold-server.json", serverPath)
 	}
-	if got := filepath.Base(filepath.Dir(p)); got != "peerfold" {
-		t.Fatalf("DefaultPath() = %q, want its parent directory to be %q, got %q", p, "peerfold", got)
+
+	clientPath, err := config.ClientPath("alice")
+	if err != nil {
+		t.Fatalf("ClientPath(): %v", err)
+	}
+	if !filepath.IsAbs(clientPath) {
+		t.Fatalf("ClientPath() = %q, want an absolute path", clientPath)
+	}
+	if filepath.Base(clientPath) != "peerfold-client-alice.json" {
+		t.Fatalf("ClientPath() = %q, want it to end in peerfold-client-alice.json", clientPath)
+	}
+
+	// Two clients get two files, never one shared file.
+	other, err := config.ClientPath("bob")
+	if err != nil {
+		t.Fatalf("ClientPath(bob): %v", err)
+	}
+	if other == clientPath {
+		t.Fatalf("ClientPath(alice) == ClientPath(bob) == %q, want distinct paths", other)
 	}
 }

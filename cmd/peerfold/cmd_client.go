@@ -47,9 +47,22 @@ func cmdClient(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	// The config path is keyed by the client name, so several clients on one
+	// machine each get their own file. The key is the -name flag when given, else
+	// the host name, and it is also the fallback for the client's own name.
+	keyName := *name
+	if keyName == "" {
+		host, err := os.Hostname()
+		if err != nil {
+			fmt.Fprintf(stderr, "client: determine host name: %v\n", err)
+			return 1
+		}
+		keyName = host
+	}
+
 	path := *cfgPath
 	if path == "" {
-		p, err := config.DefaultPath()
+		p, err := config.ClientPath(keyName)
 		if err != nil {
 			fmt.Fprintf(stderr, "client: locate config: %v\n", err)
 			return 1
@@ -82,12 +95,7 @@ func cmdClient(args []string, stdout, stderr io.Writer) int {
 
 	clientName := cfg.ClientName
 	if clientName == "" {
-		host, err := os.Hostname()
-		if err != nil {
-			fmt.Fprintf(stderr, "client: determine host name: %v\n", err)
-			return 1
-		}
-		clientName = host
+		clientName = keyName
 		cfg.ClientName = clientName
 	}
 
