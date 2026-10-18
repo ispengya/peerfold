@@ -2,6 +2,7 @@ package mount
 
 import (
 	"log"
+	"path"
 	"strings"
 
 	"peerfold/internal/node"
@@ -115,13 +116,22 @@ func (m *Mount) watchLoop(done chan struct{}, exited chan struct{}) {
 			default:
 			}
 			if m.applyEvent(b) {
-				// An owner tombstone is not a lost connection: the server is still
-				// reachable, it has simply withdrawn the one tree this mount serves.
-				// A reconnect would succeed and leave the mount up with nothing to
-				// serve, so the response is to release the mount point rather than
-				// retry. It is deliberately not setDisconnected, which is the signal
-				// the reconnect supervisor polls for.
-				log.Printf("mount: the server withdrew an owner's tree; the mount " +
+				if m.anyOwnerRemains() {
+					// One owner's tree is gone, but another owner remains. The
+					// server is still reachable and still has something to serve, so
+					// the mount stays up and keeps watching. The withdrawn subtree is
+					// already shadowed by the tombstone in the event table, and the
+					// kernel's entry timeout revalidates the rest on its own.
+					log.Printf("mount: an owner's tree was withdrawn; serving the " +
+						"remaining owners")
+					continue
+				}
+				// The last owner's tree is gone. A reconnect would succeed against
+				// the still-live server and leave the mount up with nothing to serve,
+				// so the response is to release the mount point rather than retry. It
+				// is deliberately not setDisconnected, which is the signal the
+				// reconnect supervisor polls for.
+				log.Printf("mount: the last owner's tree was withdrawn; the mount " +
 					"point is being released")
 				m.releaseMountPoint()
 				return
@@ -176,6 +186,32 @@ func (m *Mount) applyEvent(b Batch) bool {
 		m.events[n.Path] = n
 	}
 	return withdrawn
+}
+
+// anyOwnerRemains reports whether the federation still has a live owner to
+// serve. It lists the root and discards any name this mount has already been told
+// is gone, so the answer is right even while the server is still removing the
+// withdrawn owner from its own index. It is how the watch loop decides, when one
+// owner's tree is withdrawn, whether that owner was the last.
+//
+// A list that fails is treated as "owners remain": a transient wire error is not
+// evidence the tree is empty, and if the server really is gone the watch channel
+// closes and the reconnect path takes over.
+func (m *Mount) anyOwnerRemains() bool {
+	children, err := m.call().List("/")
+	if err != nil {
+		return true
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, c := range children {
+		name := path.Base(c.Path)
+		if ev, ok := m.events[name]; ok && ev.Kind == node.KindDeleted {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // eventFor returns this mount's most recent information about a path, if any.

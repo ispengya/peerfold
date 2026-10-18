@@ -217,6 +217,44 @@ func TestOwnerWithdrawalReleasesTheMount(t *testing.T) {
 	}
 }
 
+// A tombstone for one owner must not take down a mount that is still serving
+// another. The mount is a view of the whole federation, not of one client; only
+// when the last owner's tree is withdrawn is there nothing left to serve.
+func TestOwnerWithdrawalKeepsServingOtherOwners(t *testing.T) {
+	f := newFakeCaller()
+	f.addDir("/alice")
+	f.addDir("/bob")
+	f.watchForTest()
+	m := New(f, DefaultOptions())
+
+	released := make(chan struct{})
+	m.mu.Lock()
+	m.onGiveUp = func() { close(released) }
+	m.mu.Unlock()
+
+	m.startWatch()
+	defer m.stopWatch()
+
+	// One owner goes away; the other still has a tree.
+	f.emit(1, node.Node{Path: "alice", Kind: node.KindDeleted})
+
+	select {
+	case <-released:
+		t.Fatal("the mount released after one owner's tombstone, although another " +
+			"owner is still being served")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// The last owner goes away, and now nothing is left to serve.
+	f.emit(2, node.Node{Path: "bob", Kind: node.KindDeleted})
+
+	select {
+	case <-released:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the mount did not release after the last owner's tree was withdrawn")
+	}
+}
+
 // The whole point of counting events: if the transport drops some, nothing else
 // in the system notices, because a drop is not an error.
 func TestASequenceGapIsDetected(t *testing.T) {
