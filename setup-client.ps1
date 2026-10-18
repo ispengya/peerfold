@@ -85,7 +85,7 @@ function BuildBinary {
 
 Header
 
-$total = 6
+$total = 5
 
 # ── [1/5] Go ─────────────────────────────────────────────────
 
@@ -159,7 +159,7 @@ if (Test-Path $BinPath) {
     }
 }
 
-# ── [4/6] Add to PATH ────────────────────────────────────────
+# ── [4/5] Add to PATH ────────────────────────────────────────
 
 Section 4 $total "Add to system PATH"
 
@@ -169,12 +169,12 @@ if ($userPath -like "*$ProjectRoot*") {
 } else {
     $newPath = "$userPath;$ProjectRoot"
     [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-    $env:Path = "$env:Path;$ProjectRoot"
     Ok "Added to PATH: $ProjectRoot"
-    Info "You can now run 'peerfold' from any terminal."
 }
+Info "For the current terminal, run: `$env:Path += ';$ProjectRoot'"
+Info "Or reopen a new terminal — 'peerfold' will work there."
 
-# ── [5/6] Config directories ─────────────────────────────────
+# ── [5/5] Config directories ─────────────────────────────────
 
 Section 5 $total "Configuration"
 
@@ -203,31 +203,18 @@ if (-not (Test-Path $ShareDir)) {
     Ok "Share directory exists: $ShareDir"
 }
 
-# ── [6/6] Launch command ─────────────────────────────────────
-
-Section 6 $total "Ready to launch"
-
-$cmd = ".\peerfold.exe client --server 127.0.0.1:7000 --name $Name --share docs=$ShareDir"
-
-Write-Host ""
-Write-Host "       Run this to start the client:" -ForegroundColor White
-Write-Host ""
-Write-Host "         cd $ProjectRoot" -ForegroundColor Yellow
-Write-Host "         $cmd" -ForegroundColor Yellow
-Write-Host ""
-Write-Host "       Config: $clientDir\config.json" -ForegroundColor DarkGray
-Write-Host "       Log:    $clientDir\log.txt" -ForegroundColor DarkGray
-
 # ── Summary ──────────────────────────────────────────────────
 
 Write-Host ""
 Write-Host "  ------------------------------------" -ForegroundColor DarkGray
 Write-Host "  Setup complete!" -ForegroundColor Green
 Write-Host ""
-Write-Host "  Client name:  $Name" -ForegroundColor White
-Write-Host "  Share dir:    $ShareDir" -ForegroundColor White
-Write-Host "  Server:       127.0.0.1:7000 (change --server if remote)" -ForegroundColor DarkGray
+Write-Host "  Start client:" -ForegroundColor White
+Write-Host "    peerfold client" -ForegroundColor Yellow
 Write-Host ""
-Write-Host "  To mount and browse files, run on any machine:" -ForegroundColor Yellow
-Write-Host "    .\peerfold.exe mount --server 127.0.0.1:7000 --mount C:\Users\<you>\peerfold" -ForegroundColor Yellow
+Write-Host "  Or with flags:" -ForegroundColor DarkGray
+Write-Host "    peerfold client --server 127.0.0.1:7000 --name $Name --share docs=$ShareDir" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "  Config: $clientDir\config.json" -ForegroundColor DarkGray
+Write-Host "  Log:    $clientDir\log.txt" -ForegroundColor DarkGray
 Write-Host ""

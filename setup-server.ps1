@@ -94,7 +94,7 @@ function BuildBinary {
 
 Header
 
-$total = 6
+$total = 5
 
 # ── [1/5] Go ─────────────────────────────────────────────────
 
@@ -168,7 +168,7 @@ if (Test-Path $BinPath) {
     }
 }
 
-# ── [4/6] Add to PATH ────────────────────────────────────────
+# ── [4/5] Add to PATH ────────────────────────────────────────
 
 Section 4 $total "Add to system PATH"
 
@@ -178,13 +178,12 @@ if ($userPath -like "*$ProjectRoot*") {
 } else {
     $newPath = "$userPath;$ProjectRoot"
     [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-    # Also add to current session so it works immediately
-    $env:Path = "$env:Path;$ProjectRoot"
     Ok "Added to PATH: $ProjectRoot"
-    Info "You can now run 'peerfold' from any terminal."
 }
+Info "For the current terminal, run: `$env:Path += ';$ProjectRoot'"
+Info "Or reopen a new terminal — 'peerfold' will work there."
 
-# ── [5/6] Config directories ─────────────────────────────────
+# ── [5/5] Config directories ─────────────────────────────────
 
 Section 5 $total "Configuration directories"
 
@@ -196,42 +195,17 @@ if (Test-Path $serverDir) {
     Ok "Created: $serverDir"
 }
 
-# ── [6/6] Start server ───────────────────────────────────────
-
-Section 6 $total "Start server"
-
-$running = Get-Process peerfold -ErrorAction SilentlyContinue
-if ($running) {
-    Warn "Server already running (PID $($running.Id))"
-} else {
-    Info "Launching server on 127.0.0.1:7000..."
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    Start-Process -FilePath $BinPath -ArgumentList "server","--listen","127.0.0.1:7000" -WindowStyle Minimized
-    while ($sw.Elapsed.TotalSeconds -lt 3) {
-        $pct = [int](($sw.Elapsed.TotalSeconds / 3) * 100)
-        Write-Progress -Activity "Starting server" -Status "Waiting for startup... $pct%" -PercentComplete $pct
-        Start-Sleep -Milliseconds 200
-    }
-    Write-Progress -Activity "Starting server" -Completed
-
-    $check = Get-Process peerfold -ErrorAction SilentlyContinue
-    if ($check) {
-        Ok "Server started (PID $($check.Id))"
-    } else {
-        Fail "Server failed to start. Check $serverDir\log.txt"
-        exit 1
-    }
-}
-
 # ── Summary ──────────────────────────────────────────────────
 
 Write-Host ""
 Write-Host "  ------------------------------------" -ForegroundColor DarkGray
 Write-Host "  Setup complete!" -ForegroundColor Green
 Write-Host ""
-Write-Host "  Server:    127.0.0.1:7000" -ForegroundColor White
-Write-Host "  Config:    $serverDir\config.json" -ForegroundColor DarkGray
-Write-Host "  Log:       $serverDir\log.txt" -ForegroundColor DarkGray
+Write-Host "  Start server:" -ForegroundColor White
+Write-Host "    peerfold server" -ForegroundColor Yellow
 Write-Host ""
-Write-Host "  Next: run setup-client.ps1 on a client machine" -ForegroundColor Yellow
+Write-Host "  Config:  $serverDir\config.json" -ForegroundColor DarkGray
+Write-Host "  Log:     $serverDir\log.txt" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "  Next: run setup-client.bat on a client machine" -ForegroundColor DarkGray
 Write-Host ""
