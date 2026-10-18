@@ -18,25 +18,36 @@
 
 ## Windows 一键使用
 
-### 1. 启动 server（服务端）
+> 以**管理员身份**运行 PowerShell 或 CMD 均可。
+> 有 `.ps1` 和 `.bat` 两个版本，效果一样。
 
-以**管理员身份**运行 PowerShell：
+### 1. 启动 server（服务端）
 
 ```powershell
 .\setup-server.ps1
 ```
 
-自动安装 Go + WinFsp → 构建 → 创建配置目录 → 启动 server。
+或 CMD：
+```cmd
+setup-server.bat
+```
+
+自动安装 Go + WinFsp → 构建 → 启动 server。已有的依赖会跳过。
 
 ### 2. 启动 client（共享端）
 
-在需要共享文件的机器上（同一台也行），同样以**管理员身份**运行：
+在需要共享文件的机器上（同一台也行）：
 
 ```powershell
 .\setup-client.ps1
 ```
 
-自动安装 Go + WinFsp → 构建 → 创建配置目录 → **输出启动命令**，复制粘贴运行即可。
+或 CMD：
+```cmd
+setup-client.bat
+```
+
+自动安装 Go + WinFsp → 构建 → **输出启动命令**，复制粘贴运行即可。
 
 也可以直接指定名字和共享目录：
 
@@ -46,8 +57,6 @@
 
 ### 3. 挂载（查看端）
 
-在想查看聚合树的机器上，以**管理员身份**运行：
-
 ```powershell
 .\peerfold.exe mount --server 127.0.0.1:7000 --mount C:\Users\你\peerfold
 ```
@@ -56,10 +65,13 @@
 
 ### 4. 清除所有环境
 
-以**管理员身份**运行：
-
 ```powershell
 .\cleanup.ps1
+```
+
+或 CMD：
+```cmd
+cleanup.bat
 ```
 
 删除所有配置、日志、演示目录、构建产物，并卸载 WinFsp，不留痕迹。
@@ -73,7 +85,7 @@ C:\Users\你\peerfold-server\log.txt
 C:\Users\你\peerfold-client-<名字>\log.txt
 ```
 
-日志记录每次 list / read / write / mkdir / rename / remove / 文件变化推送，格式 `时间戳 [info] 内容`。
+日志记录每次 list / read / write / mkdir / rename / remove / 文件变化推送。
 
 ## License
 
