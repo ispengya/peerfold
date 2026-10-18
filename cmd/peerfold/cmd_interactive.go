@@ -5,7 +5,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"peerfold/internal/config"
 )
@@ -48,23 +47,9 @@ func interactiveServer(in io.Reader, out, errw io.Writer) int {
 	fmt.Fprintf(out, "  Run mode:\n")
 	mode := promptChoice(in, out, "", []string{"Foreground (this terminal)", "Background (detached)"}, 0)
 
-	// 3. Ask auto-start
-	autoStart := promptBool(in, out, "Start on login?", false)
-
-	// 4. Apply auto-start
-	if autoStart {
-		if err := setAutoStart("server", "server --daemon"); err != nil {
-			fmt.Fprintf(errw, "  [!] Failed to set auto-start: %v\n", err)
-		} else {
-			fmt.Fprintf(out, "  [OK] Auto-start enabled\n")
-		}
-	} else {
-		_ = removeAutoStart("server")
-	}
-
 	fmt.Fprintf(out, "\n")
 
-	// 5. Start
+	// 3. Start
 	listenFlag := cfg.Listen
 	if listenFlag == "" {
 		listenFlag = "127.0.0.1:7000"
@@ -150,29 +135,9 @@ func interactiveClient(in io.Reader, out, errw io.Writer) int {
 	fmt.Fprintf(out, "  Run mode:\n")
 	mode := promptChoice(in, out, "", []string{"Foreground (this terminal)", "Background (detached)"}, 0)
 
-	// 3. Ask auto-start
-	autoStart := promptBool(in, out, "Start on login?", false)
-
-	// 4. Apply auto-start
-	if autoStart {
-		shareArgs := make([]string, 0, len(cfg.Shares))
-		for name, dir := range cfg.Shares {
-			shareArgs = append(shareArgs, fmt.Sprintf("--share %s=%s", name, dir))
-		}
-		args := fmt.Sprintf("client --daemon --server %s --name %s %s",
-			cfg.Server, cfg.ClientName, strings.Join(shareArgs, " "))
-		if err := setAutoStart(component, args); err != nil {
-			fmt.Fprintf(errw, "  [!] Failed to set auto-start: %v\n", err)
-		} else {
-			fmt.Fprintf(out, "  [OK] Auto-start enabled\n")
-		}
-	} else {
-		_ = removeAutoStart(component)
-	}
-
 	fmt.Fprintf(out, "\n")
 
-	// 5. Build CLI args
+	// 3. Build CLI args
 	cliArgs := []string{"client", "--daemon",
 		"--server", cfg.Server,
 		"--name", cfg.ClientName,
