@@ -1,5 +1,6 @@
-# cleanup.ps1 — Remove all peerfold environment, configs, and dependencies
-# Stops processes, removes all data, uninstalls WinFsp. Leaves source code intact.
+# cleanup.ps1 — Remove peerfold data, configs, and build artifacts
+# Only removes peerfold's own files. Does NOT touch system dependencies
+# (WinFsp, PATH, etc.) to avoid breaking other software.
 # Run as Administrator.
 
 $ErrorActionPreference = "Continue"
@@ -30,13 +31,15 @@ function NotFound($msg) { Write-Host "       ... Not found: $msg" -ForegroundCol
 
 Header
 
-Write-Host "  This will remove ALL peerfold data and dependencies:" -ForegroundColor Yellow
+Write-Host "  This will remove peerfold's own data:" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "    [x] Server & client processes" -ForegroundColor DarkGray
 Write-Host "    [x] Config directories and logs" -ForegroundColor DarkGray
+Write-Host "    [x] Auto-start registry entries" -ForegroundColor DarkGray
 Write-Host "    [x] Demo / test files" -ForegroundColor DarkGray
 Write-Host "    [x] Build artifacts (peerfold.exe)" -ForegroundColor DarkGray
-Write-Host "    [x] WinFsp (FUSE driver)" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "  Not touched: WinFsp, system PATH, source code" -ForegroundColor DarkGray
 Write-Host ""
 
 $confirm = Read-Host "  Continue? [y/N]"
@@ -46,9 +49,9 @@ if ($confirm -ne 'y' -and $confirm -ne 'Y') {
     exit 0
 }
 
-$total = 8
+$total = 5
 
-# ── [1/6] Processes ──────────────────────────────────────────
+# ── [1/5] Processes ──────────────────────────────────────────
 
 Section 1 $total "Stop peerfold processes"
 
@@ -61,21 +64,9 @@ if ($procs) {
     Ok "No running processes"
 }
 
-# ── [2/6] Mount point ────────────────────────────────────────
+# ── [2/5] Config & logs ──────────────────────────────────────
 
-Section 2 $total "Remove mount point"
-
-$mountPoint = Join-Path $Up "peerfold"
-if (Test-Path $mountPoint) {
-    Remove-Item $mountPoint -Force -Recurse -ErrorAction SilentlyContinue
-    Gone $mountPoint
-} else {
-    NotFound $mountPoint
-}
-
-# ── [3/6] Config & logs ──────────────────────────────────────
-
-Section 3 $total "Remove config and log directories"
+Section 2 $total "Remove config and log directories"
 
 $dirs = @()
 $dirs += Join-Path $Up "peerfold-server"
@@ -97,46 +88,9 @@ foreach ($f in $flatFiles) {
     Gone $f.FullName
 }
 
-# ── [4/6] Demo files ─────────────────────────────────────────
+# ── [3/5] Auto-start entries ─────────────────────────────────
 
-Section 4 $total "Remove demo directories"
-
-$demo = "C:\peerfold-demo"
-if (Test-Path $demo) {
-    Remove-Item $demo -Force -Recurse -ErrorAction SilentlyContinue
-    Gone $demo
-} else {
-    NotFound $demo
-}
-
-# ── [5/6] Build artifacts ────────────────────────────────────
-
-Section 5 $total "Remove build artifacts"
-
-$bin = Join-Path $ProjectRoot "peerfold.exe"
-if (Test-Path $bin) {
-    Remove-Item $bin -Force -ErrorAction SilentlyContinue
-    Gone $bin
-} else {
-    NotFound $bin
-}
-
-# ── [6/8] Remove from PATH ───────────────────────────────────
-
-Section 6 $total "Remove from system PATH"
-
-$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if ($userPath -like "*$ProjectRoot*") {
-    $newPath = ($userPath -split ';' | Where-Object { $_ -ne $ProjectRoot }) -join ';'
-    [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-    Ok "Removed from PATH: $ProjectRoot"
-} else {
-    Ok "Not in PATH"
-}
-
-# ── [7/8] Remove auto-start entries ─────────────────────────
-
-Section 7 $total "Remove auto-start registrations"
+Section 3 $total "Remove auto-start registrations"
 
 $regBase = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 $peerfoldKeys = Get-ItemProperty -Path $regBase -ErrorAction SilentlyContinue | Get-Member -MemberType NoteProperty | Where-Object { $_.Name -like "peerfold-*" }
@@ -149,49 +103,28 @@ if ($peerfoldKeys) {
     Ok "No auto-start entries found"
 }
 
-# ── [8/8] WinFsp ─────────────────────────────────────────────
+# ── [4/5] Demo files ─────────────────────────────────────────
 
-Section 8 $total "Uninstall WinFsp"
+Section 4 $total "Remove demo directories"
 
-$svc = Get-Service "WinFsp.Launcher" -ErrorAction SilentlyContinue
-if ($svc) {
-    if ($svc.Status -eq "Running") {
-        Write-Host "       Stopping WinFsp service..." -ForegroundColor DarkGray
-        Stop-Service "WinFsp.Launcher" -Force -ErrorAction SilentlyContinue
-    }
-    sc.exe delete "WinFsp.Launcher" 2>&1 | Out-Null
-    Ok "Service removed"
+$demo = "C:\peerfold-demo"
+if (Test-Path $demo) {
+    Remove-Item $demo -Force -Recurse -ErrorAction SilentlyContinue
+    Gone $demo
 } else {
-    Ok "Service not found"
+    NotFound $demo
 }
 
-$winget = Get-Command winget -ErrorAction SilentlyContinue
-if ($winget) {
-    $installed = & winget list --id WinFsp.WinFsp 2>&1 | Select-String "WinFsp"
-    if ($installed) {
-        Write-Progress -Activity "Uninstalling WinFsp" -Status "Please wait..." -PercentComplete 50
-        & winget uninstall --id WinFsp.WinFsp --accept-source-agreements 2>&1 | Out-Null
-        Write-Progress -Activity "Uninstalling WinFsp" -Completed
-        Ok "WinFsp package uninstalled"
-    } else {
-        Ok "WinFsp not in package manager"
-    }
-}
+# ── [5/5] Build artifacts ────────────────────────────────────
 
-$winfspDir = "C:\Program Files (x86)\WinFsp"
-if (Test-Path $winfspDir) {
-    Remove-Item $winfspDir -Force -Recurse -ErrorAction SilentlyContinue
-    Gone $winfspDir
+Section 5 $total "Remove build artifacts"
+
+$bin = Join-Path $ProjectRoot "peerfold.exe"
+if (Test-Path $bin) {
+    Remove-Item $bin -Force -ErrorAction SilentlyContinue
+    Gone $bin
 } else {
-    NotFound $winfspDir
-}
-
-$regPaths = @("HKLM:\SOFTWARE\WOW6432Node\WinFsp", "HKLM:\SOFTWARE\WinFsp")
-foreach ($reg in $regPaths) {
-    if (Test-Path $reg) {
-        Remove-Item $reg -Force -Recurse -ErrorAction SilentlyContinue
-        Gone "registry: $reg"
-    }
+    NotFound $bin
 }
 
 # ── Summary ──────────────────────────────────────────────────
@@ -200,9 +133,8 @@ Write-Host ""
 Write-Host "  ------------------------------------" -ForegroundColor DarkGray
 Write-Host "  Cleanup complete!" -ForegroundColor Green
 Write-Host ""
-Write-Host "  Removed: processes, mount point, configs, logs," -ForegroundColor White
-Write-Host "           demo files, build artifacts, WinFsp" -ForegroundColor White
+Write-Host "  Removed: processes, configs, logs, auto-start," -ForegroundColor White
+Write-Host "           demo files, build artifacts" -ForegroundColor White
 Write-Host ""
-Write-Host "  Source code in $ProjectRoot is untouched." -ForegroundColor DarkGray
-Write-Host "  To use peerfold again, run setup-server.ps1 or setup-client.ps1." -ForegroundColor DarkGray
+Write-Host "  Untouched: WinFsp, system PATH, source code" -ForegroundColor DarkGray
 Write-Host ""
