@@ -47,9 +47,23 @@ func interactiveServer(in io.Reader, out, errw io.Writer) int {
 	fmt.Fprintf(out, "  Run mode:\n")
 	mode := promptChoice(in, out, "", []string{"Foreground (this terminal)", "Background (detached)"}, 0)
 
+	// 3. If background, ask auto-start
+	if mode == 1 {
+		autoStart := promptBool(in, out, "Start on login?", false)
+		if autoStart {
+			if err := setAutoStart("server", "server --daemon"); err != nil {
+				fmt.Fprintf(errw, "  [!] Failed to set auto-start: %v\n", err)
+			} else {
+				fmt.Fprintf(out, "  [OK] Auto-start enabled\n")
+			}
+		} else {
+			_ = removeAutoStart("server")
+		}
+	}
+
 	fmt.Fprintf(out, "\n")
 
-	// 3. Start
+	// 4. Start
 	listenFlag := cfg.Listen
 	if listenFlag == "" {
 		listenFlag = "127.0.0.1:7000"
