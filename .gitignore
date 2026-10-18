@@ -2,6 +2,10 @@
 /peerfold
 /peerfold.exe
 
+# Local planning and handoff document. Kept out of the repository because it
+# changes on every session and is a working document, not a deliverable.
+HANDOFF.md
+
 # Local test and diagnostic output. The repository should never publish raw
 # command output, temporary binaries, or e2e traces.
 /.artifacts/
