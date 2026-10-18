@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
+	"peerfold/internal/logging"
 	"peerfold/internal/node"
 	"peerfold/internal/proto"
 )
@@ -50,7 +50,7 @@ func (c *Client) Watch() (io.Closer, error) {
 		for _, n := range nodes {
 			paths = append(paths, n.Path)
 		}
-		log.Printf("client: push %d node(s): %v", len(nodes), paths)
+		logging.Infof("client: push %d node(s): %v", len(nodes), paths)
 		// Sent without a waiter, because an index update is not a question and
 		// the server sends nothing back for it. Registering a waiter would leave
 		// one entry in the waiting map for every change, for ever.

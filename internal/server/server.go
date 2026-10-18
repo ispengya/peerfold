@@ -6,12 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
 	"time"
 
 	"peerfold/internal/index"
+	"peerfold/internal/logging"
 	"peerfold/internal/node"
 	"peerfold/internal/proto"
 )
@@ -298,7 +298,7 @@ func (s *Server) handleConn(conn net.Conn) {
 	// viewer's watch channel never closes and a mount can stay mounted forever
 	// after its owner disappears.
 	defer func() {
-		log.Printf("server: client %q disconnected", hb.Name)
+		logging.Infof("server: client %q disconnected", hb.Name)
 		s.broadcastOwnerGone(hb.Name)
 		s.ix.RemoveClient(hb.Name)
 		s.reg.Unregister(hb.Name)
@@ -315,7 +315,7 @@ func (s *Server) handleConn(conn net.Conn) {
 	// starts after the hello is answered so the order stays "the handshake, then
 	// everything else".
 	s.router.attach(hb.Name, c)
-	log.Printf("server: client %q connected", hb.Name)
+	logging.Infof("server: client %q connected", hb.Name)
 	s.serveLoop(hb.Name, c)
 }
 
@@ -524,7 +524,7 @@ func (s *Server) applyEvent(name string, env proto.Envelope) {
 	for _, n := range nodes {
 		paths = append(paths, n.Path)
 	}
-	log.Printf("server: event from %q: %d node(s): %v", name, len(nodes), paths)
+	logging.Infof("server: event from %q: %d node(s): %v", name, len(nodes), paths)
 
 	// A deletion is not a node with a kind; it is an instruction to drop the
 	// path and everything under it. It is turned into the index's own removal
@@ -626,7 +626,7 @@ func (s *Server) broadcast(env proto.Envelope) {
 	}
 	s.mu.Unlock()
 
-	log.Printf("server: broadcast to %d watcher(s)", len(targets))
+	logging.Infof("server: broadcast to %d watcher(s)", len(targets))
 
 	for _, c := range targets {
 		s.fanout.Add(1)
@@ -668,7 +668,7 @@ func (s *Server) broadcast(env proto.Envelope) {
 			// without bound. Logging it is the minimum -- and peerfold's own
 			// mount layer notices the silence for itself, because the sequence
 			// numbers stop advancing (mount.watchLoop).
-			log.Printf("server: dropping watcher after %d consecutive send "+
+			logging.Errorf("server: dropping watcher after %d consecutive send "+
 				"timeouts; it keeps its connection but will receive no further "+
 				"updates", s.watchFails[c])
 			delete(s.watchFails, c)
@@ -725,6 +725,7 @@ func (s *Server) replyList(c *proto.Conn, env proto.Envelope) error {
 	if err := json.Unmarshal(env.Body, &b); err != nil {
 		return c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: fmt.Sprintf("bad list request: %v", err)})
 	}
+	logging.Infof("server: list %s/%s", b.Client, b.Path)
 	nodes, err := s.Query().List(b.Client, b.Path)
 	if err != nil {
 		return c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: err.Error()})
@@ -772,6 +773,7 @@ func (s *Server) replyRead(c *proto.Conn, env proto.Envelope) error {
 	case b.Off < 0:
 		fail = errors.New("bad read request: offset must not be negative")
 	default:
+		logging.Infof("server: read %s/%s off=%d n=%d", b.Client, b.Path, b.Off, b.N)
 		// The owner is asked over its connection, and this handler runs on the
 		// server's connection to the requester — not on the owner's serve loop —
 		// so the owner's loop is free to answer.
@@ -848,18 +850,21 @@ func (s *Server) replyWrite(c *proto.Conn, env proto.Envelope) error {
 		if err := json.Unmarshal(env.Body, &b); err != nil {
 			return s.writeAnswer(c, env, fmt.Errorf("bad mkdir request: %v", err))
 		}
+		logging.Infof("server: mkdir %s/%s", b.Client, b.Path)
 		return s.replyNamed(c, env, b.Client, "mkdir")
 	case proto.KindRemove:
 		var b proto.RemoveBody
 		if err := json.Unmarshal(env.Body, &b); err != nil {
 			return s.writeAnswer(c, env, fmt.Errorf("bad remove request: %v", err))
 		}
+		logging.Infof("server: remove %s/%s", b.Client, b.Path)
 		return s.replyNamed(c, env, b.Client, "remove")
 	case proto.KindRename:
 		var b proto.RenameBody
 		if err := json.Unmarshal(env.Body, &b); err != nil {
 			return s.writeAnswer(c, env, fmt.Errorf("bad rename request: %v", err))
 		}
+		logging.Infof("server: rename %s/%s -> %s/%s", b.Client, b.OldPath, b.Client, b.NewPath)
 		return s.replyRename(c, env, b)
 	default:
 		return s.writeAnswer(c, env, fmt.Errorf("bad write request: unknown kind %q", env.Kind))
@@ -991,6 +996,8 @@ func (s *Server) replyPut(c *proto.Conn, env proto.Envelope) error {
 	case b.Mode != proto.WriteModePut && b.Mode != proto.WriteModeCreate:
 		return s.drainThenAnswer(c, env, fmt.Errorf("bad write request: unknown mode %q", b.Mode))
 	}
+
+	logging.Infof("server: write %s/%s", b.Client, b.Path)
 
 	ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
 	defer cancel()

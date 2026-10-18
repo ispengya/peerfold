@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"peerfold/internal/logging"
 	"peerfold/internal/node"
 	"peerfold/internal/proto"
 )
@@ -446,12 +447,14 @@ func (c *Client) satisfyRead(env proto.Envelope) error {
 		// routing mistake, and answering it would read the wrong machine's disk.
 		reason = fmt.Errorf("read request is addressed to %q, not %q", req.Client, c.name)
 	} else {
+		logging.Infof("client: read %s off=%d n=%d", req.Path, req.Off, req.N)
 		// req.Client is this client's own name, which is how the server routes
 		// the request; the share is the first component of the path, because
 		// everything after the client name belongs to this client's namespace.
 		var err error
 		data, _, err = c.fs.ReadAt(shareOf(req.Path), restOf(req.Path), req.Off, req.N)
 		if err != nil {
+			logging.Errorf("client: read %s failed: %v", req.Path, err)
 			reason = err
 		} else {
 			ok = true
@@ -569,6 +572,7 @@ func (c *Client) servePut(env proto.Envelope) error {
 		return fmt.Errorf("write request is addressed to %q, not %q", req.Client, c.name)
 	}
 	share, rel := shareOf(req.Path), restOf(req.Path)
+	logging.Infof("client: write %s", req.Path)
 
 	// The sink pulls one frame at a time off the connection and hands the bytes
 	// straight to the file, so no copy of the file is ever held.
@@ -689,6 +693,7 @@ func (c *Client) serveMkdir(env proto.Envelope) error {
 		_ = c.drainContent(env.ID)
 		return fmt.Errorf("mkdir request is addressed to %q, not %q", req.Client, c.name)
 	}
+	logging.Infof("client: mkdir %s", req.Path)
 	reason := c.fs.Mkdir(shareOf(req.Path), restOf(req.Path))
 	if err := c.drainContent(env.ID); err != nil {
 		// Losing the connection while answering is the more serious failure:
@@ -709,6 +714,7 @@ func (c *Client) serveRemove(env proto.Envelope) error {
 		_ = c.drainContent(env.ID)
 		return fmt.Errorf("remove request is addressed to %q, not %q", req.Client, c.name)
 	}
+	logging.Infof("client: remove %s", req.Path)
 	reason := c.fs.Remove(shareOf(req.Path), restOf(req.Path))
 	if err := c.drainContent(env.ID); err != nil {
 		return err
@@ -742,6 +748,7 @@ func (c *Client) serveRename(env proto.Envelope) error {
 		_ = c.drainContent(env.ID)
 		return fmt.Errorf("rename spans shares %q and %q: a rename stays inside one share", oldShare, newShare)
 	}
+	logging.Infof("client: rename %s -> %s", req.OldPath, req.NewPath)
 	reason := c.fs.Rename(oldShare, restOf(req.OldPath), restOf(req.NewPath))
 	if err := c.drainContent(env.ID); err != nil {
 		return err
