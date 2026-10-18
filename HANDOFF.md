@@ -255,7 +255,7 @@ go test ./internal/mount -run '^TestE2ERealMount$' -count=1 -v 1> $out 2> $err
 
 **测试框架还有一个句柄泄漏：** `startMountHelper` 打开 `mount-helper.log` 后父进程从不 `Close`，Windows 上该句柄挡住 `t.TempDir()` 清理（"used by another process"）。已在 `cmd.Start()` 后 `f.Close()`。
 
-**1d（unmount）的根因是另一处：** owner tombstone 到达后，`watch.go` 把它当成了"连接断开"（`setDisconnected(true)`），于是 reconnect 监督器去 dial **server**——server 还活着，重连立刻成功、`adopt` 装上新连接，挂载点继续挂着（只是空树），永远不会 give up。修复：tombstone 不再设 `disconnected`，而是直接走 `releaseMountPoint()`（`onGiveUp` → `host.Unmount()`）。`gaveUp` 把"释放挂载点"抽成 `releaseMountPoint()` 复用。新单测 `TestOwnerWithdrawalReleasesTheMount`（替换原 `TestOwnerWithdrawalEndsTheWatch`）断言 tombstone 触发释放而非 disconnected。
+**1d（unmount）的根因是另一处：** owner tombstone 到达后，`watch.go` 把它当成了"连接断开"（`setDisconnected(true)`），于是 reconnect 监督器去 dial **server**——server 还活着，重连立刻成功、`adopt` 装上新连接，挂载点继续挂着（只是空树），永远不会 give up。修复：tombstone 不再设 `disconnected`，而是先 `anyOwnerRemains()`（列根、过滤掉 events 表里已知的 tombstone）判断是否还有别的 owner 存活——有则继续服务、继续 watch；没有则 `releaseMountPoint()`（`onGiveUp` → `host.Unmount()`）。`gaveUp` 把"释放挂载点"抽成 `releaseMountPoint()` 复用。新单测 `TestOwnerWithdrawalReleasesTheMount`（最后一个 owner 掉线才释放）+ `TestOwnerWithdrawalKeepsServingOtherOwners`（一个 owner 掉线、另一个继续服务）。
 
 **结果（2026-10-18 全量真实挂载 e2e）：10/10 全过，耗时 3.4s（原来 183s）。** 1a（read-back）、1b（mkdir-rename-unlink）、1c（editor-save）、1d（unmount）全部闭环。1c 之所以一起修好：目标文件/父目录报 0777 后，`MOVEFILE_REPLACE_EXISTING` 的 delete-access 检查在驱动层通过，`Rename` 回调能到达。
 
@@ -311,7 +311,7 @@ Flush fh=62 → status=0                      ← 内容成功上传到 owner
 
 **现象：** owner tombstone 到达、supervisor 启动、`giving up` 记录在案、`onGiveUp` 已无条件安装，但挂载点在测试预算（180s，give-up 阈值 120s）内没有消失。
 
-**已解决（2026-10-18）：** 根因是 tombstone 被当成"连接断开"（`setDisconnected(true)`），于是 reconnect 监督器去 dial **server**——server 还活着，重连立刻成功、`adopt` 装上新连接，挂载点继续挂着空树，永远不会 give up。修复：tombstone 不再设 `disconnected`，而是直接走 `releaseMountPoint()`（`onGiveUp` → `host.Unmount()`）。子测试已 PASS（0.11s，原来 skip 要等满 180s）。
+**已解决（2026-10-18）：** 根因是 tombstone 被当成"连接断开"（`setDisconnected(true)`），于是 reconnect 监督器去 dial **server**——server 还活着，重连立刻成功、`adopt` 装上新连接，挂载点继续挂着空树，永远不会 give up。修复：tombstone 不再设 `disconnected`，而是先 `anyOwnerRemains()` 判断是否还有别的 owner——有则继续服务、继续 watch；没有（最后一个）则 `releaseMountPoint()`。单 owner 场景子测试已 PASS（0.10s，原来 skip 要等满 180s）；多 owner 场景由单测钉住（一个掉线不卸载、最后一个掉线才卸载）。
 
 ### 2. Linux 外部验证
 
