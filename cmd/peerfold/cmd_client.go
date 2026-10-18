@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/signal"
 	"sort"
@@ -12,6 +13,7 @@ import (
 
 	"peerfold/internal/client"
 	"peerfold/internal/config"
+	"peerfold/internal/logging"
 )
 
 // cmdClient joins a server and shares local directories.
@@ -87,6 +89,14 @@ func cmdClient(args []string, stdout, stderr io.Writer) int {
 		}
 		clientName = host
 		cfg.ClientName = clientName
+	}
+
+	// The always-on diagnostic log, one file per client so two clients on one
+	// machine do not write over each other. Like the server's, a failure to open
+	// it is not fatal.
+	if f, err := logging.Open("client-" + clientName + ".log"); err == nil {
+		log.SetOutput(f)
+		defer f.Close()
 	}
 
 	if cfg.Server == "" {

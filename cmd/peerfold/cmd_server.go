@@ -5,11 +5,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"os/signal"
 
 	"peerfold/internal/config"
+	"peerfold/internal/logging"
 	"peerfold/internal/server"
 )
 
@@ -89,6 +91,15 @@ func cmdServerWith(args []string, stdout, stderr io.Writer, interrupt <-chan str
 	}
 	if *listen != "" {
 		addr = *listen
+	}
+
+	// The always-on diagnostic log: the server's activity goes to a fixed file
+	// under the user's home, so a run can be reconstructed without a flag. A
+	// failure to open it is not fatal -- the log is a convenience, not a
+	// dependency -- so the server runs on without file logging.
+	if f, err := logging.Open("server.log"); err == nil {
+		log.SetOutput(f)
+		defer f.Close()
 	}
 
 	s := server.New(addr)

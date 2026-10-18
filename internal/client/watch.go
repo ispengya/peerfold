@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -45,6 +46,11 @@ func (c *Client) Watch() (io.Closer, error) {
 			return fmt.Errorf("client: encode event: %w", err)
 		}
 		seq++
+		paths := make([]string, 0, len(nodes))
+		for _, n := range nodes {
+			paths = append(paths, n.Path)
+		}
+		log.Printf("client: push %d node(s): %v", len(nodes), paths)
 		// Sent without a waiter, because an index update is not a question and
 		// the server sends nothing back for it. Registering a waiter would leave
 		// one entry in the waiting map for every change, for ever.

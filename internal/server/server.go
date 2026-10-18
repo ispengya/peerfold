@@ -298,6 +298,7 @@ func (s *Server) handleConn(conn net.Conn) {
 	// viewer's watch channel never closes and a mount can stay mounted forever
 	// after its owner disappears.
 	defer func() {
+		log.Printf("server: client %q disconnected", hb.Name)
 		s.broadcastOwnerGone(hb.Name)
 		s.ix.RemoveClient(hb.Name)
 		s.reg.Unregister(hb.Name)
@@ -314,6 +315,7 @@ func (s *Server) handleConn(conn net.Conn) {
 	// starts after the hello is answered so the order stays "the handshake, then
 	// everything else".
 	s.router.attach(hb.Name, c)
+	log.Printf("server: client %q connected", hb.Name)
 	s.serveLoop(hb.Name, c)
 }
 
@@ -518,6 +520,12 @@ func (s *Server) applyEvent(name string, env proto.Envelope) {
 		return
 	}
 
+	paths := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		paths = append(paths, n.Path)
+	}
+	log.Printf("server: event from %q: %d node(s): %v", name, len(nodes), paths)
+
 	// A deletion is not a node with a kind; it is an instruction to drop the
 	// path and everything under it. It is turned into the index's own removal
 	// here, so no other layer has to know the marker exists.
@@ -617,6 +625,8 @@ func (s *Server) broadcast(env proto.Envelope) {
 		targets = append(targets, c)
 	}
 	s.mu.Unlock()
+
+	log.Printf("server: broadcast to %d watcher(s)", len(targets))
 
 	for _, c := range targets {
 		s.fanout.Add(1)
