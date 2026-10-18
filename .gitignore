@@ -6,6 +6,9 @@
 # changes on every session and is a working document, not a deliverable.
 HANDOFF.md
 
+# Design specs, plans, and local docs. Working documents, not deliverables.
+/docs/
+
 # Local test and diagnostic output. The repository should never publish raw
 # command output, temporary binaries, or e2e traces.
 /.artifacts/
