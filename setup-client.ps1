@@ -85,7 +85,7 @@ function BuildBinary {
 
 Header
 
-$total = 5
+$total = 6
 
 # ── [1/5] Go ─────────────────────────────────────────────────
 
@@ -159,9 +159,24 @@ if (Test-Path $BinPath) {
     }
 }
 
-# ── [4/5] Config directories ─────────────────────────────────
+# ── [4/6] Add to PATH ────────────────────────────────────────
 
-Section 4 $total "Configuration"
+Section 4 $total "Add to system PATH"
+
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if ($userPath -like "*$ProjectRoot*") {
+    Ok "Already in PATH: $ProjectRoot"
+} else {
+    $newPath = "$userPath;$ProjectRoot"
+    [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+    $env:Path = "$env:Path;$ProjectRoot"
+    Ok "Added to PATH: $ProjectRoot"
+    Info "You can now run 'peerfold' from any terminal."
+}
+
+# ── [5/6] Config directories ─────────────────────────────────
+
+Section 5 $total "Configuration"
 
 if (-not $Name) {
     $Name = $env:COMPUTERNAME
@@ -188,9 +203,9 @@ if (-not (Test-Path $ShareDir)) {
     Ok "Share directory exists: $ShareDir"
 }
 
-# ── [5/5] Launch command ─────────────────────────────────────
+# ── [6/6] Launch command ─────────────────────────────────────
 
-Section 5 $total "Ready to launch"
+Section 6 $total "Ready to launch"
 
 $cmd = ".\peerfold.exe client --server 127.0.0.1:7000 --name $Name --share docs=$ShareDir"
 

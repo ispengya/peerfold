@@ -26,13 +26,29 @@ func TestRunUnknownCommand(t *testing.T) {
 func TestRunNoArgsListsCommands(t *testing.T) {
 	var out, errOut bytes.Buffer
 
-	if code := runWithEmptyStdin(nil, &out, &errOut); code == 0 {
-		t.Fatalf("runWithEmptyStdin(nil) = 0, want non-zero")
+	// No arguments prints help and exits 0, which is the standard convention
+	// for a help screen: "peerfold" with no arguments is a request for usage,
+	// not an error.
+	if code := runWithEmptyStdin(nil, &out, &errOut); code != 0 {
+		t.Fatalf("runWithEmptyStdin(nil) = %d, want 0 (help is not an error)", code)
 	}
 	s := out.String()
-	for _, want := range []string{"server", "client"} {
+	for _, want := range []string{"server", "client", "mount", "ls", "cat"} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("stdout = %q, want it to mention %q", s, want)
+		}
+	}
+}
+
+func TestRunHelpFlags(t *testing.T) {
+	for _, flag := range []string{"--help", "-h", "help"} {
+		var out, errOut bytes.Buffer
+		code := runWithEmptyStdin([]string{flag}, &out, &errOut)
+		if code != 0 {
+			t.Fatalf("run(%q) = %d, want 0", flag, code)
+		}
+		if !strings.Contains(out.String(), "peerfold") {
+			t.Fatalf("run(%q) output = %q, want usage", flag, out.String())
 		}
 	}
 }

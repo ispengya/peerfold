@@ -94,7 +94,7 @@ function BuildBinary {
 
 Header
 
-$total = 5
+$total = 6
 
 # ── [1/5] Go ─────────────────────────────────────────────────
 
@@ -168,9 +168,25 @@ if (Test-Path $BinPath) {
     }
 }
 
-# ── [4/5] Config directories ─────────────────────────────────
+# ── [4/6] Add to PATH ────────────────────────────────────────
 
-Section 4 $total "Configuration directories"
+Section 4 $total "Add to system PATH"
+
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if ($userPath -like "*$ProjectRoot*") {
+    Ok "Already in PATH: $ProjectRoot"
+} else {
+    $newPath = "$userPath;$ProjectRoot"
+    [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+    # Also add to current session so it works immediately
+    $env:Path = "$env:Path;$ProjectRoot"
+    Ok "Added to PATH: $ProjectRoot"
+    Info "You can now run 'peerfold' from any terminal."
+}
+
+# ── [5/6] Config directories ─────────────────────────────────
+
+Section 5 $total "Configuration directories"
 
 $serverDir = Join-Path $Up "peerfold-server"
 if (Test-Path $serverDir) {
@@ -180,9 +196,9 @@ if (Test-Path $serverDir) {
     Ok "Created: $serverDir"
 }
 
-# ── [5/5] Start server ───────────────────────────────────────
+# ── [6/6] Start server ───────────────────────────────────────
 
-Section 5 $total "Start server"
+Section 6 $total "Start server"
 
 $running = Get-Process peerfold -ErrorAction SilentlyContinue
 if ($running) {

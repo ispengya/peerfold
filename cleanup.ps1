@@ -46,7 +46,7 @@ if ($confirm -ne 'y' -and $confirm -ne 'Y') {
     exit 0
 }
 
-$total = 6
+$total = 7
 
 # ── [1/6] Processes ──────────────────────────────────────────
 
@@ -121,9 +121,22 @@ if (Test-Path $bin) {
     NotFound $bin
 }
 
-# ── [6/6] WinFsp ─────────────────────────────────────────────
+# ── [6/7] Remove from PATH ───────────────────────────────────
 
-Section 6 $total "Uninstall WinFsp"
+Section 6 $total "Remove from system PATH"
+
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if ($userPath -like "*$ProjectRoot*") {
+    $newPath = ($userPath -split ';' | Where-Object { $_ -ne $ProjectRoot }) -join ';'
+    [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+    Ok "Removed from PATH: $ProjectRoot"
+} else {
+    Ok "Not in PATH"
+}
+
+# ── [7/7] WinFsp ─────────────────────────────────────────────
+
+Section 7 $total "Uninstall WinFsp"
 
 $svc = Get-Service "WinFsp.Launcher" -ErrorAction SilentlyContinue
 if ($svc) {

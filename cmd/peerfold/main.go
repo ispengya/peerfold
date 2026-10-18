@@ -25,10 +25,20 @@ var commands = []string{"server", "client", "mount", "ls", "cat", "put", "mkdir"
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		usage(stdout)
-		return 2
+		return 0
 	}
 
 	cmd, rest := args[0], args[1:]
+
+	switch cmd {
+	case "--help", "-h", "help", "-help":
+		usage(stdout)
+		return 0
+	case "--version", "-v", "version":
+		fmt.Fprintln(stdout, "peerfold v1")
+		return 0
+	}
+
 	return dispatch(cmd, rest, stdin, stdout, stderr)
 }
 
@@ -44,7 +54,7 @@ func dispatch(cmd string, rest []string, stdin io.Reader, stdout, stderr io.Writ
 	case "ls", "cat", "put", "mkdir", "rm", "mv":
 		return cmdTree(cmd, rest, stdin, stdout, stderr)
 	default:
-		fmt.Fprintf(stderr, "unknown command %q\n", cmd)
+		fmt.Fprintf(stderr, "unknown command %q\n\n", cmd)
 		usage(stderr)
 		return 2
 	}
@@ -64,16 +74,36 @@ func usage(w io.Writer) {
 	fmt.Fprint(w, usageText)
 }
 
-const usageText = `usage: peerfold <command> [args]
+const usageText = `peerfold — federated filesystem
 
-commands:
-  server  run the aggregation server
-  client  join a server and share local directories
-  mount   mount the federated tree as a directory
-  ls      list the aggregated tree
-  cat     print a file from the aggregated tree
-  put     write stdin to a file in the aggregated tree
-  mkdir   create a directory in the aggregated tree
-  rm      remove a file or directory in the aggregated tree
-  mv      rename within one client's tree
+usage: peerfold <command> [args]
+
+server & client:
+  server    run the aggregation server
+  client    join a server and share local directories
+
+mount & browse:
+  mount     mount the federated tree as a directory
+  ls        list the aggregated tree
+  cat       print a file from the aggregated tree
+
+file operations:
+  put       write stdin to a file in the aggregated tree
+  mkdir     create a directory in the aggregated tree
+  rm        remove a file or directory in the aggregated tree
+  mv        rename within one client's tree
+
+other:
+  --help    show this help
+  --version show version
+
+examples:
+  peerfold server --listen 127.0.0.1:7000
+  peerfold client --server 127.0.0.1:7000 --name alice --share docs=C:\data
+  peerfold mount --server 127.0.0.1:7000 --mount C:\Users\me\peerfold
+  peerfold ls
+  peerfold cat alice/docs/notes.txt
+  peerfold put alice/docs/new.txt < content.txt
+
+Run 'peerfold <command> --help' for command-specific flags.
 `
