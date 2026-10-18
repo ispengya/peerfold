@@ -72,6 +72,30 @@ cd peerfold
 
 ## 构建
 
+### 方式一：一键配置（推荐）
+
+以**管理员身份**运行 PowerShell：
+
+```powershell
+.\setup.ps1
+```
+
+自动完成：检查/安装 Go → 检查/安装 WinFsp → 构建 binary → 创建配置目录 → 生成启动脚本。
+
+如果只想构建不想装依赖：
+
+```powershell
+.\setup.ps1 -Quick
+```
+
+配置完成后直接启动：
+
+```powershell
+.\setup.ps1 -Start
+```
+
+### 方式二：手动构建
+
 ```powershell
 go build -o peerfold.exe ./cmd/peerfold
 ```
@@ -84,6 +108,22 @@ go build -o peerfold.exe ./cmd/peerfold
 ```
 
 ## 运行
+
+### 一键启动（推荐）
+
+以管理员身份运行：
+
+```powershell
+.\start-all.ps1
+```
+
+自动启动 server + alice + bob + mount，并创建测试文件。停止：
+
+```powershell
+.\stop-all.ps1
+```
+
+### 手动启动（四个终端）
 
 需要**四个终端窗口**（或分布在四台机器上）。建议先准备好共享测试目录：
 
