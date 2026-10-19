@@ -89,6 +89,15 @@ peerfold ls / cat / put / mkdir / rm / mv
 
 `peerfold mount` 运行期间会记录自己的 PID 和实际使用的 server / 挂载点，所以从另一个终端也能用 `peerfold status` 看到它；`peerfold stop mount` 会先落盘再卸载（Linux 通过 SIGTERM 触发正常退出，Windows 上是强制结束进程）。
 
+`peerfold status` 还会连一次配置里的 server，列出**所有连到这台 server 的 mount**，包括其他机器上的：
+
+```
+  Remote mounts via 124.221.247.88:7000:
+    WINBOX  C:\Users\me\peerfold  from 117.154.103.159:22739  up 3m12s
+```
+
+mount 在握手时声明主机名和挂载点，server 记录连接；所以 A 机器上的 mount 在 B 机器的 status 里也可见。旧版 server 不认识这个查询，status 会提示更新并重启 server，而不是假装没有远程挂载。要让远程 mount 可见，server 和 mount 两端都需要更新到包含该功能的版本。
+
 ### 开机自启
 
 交互式选 Background 时可以启用自启：
@@ -135,6 +144,7 @@ systemctl --user enable --now peerfold-server.service
 | 挂载点 | Windows 由 WinFsp 创建目录；Linux 要求目录**已存在且为空** |
 | 挂载依赖 | Windows 要 WinFsp；Linux 要 fuse3（`sudo apt install fuse3`） |
 | 下线语义 | client 断开 → 挂载里对应子树消失；最后一个 owner 下线 → 挂载点释放 |
+| 远程 mount | mount 在握手时向 server 登记；任何能连到该 server 的机器都能在 `status` 里看到 |
 
 ## 日志
 

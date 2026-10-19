@@ -10,6 +10,34 @@ import (
 	"github.com/ispengya/peerfold/internal/config"
 )
 
+// TestMountFlagsWorkWithoutAnyConfig pins that a fresh machine can mount with
+// nothing but flags. The config is a convenience, not a prerequisite: before
+// this, a missing default config failed the command even though every value it
+// needed was on the command line.
+func TestMountFlagsWorkWithoutAnyConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)        // unix
+	t.Setenv("USERPROFILE", home) // windows
+
+	mp := filepath.Join(t.TempDir(), "mp")
+	opts, server, point, _, err := mountOptionsFrom([]string{
+		"--server", "127.0.0.1:1",
+		"--mount", mp,
+	})
+	if err != nil {
+		t.Fatalf("mountOptionsFrom with no config: %v", err)
+	}
+	if server != "127.0.0.1:1" {
+		t.Errorf("server = %q, want the flag's 127.0.0.1:1", server)
+	}
+	if point != mp {
+		t.Errorf("mount point = %q, want the flag's %q", point, mp)
+	}
+	if opts.BufferLimit <= 0 || opts.BufferTotal <= 0 {
+		t.Errorf("buffer defaults = (%d, %d), want the mount package's positive defaults", opts.BufferLimit, opts.BufferTotal)
+	}
+}
+
 // TestMountOptionsComeFromTheConfig proves the three config keys are read rather
 // than merely parsed into a struct. A key that is stored and never consulted is
 // worse than a missing one: the user sets it, sees no complaint, and believes it

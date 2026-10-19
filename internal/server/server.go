@@ -81,9 +81,14 @@ type Server struct {
 	// separately from watchers because it has to survive individual failures,
 	// and it is cleared both on a successful send and when a watcher leaves.
 	watchFails map[*proto.Conn]int
-	closing    bool
-	closed     bool
-	wg         sync.WaitGroup
+	// viewers is every connected mount, keyed by its connection. A mount is a
+	// viewer that declared a mount point in its hello; plain viewers (ls, cat,
+	// the status query itself) are not recorded, because they are transient
+	// and listing them would drown out the mounts the registry exists for.
+	viewers map[*proto.Conn]proto.ViewerInfo
+	closing bool
+	closed  bool
+	wg      sync.WaitGroup
 
 	// broadcastTimeout bounds one push to one watcher. It is a field rather than
 	// the constant so a test can drive the timeout path without waiting five
@@ -113,6 +118,7 @@ func New(listen string) *Server {
 		conns:            make(map[net.Conn]struct{}),
 		watchers:         make(map[*proto.Conn]struct{}),
 		watchFails:       make(map[*proto.Conn]int),
+		viewers:          make(map[*proto.Conn]proto.ViewerInfo),
 		router:           &Router{clients: make(map[string]*clientLink)},
 		broadcastTimeout: DefaultEventBroadcastTimeout,
 	}
@@ -267,6 +273,26 @@ func (s *Server) handleConn(conn net.Conn) {
 	// be told when the tree changes. The registration lasts exactly as long as
 	// this handler runs, which is exactly as long as the connection does.
 	if hb.Role == proto.RoleViewer {
+		// A viewer that says where it is mounted is a mount, and a mount is
+		// what another machine's status is looking for. Ordinary viewers leave
+		// the field empty and stay anonymous.
+		//
+		// The registration happens before the hello is answered, so a mount
+		// that has completed its handshake is already visible: a status query
+		// arriving the moment after must not report a mount that is connected
+		// as absent. If the answer then fails, the deferred unregister drops
+		// the entry on the way out.
+		if hb.MountPoint != "" {
+			s.registerViewer(c, proto.ViewerInfo{
+				Name:       hb.Name,
+				MountPoint: hb.MountPoint,
+				RemoteAddr: conn.RemoteAddr().String(),
+				Since:      time.Now().Unix(),
+			})
+			defer s.unregisterViewer(c)
+			logging.Infof("server: mount %q at %q connected from %s",
+				hb.Name, hb.MountPoint, conn.RemoteAddr())
+		}
 		if err := s.replyHello(c, env.ID, hb.Name, false); err != nil {
 			return
 		}
@@ -395,6 +421,17 @@ func (s *Server) serveLoop(name string, c *proto.Conn) {
 
 		if env.Kind == proto.KindList {
 			if err := s.replyList(c, env); err != nil {
+				return
+			}
+			continue
+		}
+
+		// Status on any machine asks this to learn which mounts are attached
+		// here. It is answered for every connection rather than viewers only:
+		// the question is about the server's connections, and a supplier has
+		// no more privilege over that answer than a viewer does.
+		if env.Kind == proto.KindViewers {
+			if err := s.replyViewers(c, env); err != nil {
 				return
 			}
 			continue

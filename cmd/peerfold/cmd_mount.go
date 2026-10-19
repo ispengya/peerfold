@@ -152,7 +152,11 @@ func runMount(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	v, err := viewer.Dial(server)
+	// Declare the mount in the handshake. The host name is the identity, and
+	// the mount point is what lets status on another machine say where this
+	// window onto the tree is attached.
+	mountName := defaultClientName()
+	v, err := viewer.DialMount(server, mountName, mountPoint)
 	if err != nil {
 		fmt.Fprintf(stderr, "mount: %v\n", err)
 		return 1
@@ -181,7 +185,7 @@ func runMount(args []string, stdout, stderr io.Writer) int {
 	// install that nil caller and every later operation would panic somewhere far
 	// from the cause.
 	reconnect := func() (mount.Caller, error) {
-		fresh, err := viewer.Dial(server)
+		fresh, err := viewer.DialMount(server, mountName, mountPoint)
 		if err != nil {
 			return nil, err
 		}
@@ -243,7 +247,15 @@ func mountOptionsFrom(args []string) (mount.Options, string, string, string, err
 	}
 	cfg, _, err := loadMountConfig(path, explicit)
 	if err != nil {
-		return mount.Options{}, "", "", "", fmt.Errorf("read config %s: %w", path, err)
+		// No config anywhere is not a failure for a command that was given
+		// its values on the command line, or whose defaults are usable: a
+		// fresh machine can mount with --server and --mount alone. An explicit
+		// --config is different -- the user named a file, so its absence is
+		// the answer to what they asked.
+		if explicit || !errors.Is(err, os.ErrNotExist) {
+			return mount.Options{}, "", "", "", fmt.Errorf("read config %s: %w", path, err)
+		}
+		cfg = config.Config{}
 	}
 
 	opts := mount.DefaultOptions()

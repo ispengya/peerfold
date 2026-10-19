@@ -13,7 +13,13 @@ import (
 	"time"
 
 	"github.com/ispengya/peerfold/internal/config"
+	"github.com/ispengya/peerfold/internal/viewer"
 )
+
+// statusQueryTimeout bounds the status command's conversation with the server.
+// Status is a snapshot and must stay quick even when the address in the config
+// points at a machine that is down or gone.
+const statusQueryTimeout = 2 * time.Second
 
 // ── PID management ─────────────────────────────────────────
 //
@@ -269,8 +275,92 @@ func cmdStatus(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "           Point:   %s\n", point)
 	}
 
+	// Remote mounts. The state above describes only this machine, so the
+	// server is asked which mounts are attached to it -- that is the only way
+	// a mount on another machine becomes visible here. The query is itself an
+	// ordinary viewer and declares no mount point, so it never lists itself.
+	if addr := statusServerAddress(); addr != "" {
+		fmt.Fprintf(stdout, "\n")
+		v, err := viewer.DialTimeout(addr, statusQueryTimeout)
+		if err != nil {
+			fmt.Fprintf(stdout, "  Remote mounts: (server %s unreachable)\n", addr)
+		} else {
+			mounts, queryErr := v.ListMounts()
+			v.Close()
+			switch {
+			case queryErr != nil:
+				// An older server does not know the request. Saying so is
+				// better than pretending there are no remote mounts, and the
+				// wire's own wording is not what a user needs to read: the
+				// fix is to update and restart the server.
+				if strings.Contains(queryErr.Error(), "not implemented") {
+					fmt.Fprintf(stdout, "  Remote mounts: (server does not support listing mounts; update and restart it)\n")
+				} else {
+					fmt.Fprintf(stdout, "  Remote mounts: (%v)\n", queryErr)
+				}
+			case len(mounts) == 0:
+				fmt.Fprintf(stdout, "  Remote mounts: (none)\n")
+			default:
+				fmt.Fprintf(stdout, "  Remote mounts via %s:\n", addr)
+				for _, m := range mounts {
+					name := m.Name
+					if name == "" {
+						name = "(unnamed)"
+					}
+					fmt.Fprintf(stdout, "    %s  %s", name, m.MountPoint)
+					if m.RemoteAddr != "" {
+						fmt.Fprintf(stdout, "  from %s", m.RemoteAddr)
+					}
+					if !m.Since.IsZero() {
+						up := time.Since(m.Since)
+						if up < 0 {
+							// Server and this machine disagree about the time;
+							// a negative age would read as nonsense.
+							up = 0
+						}
+						fmt.Fprintf(stdout, "  up %s", up.Round(time.Second))
+					}
+					fmt.Fprintln(stdout)
+				}
+			}
+		}
+	}
+
 	fmt.Fprintf(stdout, "\n")
 	return 0
+}
+
+// statusServerAddress returns the server whose mounts status should ask about,
+// or "" when no local config names one.
+//
+// The server's own config comes first: on the machine that aggregates, that is
+// the authority. Then the mount config and any client config, so a machine that
+// runs only one role still reports the federation it belongs to.
+func statusServerAddress() string {
+	if path, err := config.ServerPath(); err == nil {
+		if cfg, err := config.Load(path); err == nil {
+			if cfg.Server != "" {
+				return cfg.Server
+			}
+			if cfg.Listen != "" {
+				// An older config predates the listen/server split.
+				return dialAddress(cfg.Listen)
+			}
+		}
+	}
+	if path, err := config.MountPath(); err == nil {
+		if cfg, err := config.Load(path); err == nil && cfg.Server != "" {
+			return cfg.Server
+		}
+	}
+	home, _ := os.UserHomeDir()
+	dirs, _ := filepath.Glob(filepath.Join(home, "peerfold-client-*"))
+	for _, dir := range dirs {
+		if cfg, err := config.Load(filepath.Join(dir, "config.json")); err == nil && cfg.Server != "" {
+			return cfg.Server
+		}
+	}
+	return ""
 }
 
 // cmdStop stops a running component.

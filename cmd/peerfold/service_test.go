@@ -8,6 +8,10 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/ispengya/peerfold/internal/config"
+	"github.com/ispengya/peerfold/internal/server"
+	"github.com/ispengya/peerfold/internal/viewer"
 )
 
 // TestDefaultClientNamePrefersComputerName pins the interactive default: the
@@ -94,6 +98,51 @@ func TestStatusReportsTheMount(t *testing.T) {
 // itoa is strconv.Itoa under a shorter name, so the test above reads as the
 // sentence it is making.
 func itoa(n int) string { return strconv.Itoa(n) }
+
+// TestStatusListsMountsOnAnotherMachine pins the reason the viewer registry
+// exists: the mount and the status command that sees it are different
+// processes, and the status side has no local pid file to consult. Only the
+// server knows about the mount, and status has to ask it.
+func TestStatusListsMountsOnAnotherMachine(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)        // unix
+	t.Setenv("USERPROFILE", home) // windows
+
+	s := server.New("127.0.0.1:0")
+	if err := s.Err(); err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+	go s.Serve()
+	defer s.Close()
+	addr := s.Addr().String()
+
+	cfg := config.Default()
+	cfg.Server = addr
+	cfgPath, err := config.ServerPath()
+	if err != nil {
+		t.Fatalf("ServerPath: %v", err)
+	}
+	if err := config.Save(cfgPath, cfg); err != nil {
+		t.Fatalf("config.Save: %v", err)
+	}
+
+	m, err := viewer.DialMount(addr, "winbox", `C:\Users\me\peerfold`)
+	if err != nil {
+		t.Fatalf("DialMount: %v", err)
+	}
+	defer m.Close()
+
+	var out, errOut bytes.Buffer
+	if code := cmdStatus(nil, &out, &errOut); code != 0 {
+		t.Fatalf("cmdStatus() = %d, stderr = %q", code, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{"Remote mounts via " + addr, "winbox", `C:\Users\me\peerfold`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("status output missing %q:\n%s", want, got)
+		}
+	}
+}
 
 // TestPidFileRoundTrip pins the portable pid-file helpers against the real
 // home directory layout.

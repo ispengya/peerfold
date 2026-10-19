@@ -40,6 +40,13 @@ const (
 	KindMkdir   = "mkdir"
 	KindRename  = "rename"
 	KindRemove  = "remove"
+
+	// KindViewers asks the server which mounts are currently attached to it.
+	// It is answered with KindViewersOK, whose body lists them. The question is
+	// how `peerfold status` sees a mount running on another machine: the mount
+	// is a viewer, and no local pid file can describe a process elsewhere.
+	KindViewers   = "viewers"
+	KindViewersOK = "viewers_ok"
 )
 
 // Write-body modes. A whole-file write-back either replaces what is there or
@@ -68,6 +75,12 @@ type HelloBody struct {
 	Role      string   `json:"role"`
 	Shares    []string `json:"shares"`
 	Aggregate bool     `json:"aggregate"`
+
+	// MountPoint is set by a mount viewer: the directory it exposes on its
+	// own machine. It is what distinguishes a mount from the short-lived
+	// viewer a command like `peerfold ls` opens, and an ordinary viewer leaves
+	// it empty. Older servers ignore it, which is why it is omitempty.
+	MountPoint string `json:"mount_point,omitempty"`
 }
 
 // HelloOKBody answers a hello. Aggregate reports the server's ruling: a second
@@ -178,4 +191,26 @@ type RemoveBody struct {
 type EventBody struct {
 	Seq   uint64     `json:"seq,omitempty"`
 	Nodes []NodeJSON `json:"nodes"`
+}
+
+// ViewerInfo describes one mount connected to the server.
+//
+// It is the server's account of the connection, not the mount's: Name and
+// MountPoint are what the mount declared in its hello, while RemoteAddr is
+// what the server observed and Since is when it accepted the connection. That
+// split means status can report a mount even when the machine running it is
+// unreachable by any other route.
+type ViewerInfo struct {
+	Name       string `json:"name"`
+	MountPoint string `json:"mount_point"`
+	RemoteAddr string `json:"remote_addr"`
+	// Since is Unix seconds. A JSON time would need a time zone and a parser
+	// on every peer for no benefit: the only thing anyone does with it is
+	// subtract it from now.
+	Since int64 `json:"since"`
+}
+
+// ViewersOKBody is the answer to KindViewers.
+type ViewersOKBody struct {
+	Viewers []ViewerInfo `json:"viewers"`
 }

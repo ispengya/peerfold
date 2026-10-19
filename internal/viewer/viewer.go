@@ -114,16 +114,49 @@ type Viewer struct {
 // rather than half-fixed, and it is recorded as a limitation.
 const readWindow = 20 * time.Millisecond
 
+// Mount is one mount attached to a server, as the server describes it.
+//
+// It is a value rather than a live connection: the mount is on some other
+// machine and this is a snapshot of what the server knows about it.
+type Mount struct {
+	Name       string
+	MountPoint string
+	RemoteAddr string
+	// Since is when the server accepted the mount's connection, or the zero
+	// time if the server did not say.
+	Since time.Time
+}
+
 // Dial connects to serverAddr and completes the viewer handshake: the server
 // replies to the hello with its name and aggregate ruling, and a viewer is not
 // registered, so it can observe but cannot publish.
 func Dial(serverAddr string) (*Viewer, error) {
-	conn, err := net.DialTimeout("tcp", serverAddr, dialTimeout)
+	return dial(serverAddr, "", "", dialTimeout)
+}
+
+// DialMount connects as a viewer that also tells the server where it is
+// mounted. That declaration is what makes the mount visible to other machines:
+// the server records it, and their `peerfold status` asks for the list.
+func DialMount(serverAddr, name, mountPoint string) (*Viewer, error) {
+	return dial(serverAddr, name, mountPoint, dialTimeout)
+}
+
+// DialTimeout is Dial with a caller-chosen bound on the dial and handshake.
+//
+// `peerfold status` uses it: a server that is down should cost status a short
+// wait, not the ten seconds a deliberate dial is allowed.
+func DialTimeout(serverAddr string, timeout time.Duration) (*Viewer, error) {
+	return dial(serverAddr, "", "", timeout)
+}
+
+// dial is the shared body of the constructors above.
+func dial(serverAddr, name, mountPoint string, timeout time.Duration) (*Viewer, error) {
+	conn, err := net.DialTimeout("tcp", serverAddr, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("viewer: dial %s: %w", serverAddr, err)
 	}
 	v := &Viewer{conn: conn, pc: proto.NewConn(conn)}
-	if err := v.handshake(); err != nil {
+	if err := v.handshake(timeout, name, mountPoint); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -131,8 +164,12 @@ func Dial(serverAddr string) (*Viewer, error) {
 }
 
 // handshake sends the hello and requires a hello_ok back.
-func (v *Viewer) handshake() error {
-	body, err := json.Marshal(proto.HelloBody{Role: proto.RoleViewer})
+func (v *Viewer) handshake(timeout time.Duration, name, mountPoint string) error {
+	body, err := json.Marshal(proto.HelloBody{
+		Role:       proto.RoleViewer,
+		Name:       name,
+		MountPoint: mountPoint,
+	})
 	if err != nil {
 		return fmt.Errorf("viewer: encode hello: %w", err)
 	}
@@ -140,7 +177,7 @@ func (v *Viewer) handshake() error {
 	if err != nil {
 		return err
 	}
-	env, err := v.recv(dialTimeout)
+	env, err := v.recv(timeout)
 	if err != nil {
 		return fmt.Errorf("viewer: read hello reply: %w", err)
 	}
@@ -181,6 +218,56 @@ func (v *Viewer) List(path string) ([]node.Node, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// ListMounts asks the server which mounts are attached to it. An empty list is
+// a server with no mounts, not an error.
+func (v *Viewer) ListMounts() ([]Mount, error) {
+	var out []Mount
+	err := v.stream(func() error {
+		id, err := v.send(proto.KindViewers, nil)
+		if err != nil {
+			return err
+		}
+		env, err := v.recv(callTimeout)
+		if err != nil {
+			return fmt.Errorf("viewer: read mounts reply: %w", err)
+		}
+		if env.Err != "" {
+			return fmt.Errorf("viewer: %s", env.Err)
+		}
+		if env.ID != id {
+			return fmt.Errorf("viewer: mounts reply ID = %d, want %d: replies are out of step", env.ID, id)
+		}
+		if env.Kind != proto.KindViewersOK {
+			return fmt.Errorf("viewer: mounts reply kind = %q, want %q", env.Kind, proto.KindViewersOK)
+		}
+		// The list is small and arrives whole in the envelope. A missing body
+		// is a protocol error rather than "no mounts": the server always sends
+		// the field, even when it is empty.
+		if env.Body == nil {
+			return fmt.Errorf("viewer: mounts reply carried no body")
+		}
+		var b proto.ViewersOKBody
+		if err := json.Unmarshal(env.Body, &b); err != nil {
+			return fmt.Errorf("viewer: decode mounts reply: %w", err)
+		}
+		out = make([]Mount, 0, len(b.Viewers))
+		for _, m := range b.Viewers {
+			var since time.Time
+			if m.Since > 0 {
+				since = time.Unix(m.Since, 0)
+			}
+			out = append(out, Mount{
+				Name:       m.Name,
+				MountPoint: m.MountPoint,
+				RemoteAddr: m.RemoteAddr,
+				Since:      since,
+			})
+		}
+		return nil
+	})
+	return out, err
 }
 
 // list asks for one directory of the aggregated tree.
