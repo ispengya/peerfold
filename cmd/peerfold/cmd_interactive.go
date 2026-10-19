@@ -134,6 +134,19 @@ func interactiveClient(input io.Reader, out, errw io.Writer) int {
 		shareName := promptString(in, out, "Share name", "docs")
 		shareDir := promptString(in, out, "Share directory", defaultShareDir(name))
 
+		// The generated default lives under peerfold-demo and does not exist on
+		// a fresh machine. Creating it here is what makes the default usable;
+		// without it the client saved the config, dialed, and then failed with
+		// "lstat <dir>: no such file or directory".
+		_, statErr := os.Stat(shareDir)
+		if err := os.MkdirAll(shareDir, 0o755); err != nil {
+			fmt.Fprintf(errw, "  [X] Failed to create share directory %s: %v\n", shareDir, err)
+			return 1
+		}
+		if os.IsNotExist(statErr) {
+			fmt.Fprintf(out, "  [OK] Created share directory: %s\n", shareDir)
+		}
+
 		cfg = config.Default()
 		cfg.Server = server
 		cfg.ClientName = name
@@ -155,8 +168,11 @@ func interactiveClient(input io.Reader, out, errw io.Writer) int {
 
 	fmt.Fprintf(out, "\n")
 
-	// 3. Build CLI args
-	cliArgs := []string{"client", "--daemon",
+	// 3. Build CLI args. --daemon marks a background child and is stripped by
+	// dispatch before cmdClient parses flags. The foreground path calls
+	// cmdClient directly, so it must not carry the flag: doing so made
+	// `peerfold client` fail with "flag provided but not defined: -daemon".
+	cliArgs := []string{
 		"--server", cfg.Server,
 		"--name", cfg.ClientName,
 	}
@@ -166,7 +182,8 @@ func interactiveClient(input io.Reader, out, errw io.Writer) int {
 
 	if mode == 1 {
 		// Background
-		pid, err := launchBackground(cliArgs)
+		launchArgs := append([]string{"client", daemonFlag}, cliArgs...)
+		pid, err := launchBackground(launchArgs)
 		if err != nil {
 			fmt.Fprintf(errw, "  [X] Failed to start: %v\n", err)
 			return 1
@@ -182,7 +199,7 @@ func interactiveClient(input io.Reader, out, errw io.Writer) int {
 	// Foreground — record PID so status can see it, then run inline
 	writePID(component, os.Getpid())
 	fmt.Fprintf(out, "  [OK] Starting client '%s' (Ctrl-C to stop)\n\n", cfg.ClientName)
-	code := cmdClient(cliArgs[1:], out, errw)
+	code := cmdClient(cliArgs, out, errw)
 	clearPID(component)
 	return code
 }

@@ -44,6 +44,80 @@ func TestInteractiveMountSavesConfig(t *testing.T) {
 	}
 }
 
+// TestInteractiveClientForegroundStartsWithoutDaemonFlag pins that the
+// foreground path of the interactive client hands cmdClient arguments its flag
+// set accepts. --daemon is an internal marker for the background child and is
+// stripped by dispatch, but the foreground path calls cmdClient directly, so
+// passing it made `peerfold client` exit with
+// "flag provided but not defined: -daemon" instead of starting.
+//
+// The server address is a closed port on purpose: the test only needs the
+// client to get as far as dialing, which proves the flags parsed.
+func TestInteractiveClientForegroundStartsWithoutDaemonFlag(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("USERPROFILE", home) // windows
+	t.Setenv("HOME", home)        // unix
+
+	share := filepath.Join(home, "docs")
+	if err := os.MkdirAll(share, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(home, "peerfold-client-alice", "config.json")
+	if err := config.Save(cfgPath, config.Config{
+		Server:     "127.0.0.1:1",
+		ClientName: "alice",
+		Shares:     map[string]string{"docs": share},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	code := interactiveClient(strings.NewReader("1\n"), &out, &errOut)
+
+	if strings.Contains(errOut.String(), "flag provided but not defined") {
+		t.Fatalf("foreground client passed --daemon to cmdClient:\n%s", errOut.String())
+	}
+	if code == 0 {
+		t.Fatalf("client with an unreachable server returned 0; out=%q err=%q",
+			out.String(), errOut.String())
+	}
+	if !strings.Contains(out.String(), "Starting client 'alice'") {
+		t.Errorf("output missing start message:\n%s", out.String())
+	}
+	if !strings.Contains(errOut.String(), "127.0.0.1:1") {
+		t.Errorf("stderr missing the dial failure for the configured server:\n%s", errOut.String())
+	}
+}
+
+// TestInteractiveClientCreatesDefaultShareDir pins that a fresh interactive
+// setup makes the directory it is about to share. The default lives under
+// peerfold-demo and does not exist yet, and the client refuses to start on a
+// missing share — so a user who accepted the default used to get a saved
+// config and an immediate lstat failure.
+func TestInteractiveClientCreatesDefaultShareDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("USERPROFILE", home) // windows
+	t.Setenv("HOME", home)        // unix
+
+	// Name, server, share name, empty share directory (take the default),
+	// foreground mode. The server is a closed port so the dial fails fast.
+	input := strings.NewReader("alice\n127.0.0.1:1\ndocs\n\n1\n")
+	var out, errOut bytes.Buffer
+	code := interactiveClient(input, &out, &errOut)
+
+	shareDir := filepath.Join(home, "peerfold-demo", "alice")
+	if _, err := os.Stat(shareDir); err != nil {
+		t.Fatalf("default share directory was not created (code=%d, out=%q err=%q): %v",
+			code, out.String(), errOut.String(), err)
+	}
+	if strings.Contains(errOut.String(), "no such file or directory") {
+		t.Fatalf("client started against a missing share directory:\n%s", errOut.String())
+	}
+	if !strings.Contains(out.String(), "Created share directory") {
+		t.Errorf("output missing share directory creation:\n%s", out.String())
+	}
+}
+
 // TestInteractiveMountRejectsRelativePoint pins that a relative mount point
 // is refused interactively as well as on the command line: a mount that
 // follows the working directory is not a location the user can find later.
