@@ -5,8 +5,8 @@ import (
 	"sync"
 	"testing"
 
-	"peerfold/internal/index"
-	"peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/index"
+	"github.com/ispengya/peerfold/internal/node"
 )
 
 // dir and file build the two node kinds the index stores, so the tests say

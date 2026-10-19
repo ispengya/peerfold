@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"peerfold/internal/client"
+	"github.com/ispengya/peerfold/internal/client"
 )
 
 func TestRunUnknownCommand(t *testing.T) {

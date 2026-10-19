@@ -12,10 +12,13 @@ import (
 	"syscall"
 	"time"
 
-	"peerfold/internal/config"
+	"github.com/ispengya/peerfold/internal/config"
 )
 
 // ── PID management ─────────────────────────────────────────
+//
+// Portable: the pid file layout is the same on every platform. Whether a pid
+// is alive and how a process is launched live in proc_windows.go / proc_unix.go.
 
 // pidFilePath returns the PID file for a component ("server" or "client-<name>").
 func pidFilePath(component string) (string, error) {
@@ -68,26 +71,10 @@ func clearPID(component string) error {
 	return os.Remove(path)
 }
 
-// isProcessAlive checks if a process with the given PID is running.
-func isProcessAlive(pid int) bool {
-	// On Windows, os.FindProcess always succeeds; we must actually try to
-	// query the process. Opening with PROCESS_QUERY_LIMITED_INFORMATION is
-	// the lightest way.
-	const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-	h, err := syscall.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
-	if err != nil {
-		return false
-	}
-	defer syscall.CloseHandle(h)
-	var code uint32
-	if err := syscall.GetExitCodeProcess(h, &code); err != nil {
-		return false
-	}
-	// STILL_ACTIVE = 259
-	return code == 259
-}
-
 // killProcess terminates a process, first gracefully then forcefully.
+//
+// SIGTERM is portable: on Windows Go maps it to TerminateProcess, which is
+// the only graceful-ish stop that OS offers a console process.
 func killProcess(pid int) error {
 	if !isProcessAlive(pid) {
 		return nil
@@ -111,16 +98,14 @@ func killProcess(pid int) error {
 
 // ── Background process launch ──────────────────────────────
 
-// launchBackground starts peerfold.exe in the background and returns its PID.
+// launchBackground starts this executable in the background and returns its PID.
 func launchBackground(args []string) (int, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return 0, err
 	}
 	cmd := exec.Command(exe, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
-	}
+	cmd.SysProcAttr = backgroundSysProcAttr()
 	// Redirect output to log file
 	component := "peerfold"
 	if len(args) > 0 {
@@ -143,86 +128,31 @@ func launchBackground(args []string) (int, error) {
 	return cmd.Process.Pid, nil
 }
 
-// ── Auto-start registry (Windows) ──────────────────────────
-
-const autoStartRegPath = `Software\Microsoft\Windows\CurrentVersion\Run`
-
-// setAutoStart registers a component to start on login.
-func setAutoStart(component, args string) error {
-	exe, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	value := fmt.Sprintf(`"%s" %s`, exe, args)
-	return writeRegistry(autoStartRegPath, "peerfold-"+component, value)
-}
-
-// removeAutoStart removes the auto-start registration.
-func removeAutoStart(component string) error {
-	return deleteRegistry(autoStartRegPath, "peerfold-"+component)
-}
-
-// hasAutoStart checks if a component is registered for auto-start.
-func hasAutoStart(component string) bool {
-	_, err := readRegistry(autoStartRegPath, "peerfold-"+component)
-	return err == nil
-}
-
-// ── Registry helpers (Windows-specific via reg.exe) ────────
-
-func writeRegistry(path, name, value string) error {
-	cmd := exec.Command("reg", "add",
-		`HKCU\`+path, "/v", name, "/t", "REG_SZ", "/d", value, "/f")
-	return cmd.Run()
-}
-
-func readRegistry(path, name string) (string, error) {
-	cmd := exec.Command("reg", "query",
-		`HKCU\`+path, "/v", name)
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	// Parse output: "name    REG_SZ    value"
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, name) {
-			parts := strings.SplitN(line, "REG_SZ", 2)
-			if len(parts) == 2 {
-				return strings.TrimSpace(parts[1]), nil
-			}
-		}
-	}
-	return "", fmt.Errorf("not found")
-}
-
-func deleteRegistry(path, name string) error {
-	cmd := exec.Command("reg", "delete",
-		`HKCU\`+path, "/v", name, "/f")
-	return cmd.Run()
-}
-
 // ── Interactive prompts ────────────────────────────────────
+//
+// The prompts share one *bufio.Reader for the whole interactive session. A
+// fresh Scanner per question would read ahead past the newline and swallow
+// the next answers whenever input arrives as a block (a pipe, a test, a
+// here-doc). One reader keeps the leftovers for the next prompt.
 
-func promptString(in io.Reader, out io.Writer, label, defaultVal string) string {
+func promptString(in *bufio.Reader, out io.Writer, label, defaultVal string) string {
 	if defaultVal != "" {
 		fmt.Fprintf(out, "  %s [%s]: ", label, defaultVal)
 	} else {
 		fmt.Fprintf(out, "  %s: ", label)
 	}
-	scanner := bufio.NewScanner(in)
-	if scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			return defaultVal
-		}
-		return line
+	line, err := in.ReadString('\n')
+	line = strings.TrimSpace(line)
+	if err != nil && line == "" {
+		return defaultVal
 	}
-	return defaultVal
+	if line == "" {
+		return defaultVal
+	}
+	return line
 }
 
-func promptChoice(in io.Reader, out io.Writer, label string, options []string, defaultIdx int) int {
+func promptChoice(in *bufio.Reader, out io.Writer, label string, options []string, defaultIdx int) int {
 	for i, opt := range options {
 		marker := " "
 		if i == defaultIdx {
@@ -231,31 +161,27 @@ func promptChoice(in io.Reader, out io.Writer, label string, options []string, d
 		fmt.Fprintf(out, "  %s %s\n", marker, opt)
 	}
 	fmt.Fprintf(out, "  Choose [1-%d, default %d]: ", len(options), defaultIdx+1)
-	scanner := bufio.NewScanner(in)
-	if scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if n, err := strconv.Atoi(line); err == nil && n >= 1 && n <= len(options) {
-			return n - 1
-		}
+	line, _ := in.ReadString('\n')
+	line = strings.TrimSpace(line)
+	if n, err := strconv.Atoi(line); err == nil && n >= 1 && n <= len(options) {
+		return n - 1
 	}
 	return defaultIdx
 }
 
-func promptBool(in io.Reader, out io.Writer, label string, defaultVal bool) bool {
+func promptBool(in *bufio.Reader, out io.Writer, label string, defaultVal bool) bool {
 	hint := "y/N"
 	if defaultVal {
 		hint = "Y/n"
 	}
 	fmt.Fprintf(out, "  %s [%s]: ", label, hint)
-	scanner := bufio.NewScanner(in)
-	if scanner.Scan() {
-		line := strings.ToLower(strings.TrimSpace(scanner.Text()))
-		switch line {
-		case "y", "yes":
-			return true
-		case "n", "no":
-			return false
-		}
+	line, _ := in.ReadString('\n')
+	line = strings.ToLower(strings.TrimSpace(line))
+	switch line {
+	case "y", "yes":
+		return true
+	case "n", "no":
+		return false
 	}
 	return defaultVal
 }

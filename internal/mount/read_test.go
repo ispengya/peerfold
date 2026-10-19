@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/node"
 )
 
 // OReadOnly and OReadWrite are cgofuse's flag values, declared here because the

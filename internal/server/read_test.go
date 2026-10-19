@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"peerfold/internal/proto"
+	"github.com/ispengya/peerfold/internal/proto"
 )
 
 // A read answer is three parts in every direction, and these tests pin that

@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"peerfold/internal/proto"
+	"github.com/ispengya/peerfold/internal/proto"
 )
 
 // sendAsync runs fn in a goroutine and returns a channel carrying its error.

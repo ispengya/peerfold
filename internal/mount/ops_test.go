@@ -3,7 +3,7 @@ package mount
 import (
 	"testing"
 
-	"peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/node"
 )
 
 func TestGetattrRoot(t *testing.T) {

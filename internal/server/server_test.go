@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"peerfold/internal/node"
-	"peerfold/internal/proto"
-	"peerfold/internal/server"
+	"github.com/ispengya/peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/proto"
+	"github.com/ispengya/peerfold/internal/server"
 )
 
 // start brings a server up on a loopback port and returns it with its address.

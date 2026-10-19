@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/node"
 )
 
 // ------------------------------------------------------------------ the tests

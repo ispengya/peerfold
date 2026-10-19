@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"peerfold/internal/config"
+	"github.com/ispengya/peerfold/internal/config"
 )
 
 // TestMountOptionsComeFromTheConfig proves the three config keys are read rather

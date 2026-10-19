@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"peerfold/internal/client"
+	"github.com/ispengya/peerfold/internal/client"
 )
 
 // fsWriteFixture builds a share with a directory, a file, and a subdirectory

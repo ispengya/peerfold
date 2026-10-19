@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"peerfold/internal/client"
-	"peerfold/internal/config"
+	"github.com/ispengya/peerfold/internal/client"
+	"github.com/ispengya/peerfold/internal/config"
 )
 
 // cliWriteFixture brings up a server and a client sharing a directory holding

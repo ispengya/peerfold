@@ -7,8 +7,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"peerfold/internal/errtoken"
-	"peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/errtoken"
+	"github.com/ispengya/peerfold/internal/node"
 )
 
 // FS performs the local filesystem operations the server routes to this

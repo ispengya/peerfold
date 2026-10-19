@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"peerfold/internal/client"
-	"peerfold/internal/config"
-	"peerfold/internal/server"
+	"github.com/ispengya/peerfold/internal/client"
+	"github.com/ispengya/peerfold/internal/config"
+	"github.com/ispengya/peerfold/internal/server"
 )
 
 // startServerForCLI brings up a real server and returns its address, so the ls

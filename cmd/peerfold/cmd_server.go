@@ -10,9 +10,9 @@ import (
 	"os"
 	"os/signal"
 
-	"peerfold/internal/config"
-	"peerfold/internal/logging"
-	"peerfold/internal/server"
+	"github.com/ispengya/peerfold/internal/config"
+	"github.com/ispengya/peerfold/internal/logging"
+	"github.com/ispengya/peerfold/internal/server"
 )
 
 // cmdServer runs the aggregation server until interrupted.

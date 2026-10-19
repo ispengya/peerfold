@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"peerfold/internal/client"
-	"peerfold/internal/index"
-	"peerfold/internal/node"
-	"peerfold/internal/proto"
-	"peerfold/internal/server"
+	"github.com/ispengya/peerfold/internal/client"
+	"github.com/ispengya/peerfold/internal/index"
+	"github.com/ispengya/peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/proto"
+	"github.com/ispengya/peerfold/internal/server"
 )
 
 // startServer brings up a real server on a loopback port.

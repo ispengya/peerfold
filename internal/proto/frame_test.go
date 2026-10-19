@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"peerfold/internal/proto"
+	"github.com/ispengya/peerfold/internal/proto"
 )
 
 func TestFrameControlRoundTrip(t *testing.T) {

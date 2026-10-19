@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/node"
 )
 
 // The type bits, matching cgofuse's S_IFDIR, S_IFREG and S_IFLNK, which are the

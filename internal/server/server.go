@@ -10,10 +10,10 @@ import (
 	"sync"
 	"time"
 
-	"peerfold/internal/index"
-	"peerfold/internal/logging"
-	"peerfold/internal/node"
-	"peerfold/internal/proto"
+	"github.com/ispengya/peerfold/internal/index"
+	"github.com/ispengya/peerfold/internal/logging"
+	"github.com/ispengya/peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/proto"
 )
 
 // helloTimeout bounds the handshake only. An established connection is not

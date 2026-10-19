@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/node"
 )
 
 // waitFor polls a condition until it holds or the deadline passes. The watch loop

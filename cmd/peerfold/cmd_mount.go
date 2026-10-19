@@ -10,9 +10,9 @@ import (
 	"strconv"
 	"strings"
 
-	"peerfold/internal/config"
-	"peerfold/internal/mount"
-	"peerfold/internal/viewer"
+	"github.com/ispengya/peerfold/internal/config"
+	"github.com/ispengya/peerfold/internal/mount"
+	"github.com/ispengya/peerfold/internal/viewer"
 )
 
 // cmdMount is the entry point for `peerfold mount`.

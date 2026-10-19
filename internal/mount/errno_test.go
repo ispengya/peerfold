@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"peerfold/internal/viewer"
+	"github.com/ispengya/peerfold/internal/viewer"
 )
 
 func TestErrnoForKnownTokens(t *testing.T) {

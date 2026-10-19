@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"peerfold/internal/logging"
-	"peerfold/internal/node"
-	"peerfold/internal/proto"
+	"github.com/ispengya/peerfold/internal/logging"
+	"github.com/ispengya/peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/proto"
 )
 
 const (

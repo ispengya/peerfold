@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"peerfold/internal/proto"
+	"github.com/ispengya/peerfold/internal/proto"
 )
 
 // A write answer is the same three parts a read answer is — a head control

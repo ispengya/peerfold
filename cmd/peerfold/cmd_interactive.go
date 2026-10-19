@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 
-	"peerfold/internal/config"
+	"github.com/ispengya/peerfold/internal/config"
+	"github.com/ispengya/peerfold/internal/mount"
 )
 
 // daemonFlag is the internal flag that marks a process as the background
@@ -15,7 +17,8 @@ const daemonFlag = "--daemon"
 
 // interactiveServer guides the user through starting the server.
 // It is called when `peerfold server` runs without flags.
-func interactiveServer(in io.Reader, out, errw io.Writer) int {
+func interactiveServer(input io.Reader, out, errw io.Writer) int {
+	in := bufio.NewReader(input)
 	home, _ := os.UserHomeDir()
 	cfgDir := filepath.Join(home, "peerfold-server")
 	cfgPath := filepath.Join(cfgDir, "config.json")
@@ -94,17 +97,15 @@ func interactiveServer(in io.Reader, out, errw io.Writer) int {
 
 // interactiveClient guides the user through starting a client.
 // It is called when `peerfold client` runs without flags.
-func interactiveClient(in io.Reader, out, errw io.Writer) int {
+func interactiveClient(input io.Reader, out, errw io.Writer) int {
+	in := bufio.NewReader(input)
 	home, _ := os.UserHomeDir()
 
 	fmt.Fprintf(out, "\n  peerfold client\n")
 	fmt.Fprintf(out, "  ------------------------------------\n\n")
 
 	// 1. Determine name first (needed for config path)
-	name := os.Getenv("COMPUTERNAME")
-	if name == "" {
-		name = "peerfold"
-	}
+	name := defaultClientName()
 
 	// Check if there's exactly one existing client config
 	existing := findSingleClientConfig(home)
@@ -131,7 +132,7 @@ func interactiveClient(in io.Reader, out, errw io.Writer) int {
 		name = promptString(in, out, "Client name", name)
 		server := promptString(in, out, "Server address", "127.0.0.1:7000")
 		shareName := promptString(in, out, "Share name", "docs")
-		shareDir := promptString(in, out, "Share directory", "C:\\peerfold-demo\\"+name)
+		shareDir := promptString(in, out, "Share directory", defaultShareDir(name))
 
 		cfg = config.Default()
 		cfg.Server = server
@@ -186,6 +187,69 @@ func interactiveClient(in io.Reader, out, errw io.Writer) int {
 	return code
 }
 
+// interactiveMount guides the user through mounting the federated tree.
+// It is called when `peerfold mount` runs without flags.
+//
+// Mount is the read/write window onto the federation, so it only needs two
+// things: where the server is and where the tree should appear. Both are
+// written to the config before the mount starts, so the next run of
+// `peerfold mount` can skip the questions.
+func interactiveMount(input io.Reader, out, errw io.Writer) int {
+	in := bufio.NewReader(input)
+	home, _ := os.UserHomeDir()
+	cfgDir := filepath.Join(home, "peerfold-server")
+	cfgPath := filepath.Join(cfgDir, "config.json")
+
+	fmt.Fprintf(out, "\n  peerfold mount\n")
+	fmt.Fprintf(out, "  ------------------------------------\n\n")
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		cfg = config.Default()
+		fmt.Fprintf(out, "  No config found. Let's set one up.\n\n")
+	} else {
+		fmt.Fprintf(out, "  [OK] Loaded config: %s\n", cfgPath)
+		if cfg.Server != "" {
+			fmt.Fprintf(out, "       Server: %s\n", cfg.Server)
+		}
+		if cfg.MountPoint != "" {
+			fmt.Fprintf(out, "       Mount:  %s\n", cfg.MountPoint)
+		}
+		fmt.Fprintf(out, "\n  Press Enter to keep a value in [brackets].\n\n")
+	}
+
+	server := cfg.Server
+	if server == "" {
+		server = "127.0.0.1:7000"
+	}
+	server = promptString(in, out, "Server address", server)
+
+	mountPoint := cfg.MountPoint
+	if mountPoint == "" {
+		if p, err := mount.DefaultMountPoint(); err == nil {
+			mountPoint = p
+		}
+	}
+	mountPoint = promptString(in, out, "Mount point", mountPoint)
+
+	if !filepath.IsAbs(mountPoint) {
+		fmt.Fprintf(errw, "  [X] Mount point must be an absolute path (got %q)\n", mountPoint)
+		return 1
+	}
+
+	cfg.Server = server
+	cfg.MountPoint = mountPoint
+	if err := config.Save(cfgPath, cfg); err != nil {
+		fmt.Fprintf(errw, "  [X] Failed to save config: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(out, "\n  [OK] Config saved: %s\n\n", cfgPath)
+
+	// Run the mount with the values just gathered. The flags keep one code
+	// path: interactive and scripted both end in runMount.
+	return runMount([]string{"--server", server, "--mount", mountPoint}, out, errw)
+}
+
 // findSingleClientConfig finds a single existing client config file.
 // If there are multiple, it returns empty (user must specify which).
 func findSingleClientConfig(home string) string {
@@ -194,6 +258,20 @@ func findSingleClientConfig(home string) string {
 		return matches[0]
 	}
 	return ""
+}
+
+// defaultClientName returns the interactive setup's suggested client name.
+//
+// Windows sets COMPUTERNAME; elsewhere the host name is the identity, which
+// is the same fallback cmd_client.go uses when --name is omitted.
+func defaultClientName() string {
+	if n := os.Getenv("COMPUTERNAME"); n != "" {
+		return n
+	}
+	if n, err := os.Hostname(); err == nil && n != "" {
+		return n
+	}
+	return "peerfold"
 }
 
 // isDaemon reports whether the process was launched as a background child.

@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"peerfold/internal/client"
-	"peerfold/internal/config"
+	"github.com/ispengya/peerfold/internal/client"
+	"github.com/ispengya/peerfold/internal/config"
 )
 
 // joinWithFiles dials a client sharing a directory built from the given files,

@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"peerfold/internal/config"
-	"peerfold/internal/mount"
+	"github.com/ispengya/peerfold/internal/config"
+	"github.com/ispengya/peerfold/internal/mount"
 )
 
 // TestMountZeroBufferInTheConfigKeepsTheDefault pins the "zero means unset" rule

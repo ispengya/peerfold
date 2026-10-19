@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"peerfold/internal/node"
-	"peerfold/internal/proto"
-	"peerfold/internal/viewer"
+	"github.com/ispengya/peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/proto"
+	"github.com/ispengya/peerfold/internal/viewer"
 )
 
 // sendEvent writes one pushed index update.

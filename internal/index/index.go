@@ -11,7 +11,7 @@ import (
 	"strings"
 	"sync"
 
-	"peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/node"
 )
 
 // ErrNotDir reports that a path exists but is not a directory, so it cannot

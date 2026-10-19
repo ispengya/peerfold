@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"peerfold/internal/mount"
+	"github.com/ispengya/peerfold/internal/mount"
 )
 
 // TestMountIsDispatched pins the arm that turns the whole mount layer into

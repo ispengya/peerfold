@@ -10,7 +10,7 @@ import (
 	"sort"
 	"strings"
 
-	"peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/node"
 )
 
 // Shares is the mapping from share names to absolute directories, plus the

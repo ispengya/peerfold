@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"peerfold/internal/errtoken"
-	"peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/errtoken"
+	"github.com/ispengya/peerfold/internal/node"
 )
 
 // ---------------------------------------------------------------- Create

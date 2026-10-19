@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sync"
 
-	"peerfold/internal/proto"
+	"github.com/ispengya/peerfold/internal/proto"
 )
 
 // Router forwards a request to the client that owns a path and returns that

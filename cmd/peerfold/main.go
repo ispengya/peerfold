@@ -64,6 +64,10 @@ func dispatch(cmd string, rest []string, stdin io.Reader, stdout, stderr io.Writ
 		}
 		return cmdClient(rest, stdout, stderr)
 	case "mount":
+		// No flags: interactive setup, like server and client.
+		if len(rest) == 0 {
+			return interactiveMount(stdin, stdout, stderr)
+		}
 		return cmdMount(rest, stdout, stderr)
 	case "status":
 		return cmdStatus(rest, stdout, stderr)
@@ -106,7 +110,7 @@ service:
   restart     restart a component (server|client)
 
 mount & browse:
-  mount       mount the federated tree as a directory
+  mount       mount the federated tree as a directory (interactive without flags)
   ls          list the aggregated tree
   cat         print a file from the aggregated tree
 

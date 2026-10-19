@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"peerfold/internal/viewer"
+	"github.com/ispengya/peerfold/internal/viewer"
 )
 
 // dialViewer connects a viewer to addr.

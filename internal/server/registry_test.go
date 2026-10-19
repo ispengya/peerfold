@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"peerfold/internal/server"
+	"github.com/ispengya/peerfold/internal/server"
 )
 
 func TestRegistryAggregateIsFirstComeOnly(t *testing.T) {

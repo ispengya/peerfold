@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"peerfold/internal/client"
-	"peerfold/internal/node"
-	"peerfold/internal/viewer"
+	"github.com/ispengya/peerfold/internal/client"
+	"github.com/ispengya/peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/viewer"
 )
 
 // joinExcluding dials a client whose shares skip the named subtrees, and starts

@@ -11,9 +11,9 @@ import (
 	"sort"
 	"strings"
 
-	"peerfold/internal/client"
-	"peerfold/internal/config"
-	"peerfold/internal/logging"
+	"github.com/ispengya/peerfold/internal/client"
+	"github.com/ispengya/peerfold/internal/config"
+	"github.com/ispengya/peerfold/internal/logging"
 )
 
 // cmdClient joins a server and shares local directories.

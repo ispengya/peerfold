@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"peerfold/internal/node"
-	"peerfold/internal/proto"
+	"github.com/ispengya/peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/proto"
 )
 
 // This file drives broadcast's watcher-retirement policy.

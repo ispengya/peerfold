@@ -3,7 +3,7 @@ package node_test
 import (
 	"testing"
 
-	"peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/node"
 )
 
 func TestSplitFirst(t *testing.T) {

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/node"
 )
 
 // fakeCaller is a Caller backed by two maps. It exists so the operation core

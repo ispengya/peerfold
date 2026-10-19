@@ -16,74 +16,161 @@
 └──────────┘
 ```
 
-## Windows 一键使用
+**Windows 与 Linux 可互相混部**：server 在一边、client 在另一边、mount 两边都能挂。协议走 TCP，路径在 wire 上统一用 `/`。
 
-> 以**管理员身份**运行 PowerShell 或 CMD 均可。
-> 有 `.ps1` 和 `.bat` 两个版本，效果一样。
+---
 
-### 1. 启动 server（服务端）
+## 安装
 
-```powershell
-.\setup-server.ps1
+### 一行安装（推荐）
+
+不用 clone、不用装 Go，直接拿二进制：
+
+**Linux / macOS**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ispengya/peerfold/main/install.sh | sh
 ```
 
-或 CMD：
+**Windows — PowerShell**
+
+```powershell
+irm https://raw.githubusercontent.com/ispengya/peerfold/main/install.ps1 | iex
+```
+
+**Windows — CMD**
+
 ```cmd
-setup-server.bat
+curl -fsSL -o install.bat https://raw.githubusercontent.com/ispengya/peerfold/main/install.bat && install.bat
 ```
 
-自动安装 Go + WinFsp → 构建 → 启动 server。已有的依赖会跳过。
+装完 `peerfold` 就在 PATH 里。卸载：
 
-### 2. 启动 client（共享端）
-
-在需要共享文件的机器上（同一台也行）：
-
-```powershell
-.\setup-client.ps1
+```sh
+install.sh --uninstall          # 或
+install.ps1 -Uninstall
 ```
 
-或 CMD：
-```cmd
-setup-client.bat
+指定版本：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ispengya/peerfold/main/install.sh | sh -s -- v1.0.0
 ```
 
-自动安装 Go + WinFsp → 构建 → **输出启动命令**，复制粘贴运行即可。
+### 用 Go 装
 
-也可以直接指定名字和共享目录：
-
-```powershell
-.\setup-client.ps1 -Name alice -ShareDir C:\data\documents
+```sh
+go install github.com/ispengya/peerfold/cmd/peerfold@latest
 ```
 
-### 3. 挂载（查看端）
+### 从源码构建
 
-```powershell
-.\peerfold.exe mount --server 127.0.0.1:7000 --mount C:\Users\你\peerfold
+```sh
+git clone https://github.com/ispengya/peerfold.git
+cd peerfold
+
+./setup-server.sh          # Linux
+.\setup-server.ps1         # Windows
+
+./setup-client.sh          # Linux
+.\setup-client.ps1         # Windows
 ```
 
-挂载点打开后就能像普通文件夹一样读写。
+脚本会装依赖（Go + FUSE/WinFsp）、编译、写 PATH、建配置目录。
 
-### 4. 清除所有环境
+---
 
-```powershell
-.\cleanup.ps1
+## 使用
+
+三个角色都是**不带参数就是交互式 setup**，带参数就直接跑：
+
+```sh
+peerfold server    # 聚合服务端
+peerfold client    # 共享本地目录
+peerfold mount     # 挂载聚合树
 ```
 
-或 CMD：
-```cmd
-cleanup.bat
+带参数示例：
+
+```sh
+# 服务端
+peerfold server --listen 0.0.0.0:7000
+
+# 共享端（可多个 --share）
+peerfold client --server 1.2.3.4:7000 --name alice \
+  --share docs=/home/alice/docs \
+  --share photos=/home/alice/photos
+
+# 挂载端
+peerfold mount --server 1.2.3.4:7000 --mount ~/peerfold
 ```
 
-删除所有配置、日志、演示目录、构建产物，并卸载 WinFsp，不留痕迹。
+### 常用命令
+
+```sh
+peerfold status
+peerfold stop server
+peerfold stop client alice
+peerfold stop all
+peerfold restart server
+peerfold ls / cat / put / mkdir / rm / mv
+```
+
+### 开机自启
+
+交互式选 Background 时可以启用自启：
+
+- **Windows**：写入 HKCU `...\CurrentVersion\Run`
+- **桌面 Linux**：写入 `~/.config/autostart/peerfold-*.desktop`（XDG）
+- **无桌面 Linux**：用 systemd user unit
+
+```ini
+# ~/.config/systemd/user/peerfold-server.service
+[Unit]
+Description=peerfold server
+After=network.target
+
+[Service]
+ExecStart=%h/.local/bin/peerfold server --daemon --listen 0.0.0.0:7000
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user enable --now peerfold-server.service
+```
+
+### 清理
+
+```sh
+./cleanup.sh          # Linux（从源码目录）
+.\cleanup.ps1         # Windows
+```
+
+删配置、日志、自启项、演示目录、构建产物。不动 FUSE/WinFsp 和系统 PATH。
+
+---
+
+## 跨平台混部注意
+
+| 事项 | 说明 |
+|---|---|
+| 路径 | wire 上统一 `/`；本地路径用各平台的分隔符 |
+| 主机名 | client 默认名：Windows 用 `COMPUTERNAME`，Linux 用 `hostname` |
+| 挂载点 | Windows 由 WinFsp 创建目录；Linux 要求目录**已存在且为空** |
+| 挂载依赖 | Windows 要 WinFsp；Linux 要 fuse3（`sudo apt install fuse3`） |
+| 下线语义 | client 断开 → 挂载里对应子树消失；最后一个 owner 下线 → 挂载点释放 |
 
 ## 日志
 
-每个组件的日志在用户主目录下的独立文件夹里：
+```
+~/peerfold-server/log.txt
+~/peerfold-client-<名字>/log.txt
+```
 
-```
-C:\Users\你\peerfold-server\log.txt
-C:\Users\你\peerfold-client-<名字>\log.txt
-```
+Windows 上是 `C:\Users\你\peerfold-server\log.txt` 这种形式。
 
 日志记录每次 list / read / write / mkdir / rename / remove / 文件变化推送。
 

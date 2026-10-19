@@ -7,7 +7,7 @@ import (
 	"reflect"
 	"testing"
 
-	"peerfold/internal/config"
+	"github.com/ispengya/peerfold/internal/config"
 )
 
 func TestConfigDefaultListen(t *testing.T) {

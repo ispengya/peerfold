@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"peerfold/internal/client"
-	"peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/client"
+	"github.com/ispengya/peerfold/internal/node"
 )
 
 // collector gathers watch events so a test can wait for the one it expects

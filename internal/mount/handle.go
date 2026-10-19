@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"log"
 
-	"peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/node"
 )
 
 // openFile is one open handle: the writes it has accumulated but not yet

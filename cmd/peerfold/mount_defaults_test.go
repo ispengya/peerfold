@@ -3,8 +3,8 @@ package main
 import (
 	"testing"
 
-	"peerfold/internal/config"
-	"peerfold/internal/mount"
+	"github.com/ispengya/peerfold/internal/config"
+	"github.com/ispengya/peerfold/internal/mount"
 )
 
 // TestConfigMountDefaultsAgreeWithTheMount is the check the comment on

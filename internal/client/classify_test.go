@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/node"
 )
 
 // classify is tested here, in the internal test package, rather than from

@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"peerfold/internal/proto"
-	"peerfold/internal/viewer"
+	"github.com/ispengya/peerfold/internal/proto"
+	"github.com/ispengya/peerfold/internal/viewer"
 )
 
 // answer is what the fake server does when it is asked for a file.

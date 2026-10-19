@@ -4,8 +4,8 @@ import (
 	"errors"
 	"testing"
 
-	"peerfold/internal/node"
-	"peerfold/internal/server"
+	"github.com/ispengya/peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/server"
 )
 
 // The Query is the read side of the server the CLI drives: it answers "what is

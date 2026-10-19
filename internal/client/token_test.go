@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"testing"
 
-	"peerfold/internal/errtoken"
+	"github.com/ispengya/peerfold/internal/errtoken"
 )
 
 // The classifier is the producing half of the token convention, so its output

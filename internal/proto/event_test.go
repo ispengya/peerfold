@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"peerfold/internal/proto"
+	"github.com/ispengya/peerfold/internal/proto"
 )
 
 // pushEnvelope is a pushed index update: a control frame, no stream, and an ID

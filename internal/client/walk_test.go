@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"peerfold/internal/client"
-	"peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/client"
+	"github.com/ispengya/peerfold/internal/node"
 )
 
 // buildTree creates the fixture both the share tests and Scan use:

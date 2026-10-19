@@ -5,7 +5,7 @@ import (
 	"path"
 	"strings"
 
-	"peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/node"
 )
 
 // startWatch begins consuming the caller's event channel, applying each batch to

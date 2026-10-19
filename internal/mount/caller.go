@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/node"
 )
 
 // Batch is one pushed index update: a group of nodes that arrived together, and

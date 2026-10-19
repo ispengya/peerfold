@@ -4,7 +4,7 @@ import (
 	"path"
 	"strings"
 
-	"peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/node"
 )
 
 // Clean normalises a FUSE path and refuses anything that would escape the

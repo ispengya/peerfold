@@ -16,8 +16,8 @@ import (
 
 	"github.com/winfsp/cgofuse/fuse"
 
-	"peerfold/internal/node"
-	"peerfold/internal/viewer"
+	"github.com/ispengya/peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/viewer"
 )
 
 // Lock_t is the byte-lock shape cgofuse uses for its optional Lock callback.

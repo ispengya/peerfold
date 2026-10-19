@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"peerfold/internal/client"
-	"peerfold/internal/server"
-	"peerfold/internal/viewer"
+	"github.com/ispengya/peerfold/internal/client"
+	"github.com/ispengya/peerfold/internal/server"
+	"github.com/ispengya/peerfold/internal/viewer"
 )
 
 // The real-mount test is the only one that proves this filesystem works.

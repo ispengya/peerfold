@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"peerfold/internal/node"
-	"peerfold/internal/proto"
+	"github.com/ispengya/peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/proto"
 )
 
 // TestEmitDroppingABatchIsVisibleAsAGap pins the mechanism that makes a dropped

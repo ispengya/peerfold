@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"peerfold/internal/config"
+	"github.com/ispengya/peerfold/internal/config"
 )
 
 // TestClientSavesConfigBeforeDialing pins the ordering that makes "one command

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"peerfold/internal/client"
+	"github.com/ispengya/peerfold/internal/client"
 )
 
 // fsFixture builds a share holding one file of known content plus a zero-byte

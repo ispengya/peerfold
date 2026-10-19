@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"io"
 
-	"peerfold/internal/config"
-	"peerfold/internal/node"
-	"peerfold/internal/viewer"
+	"github.com/ispengya/peerfold/internal/config"
+	"github.com/ispengya/peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/viewer"
 )
 
 // cmdTree dispatches the tree commands: the reads, the writes, and the two

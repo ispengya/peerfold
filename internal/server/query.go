@@ -1,7 +1,7 @@
 package server
 
 import (
-	"peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/node"
 )
 
 // Query is the read side of the server: it answers what is currently indexed

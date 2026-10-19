@@ -4,8 +4,8 @@ import (
 	"errors"
 	"strings"
 
-	"peerfold/internal/errtoken"
-	"peerfold/internal/viewer"
+	"github.com/ispengya/peerfold/internal/errtoken"
+	"github.com/ispengya/peerfold/internal/viewer"
 )
 
 // The errno values cgofuse uses on both platforms. They are declared here

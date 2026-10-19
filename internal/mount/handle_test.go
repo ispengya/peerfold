@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/node"
 )
 
 func TestHandleAllocationAndLookup(t *testing.T) {

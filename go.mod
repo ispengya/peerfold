@@ -1,4 +1,4 @@
-module peerfold
+module github.com/ispengya/peerfold
 
 go 1.27.0
 

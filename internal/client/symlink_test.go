@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"peerfold/internal/client"
-	"peerfold/internal/node"
+	"github.com/ispengya/peerfold/internal/client"
+	"github.com/ispengya/peerfold/internal/node"
 )
 
 // A symlink inside a share used to be indexed as a regular file, with Size set
