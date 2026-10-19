@@ -7,6 +7,12 @@ import (
 	"path/filepath"
 )
 
+// platformMountArgs is empty on Linux: the kernel applies the mode Getattr
+// reports directly, and there is no Windows DACL to synthesise.
+func platformMountArgs() []string {
+	return nil
+}
+
 // DefaultMountPoint is ~/peerfold.
 func DefaultMountPoint() (string, error) {
 	home, err := os.UserHomeDir()

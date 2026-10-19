@@ -55,11 +55,15 @@ func mountArgs(opts Options) []string {
 	secs := func(d time.Duration) string {
 		return strconv.FormatFloat(d.Seconds(), 'f', -1, 64)
 	}
-	return []string{
+	args := []string{
 		"-o", "attr_timeout=" + secs(opts.AttrTimeout),
 		"-o", "entry_timeout=" + secs(opts.EntryTimeout),
 		"-o", "negative_timeout=0",
 	}
+	// Platform options go last so a platform that needs to override one of the
+	// shared options above can -- the FUSE option parsers let the last
+	// occurrence win.
+	return append(args, platformMountArgs()...)
 }
 
 // Run mounts and blocks until the mount goes away, ctx is cancelled, or the

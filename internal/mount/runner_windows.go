@@ -7,6 +7,25 @@ import (
 	"path/filepath"
 )
 
+// platformMountArgs is the Windows-specific option list.
+//
+// WinFsp synthesises a file DACL from the POSIX mode Getattr reports. The ACL
+// it builds for 0777 grants read, write, append and write-attributes, but not
+// FILE_WRITE_EA. Windows expands GENERIC_WRITE -- the access editors such as
+// VS Code and Notepad open a file with -- to include FILE_WRITE_EA, so every
+// editor save is refused with ACCESS_DENIED by the driver before any FUSE
+// callback runs. Writing through a tool that asks for explicit access bits
+// (msys bash, for one) still works, which is what made this look like a
+// per-file permission problem rather than a mount-wide one.
+//
+// FileSecurity replaces that synthesised DACL with the one given here. FA is
+// FILE_ALL_ACCESS and WD is Everyone; the mount already widens every node to
+// 0777 and has no notion of users, so the widest grant is the one that matches
+// its model. The owner's own bits stay on the owner's disk.
+func platformMountArgs() []string {
+	return []string{"-o", "FileSecurity=D:P(A;;FA;;;WD)"}
+}
+
 // DefaultMountPoint is %USERPROFILE%\peerfold.
 func DefaultMountPoint() (string, error) {
 	home, err := os.UserHomeDir()
