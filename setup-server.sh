@@ -118,16 +118,6 @@ install_fuse() {
   esac
 }
 
-# build_with runs one build, optionally through a different module proxy.
-build_with() {
-  local tags="$1" proxy="${2:-}"
-  if [ -n "$proxy" ]; then
-    (cd "$PROJECT_ROOT" && GOPROXY="$proxy" GOTOOLCHAIN=auto go build $tags -o "$BIN_PATH" ./cmd/peerfold)
-  else
-    (cd "$PROJECT_ROOT" && go build $tags -o "$BIN_PATH" ./cmd/peerfold)
-  fi
-}
-
 build_binary() {
   # cgofuse on Linux defaults to libfuse2. The scripts install fuse3, so the
   # build asks for the fuse3 variant (CGO_CFLAGS picks /usr/include/fuse3).
@@ -135,20 +125,7 @@ build_binary() {
   case "$(uname -s | tr '[:upper:]' '[:lower:]')" in
     linux) tags="-tags=fuse3" ;;
   esac
-
-  local built=0
-  if build_with "$tags"; then
-    built=1
-  elif [ -z "${GOPROXY:-}" ]; then
-    # proxy.golang.org is not reachable everywhere. A second attempt through a
-    # mirror costs one failed build and turns a network wall into a working
-    # install; an explicit GOPROXY from the user is respected, not replaced.
-    info "Build failed; retrying with GOPROXY=https://goproxy.cn,direct ..."
-    if build_with "$tags" "https://goproxy.cn,direct"; then
-      built=1
-    fi
-  fi
-  if [ "$built" -eq 1 ]; then
+  if (cd "$PROJECT_ROOT" && go build $tags -o "$BIN_PATH" ./cmd/peerfold); then
     local size
     size="$(wc -c < "$BIN_PATH" | tr -d ' ')"
     ok "Build succeeded — ${BIN_PATH} ($((size / 1024 / 1024)) MB)"
@@ -157,37 +134,59 @@ build_binary() {
   return 1
 }
 
-add_to_path() {
-  local marker="# peerfold"
-  local line="export PATH=\"\$PATH:$PROJECT_ROOT\""
-  # $SHELL is the login shell, which is what should be updated. ZSH_VERSION
-  # would only be set when this script itself runs under an interactive zsh;
-  # run as `bash setup-server.sh` it is always empty, and zsh users ended up
-  # with the entry in .bashrc instead.
+install_command() {
+  local bindir="${HOME_DIR}/.local/bin"
+  local target="${bindir}/peerfold"
+
+  if ! mkdir -p "$bindir"; then
+    warn "Could not create $bindir"
+    return 1
+  fi
+
+  # A symlink makes the installed command follow every rebuild; copying is the
+  # fallback for filesystems that do not support links.
+  rm -f "$target"
+  if ln -s "$BIN_PATH" "$target" 2>/dev/null; then
+    ok "Installed: $target -> $BIN_PATH"
+  elif cp "$BIN_PATH" "$target" && chmod 755 "$target"; then
+    ok "Installed: $target"
+  else
+    warn "Could not install $target"
+    return 1
+  fi
+
+  # A child process cannot change its parent's PATH, but it can put the binary
+  # where the parent is already looking. ~/.local/bin is on PATH in most
+  # setups, so installing there makes `peerfold` usable in the very terminal
+  # that ran this script, with no new shell and no `source`.
+  case ":$PATH:" in
+    *":$bindir:"*)
+      ok "On PATH: peerfold is ready in this terminal"
+      return 0
+      ;;
+  esac
+
+  # Fallback for setups where ~/.local/bin is not on PATH yet: add it to the
+  # login shell's rc file. This terminal still needs the export below, because
+  # only a sourced file can change it; future terminals get it from the rc.
+  local marker="# peerfold (~/.local/bin)"
+  local line="export PATH=\"\$HOME/.local/bin:\$PATH\""
   local rc="${HOME_DIR}/.bashrc"
   case "$(basename "${SHELL:-bash}")" in
     zsh) rc="${HOME_DIR}/.zshrc" ;;
   esac
 
-  case ":$PATH:" in
-    *":$PROJECT_ROOT:"*)
-      ok "Already in PATH: $PROJECT_ROOT"
-      return 0
-      ;;
-  esac
-
   if [ -f "$rc" ] && grep -qF "$marker" "$rc" 2>/dev/null; then
     ok "Already in PATH profile: $rc"
-    return 0
+  else
+    {
+      echo ""
+      echo "$marker"
+      echo "$line"
+    } >> "$rc"
+    ok "Added ~/.local/bin to PATH in $rc"
   fi
-
-  {
-    echo ""
-    echo "$marker"
-    echo "$line"
-  } >> "$rc"
-  ok "Added to PATH in $rc"
-  info "For the current terminal: export PATH=\"\$PATH:$PROJECT_ROOT\""
+  info "For this terminal: export PATH=\"\$HOME/.local/bin:\$PATH\""
 }
 
 # ── Start ────────────────────────────────────────────────────
@@ -226,9 +225,8 @@ if [ "$GO_CODE" -lt 1027 ]; then
     fail "Install a current Go from https://go.dev/dl/ and run this again."
     exit 1
   fi
-  # Go 1.21+ can fetch the toolchain go.mod asks for. The download goes through
-  # GOPROXY like any module; build_binary retries through a mirror when the
-  # default proxy is unreachable.
+  # Go 1.21+ can fetch the toolchain go.mod asks for, using whatever GOPROXY
+  # the environment already has. No proxy is hard-coded here.
   ok "Go 1.27+ required; the matching toolchain will be fetched on first build"
   export GOTOOLCHAIN=auto
 fi
@@ -311,9 +309,9 @@ fi
 
 # ── [4/5] PATH ───────────────────────────────────────────────
 
-section 4 "Add to PATH"
+section 4 "Install command"
 
-add_to_path
+install_command
 
 # ── [5/5] Config directories ─────────────────────────────────
 

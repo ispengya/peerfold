@@ -39,6 +39,7 @@ echo "    [x] Config directories and logs"
 echo "    [x] Auto-start entries (XDG)"
 echo "    [x] Demo / test files"
 echo "    [x] Build artifacts (./peerfold)"
+echo "    [x] Installed command (~/.local/bin/peerfold)"
 echo ""
 echo "  Not touched: FUSE, system PATH, source code"
 echo ""
@@ -126,8 +127,10 @@ done
 
 section 5 "Remove build artifacts"
 
-for bin in "${PROJECT_ROOT}/peerfold" "${PROJECT_ROOT}/peerfold.exe"; do
-  if [ -f "$bin" ]; then
+# The installed command is a symlink, so -f alone is not enough: a symlink
+# whose target is already gone still has to be removed.
+for bin in "${PROJECT_ROOT}/peerfold" "${PROJECT_ROOT}/peerfold.exe" "${HOME_DIR}/.local/bin/peerfold"; do
+  if [ -e "$bin" ] || [ -L "$bin" ]; then
     rm -f "$bin"
     gone "$bin"
   else
@@ -142,7 +145,7 @@ echo "  ------------------------------------"
 echo "  Cleanup complete!"
 echo ""
 echo "  Removed: processes, configs, logs, auto-start,"
-echo "           demo files, build artifacts"
+echo "           demo files, build artifacts, installed command"
 echo ""
 echo "  Untouched: FUSE, system PATH, source code"
 echo ""
