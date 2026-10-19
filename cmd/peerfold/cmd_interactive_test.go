@@ -38,21 +38,27 @@ func TestInteractiveMountSavesConfig(t *testing.T) {
 	t.Setenv("HOME", home)        // unix
 
 	mountPoint := filepath.Join(home, "mnt")
-	input := strings.NewReader("127.0.0.1:7000\n" + mountPoint + "\n")
+	// Port 1 is closed on any sane host, so the dial fails immediately. Using
+	// the default port would let this test mount for real on a machine that is
+	// already running a server, and then block in the FUSE loop.
+	input := strings.NewReader("127.0.0.1:1\n" + mountPoint + "\n")
 	var out, errOut bytes.Buffer
 
 	// runMount will try to dial and fail; that is fine. What matters is that
 	// the config was written before the dial.
 	code := interactiveMount(input, &out, &errOut)
 
-	cfgPath := filepath.Join(home, "peerfold-server", "config.json")
+	cfgPath, err := config.MountPath()
+	if err != nil {
+		t.Fatalf("MountPath: %v", err)
+	}
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		t.Fatalf("Load config after interactive mount (code=%d, out=%q err=%q): %v",
 			code, out.String(), errOut.String(), err)
 	}
-	if cfg.Server != "127.0.0.1:7000" {
-		t.Errorf("Server = %q, want 127.0.0.1:7000", cfg.Server)
+	if cfg.Server != "127.0.0.1:1" {
+		t.Errorf("Server = %q, want 127.0.0.1:1", cfg.Server)
 	}
 	if cfg.MountPoint != mountPoint {
 		t.Errorf("MountPoint = %q, want %q", cfg.MountPoint, mountPoint)

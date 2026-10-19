@@ -105,8 +105,8 @@ usage: peerfold <command> [args]
 service:
   server      start the aggregation server (interactive without flags)
   client      start a client (interactive without flags)
-  status      show running status
-  stop        stop a running component (server|client|all)
+  status      show running status (server, clients, mount)
+  stop        stop a running component (server|client|mount|all)
   restart     restart a component (server|client)
 
 mount & browse:
@@ -131,6 +131,7 @@ examples:
   peerfold client --server 127.0.0.1:7000 --name alice --share docs=C:\data
   peerfold status
   peerfold stop server
+  peerfold stop mount
   peerfold restart client alice
   peerfold mount --server 127.0.0.1:7000 --mount C:\Users\me\peerfold
 

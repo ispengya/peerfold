@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -56,6 +58,42 @@ func TestDefaultShareDirIsAPerUserPath(t *testing.T) {
 		t.Fatalf("defaultShareDir(alice) = %q, want %q", got, want)
 	}
 }
+
+// TestStatusReportsTheMount pins that a mount is visible from another
+// terminal: the pid file makes it "running", and its state file supplies the
+// values it was actually started with. Flags need not match the config, so
+// reading the config alone would report the wrong server or mount point.
+func TestStatusReportsTheMount(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)        // unix
+	t.Setenv("USERPROFILE", home) // windows
+	defer func() {
+		clearPID("mount")
+		clearMountState()
+	}()
+
+	if err := writePID("mount", os.Getpid()); err != nil {
+		t.Fatalf("writePID(mount): %v", err)
+	}
+	if err := writeMountState("10.0.0.9:7000", filepath.Join(home, "mnt")); err != nil {
+		t.Fatalf("writeMountState: %v", err)
+	}
+
+	var out, errOut bytes.Buffer
+	if code := cmdStatus(nil, &out, &errOut); code != 0 {
+		t.Fatalf("cmdStatus() = %d, stderr = %q", code, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{"Mount:", "running (PID " + itoa(os.Getpid()) + ")", "10.0.0.9:7000", filepath.Join(home, "mnt")} {
+		if !strings.Contains(got, want) {
+			t.Errorf("status output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// itoa is strconv.Itoa under a shorter name, so the test above reads as the
+// sentence it is making.
+func itoa(n int) string { return strconv.Itoa(n) }
 
 // TestPidFileRoundTrip pins the portable pid-file helpers against the real
 // home directory layout.

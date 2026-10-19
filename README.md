@@ -78,13 +78,16 @@ peerfold mount --server 1.2.3.4:7000 --mount ~/peerfold
 ### 常用命令
 
 ```sh
-peerfold status
+peerfold status                 # server / client / mount 的运行状态
 peerfold stop server
 peerfold stop client alice
+peerfold stop mount
 peerfold stop all
 peerfold restart server
 peerfold ls / cat / put / mkdir / rm / mv
 ```
+
+`peerfold mount` 运行期间会记录自己的 PID 和实际使用的 server / 挂载点，所以从另一个终端也能用 `peerfold status` 看到它；`peerfold stop mount` 会先落盘再卸载（Linux 通过 SIGTERM 触发正常退出，Windows 上是强制结束进程）。
 
 ### 开机自启
 

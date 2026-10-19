@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -43,6 +44,68 @@ func loadMountConfig(path string, explicit bool) (cfg config.Config, migrated bo
 		BufferLimit: old.BufferLimit,
 		BufferTotal: old.BufferTotal,
 	}, true, nil
+}
+
+// mountState is what a running mount records for the service commands. The
+// pid file alone would let status say "running" but not which server the mount
+// dialled or where it is mounted, and those flags need not match the config.
+type mountState struct {
+	Server     string `json:"server"`
+	MountPoint string `json:"mount_point"`
+}
+
+// mountStatePath is where a running mount records its command line. It lives
+// beside the mount config so everything the mount role owns sits in one
+// directory, and status finds it without knowing the flags it was started with.
+func mountStatePath() (string, error) {
+	cfgPath, err := config.MountPath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(cfgPath), "state.json"), nil
+}
+
+// writeMountState records the server and mount point of a running mount.
+func writeMountState(server, mountPoint string) error {
+	path, err := mountStatePath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(mountState{Server: server, MountPoint: mountPoint}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(b, '\n'), 0o644)
+}
+
+// readMountState reads what a mount last recorded. The caller still has to
+// check the pid: the file outlives a mount that was killed outright.
+func readMountState() (mountState, error) {
+	path, err := mountStatePath()
+	if err != nil {
+		return mountState{}, err
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return mountState{}, err
+	}
+	var s mountState
+	if err := json.Unmarshal(b, &s); err != nil {
+		return mountState{}, err
+	}
+	return s, nil
+}
+
+// clearMountState removes the state file. Errors are ignored for the same
+// reason clearPID ignores them: the process is exiting and there is no one
+// left to tell.
+func clearMountState() {
+	if path, err := mountStatePath(); err == nil {
+		_ = os.Remove(path)
+	}
 }
 
 // cmdMount is the entry point for `peerfold mount`.
@@ -95,6 +158,23 @@ func runMount(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	defer v.Close()
+
+	// The mount runs in the foreground with no other handle on it, so it
+	// records its pid and what it dialled before going into the FUSE loop.
+	// `peerfold status` reports that, and `peerfold stop mount` reaches the
+	// process through the pid file. Neither is needed to mount, so a failure
+	// warns rather than aborting. One mount per user: a second one overwrites
+	// these, just as the config already assumes a single mount point.
+	defer func() {
+		clearMountState()
+		_ = clearPID("mount")
+	}()
+	if err := writePID("mount", os.Getpid()); err != nil {
+		fmt.Fprintf(stderr, "mount: could not record the pid: %v\n", err)
+	}
+	if err := writeMountState(server, mountPoint); err != nil {
+		fmt.Fprintf(stderr, "mount: could not record its state: %v\n", err)
+	}
 
 	// The reconnector dials again after the connection dies. A failed dial
 	// returns an error and never a nil viewer with a nil error: the mount would

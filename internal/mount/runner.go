@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 )
 
@@ -134,17 +135,22 @@ func (r *Runner) Run(ctx context.Context) error {
 		}()
 	}
 
-	// Interrupt and cancellation both mean "save and stop", not "die". The
-	// handler flushes and then unmounts, which makes Mount() return and lets the
-	// deferred save above run a second time -- it is idempotent, and the second
-	// call finds nothing dirty.
+	// Interrupt, SIGTERM and cancellation all mean "save and stop", not "die".
+	// The handler flushes and then unmounts, which makes Mount() return and lets
+	// the deferred save above run a second time -- it is idempotent, and the
+	// second call finds nothing dirty.
+	//
+	// SIGTERM is how `peerfold stop mount` asks; without it that command would
+	// wait out its grace period and then kill the process, losing whatever was
+	// dirty and leaving the kernel to tear down a mount nobody flushed.
+	// Windows cannot deliver SIGTERM, so there the stop remains a hard kill.
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sig)
 	go func() {
 		select {
 		case <-sig:
-			log.Printf("mount: interrupted; flushing before unmounting")
+			log.Printf("mount: signaled; flushing before unmounting")
 		case <-ctx.Done():
 			log.Printf("mount: the context was cancelled; flushing before unmounting")
 		}

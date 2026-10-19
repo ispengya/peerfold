@@ -233,6 +233,42 @@ func cmdStatus(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "  Client:  (none configured)\n")
 	}
 
+	// Mount. It is a foreground process, so the pid file is the only way to
+	// see it from another terminal. The values come from the running mount's
+	// state file when it left one: --server and --mount need not match the
+	// config, and status should report what was dialled, not what was saved.
+	mountPID, mountAlive, _ := readPID("mount")
+	state, stateErr := readMountState()
+	var (
+		mountCfg    config.Config
+		mountCfgErr error
+	)
+	if path, err := config.MountPath(); err != nil {
+		mountCfgErr = err
+	} else {
+		mountCfg, mountCfgErr = config.Load(path)
+	}
+	server, point := mountCfg.Server, mountCfg.MountPoint
+	if stateErr == nil {
+		server, point = state.Server, state.MountPoint
+	}
+
+	fmt.Fprintf(stdout, "\n")
+	switch {
+	case mountAlive:
+		fmt.Fprintf(stdout, "  Mount:   running (PID %d)\n", mountPID)
+	case mountCfgErr == nil || stateErr == nil:
+		fmt.Fprintf(stdout, "  Mount:   stopped\n")
+	default:
+		fmt.Fprintf(stdout, "  Mount:   (none configured)\n")
+	}
+	if server != "" {
+		fmt.Fprintf(stdout, "           Server:  %s\n", server)
+	}
+	if point != "" {
+		fmt.Fprintf(stdout, "           Point:   %s\n", point)
+	}
+
 	fmt.Fprintf(stdout, "\n")
 	return 0
 }
@@ -240,7 +276,7 @@ func cmdStatus(args []string, stdout, stderr io.Writer) int {
 // cmdStop stops a running component.
 func cmdStop(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: peerfold stop <server|client|all>")
+		fmt.Fprintln(stderr, "usage: peerfold stop <server|client|mount|all>")
 		return 2
 	}
 
@@ -248,6 +284,12 @@ func cmdStop(args []string, stdout, stderr io.Writer) int {
 	switch target {
 	case "all":
 		stopped := 0
+		// The mount goes first: it is the consumer, and unmounting before the
+		// server disappears lets it flush and go away cleanly instead of
+		// entering its reconnect loop on the way out.
+		if stopComponent("mount", stdout) {
+			stopped++
+		}
 		if stopComponent("server", stdout) {
 			stopped++
 		}
@@ -280,6 +322,14 @@ func cmdStop(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "\n  Client %s stopped.\n", args[1])
 		} else {
 			fmt.Fprintf(stdout, "\n  Client %s is not running.\n", args[1])
+		}
+		return 0
+
+	case "mount":
+		if stopComponent("mount", stdout) {
+			fmt.Fprintf(stdout, "\n  Mount stopped.\n")
+		} else {
+			fmt.Fprintf(stdout, "\n  Mount is not running.\n")
 		}
 		return 0
 
