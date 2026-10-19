@@ -60,14 +60,16 @@ install_go() {
 }
 
 install_fuse() {
+  # Installs the runtime (fusermount3 + libfuse3) and the headers the cgo
+  # build needs: `go build -tags=fuse3` compiles against /usr/include/fuse3.
   local pm
   pm="$(detect_pm)"
   case "$pm" in
-    apt)    need_root && apt-get install -y -qq fuse3 ;;
-    dnf)    need_root && dnf install -y fuse3 ;;
-    yum)    need_root && yum install -y fuse3 ;;
+    apt)    need_root && apt-get install -y -qq fuse3 libfuse3-dev ;;
+    dnf)    need_root && dnf install -y fuse3 fuse3-devel ;;
+    yum)    need_root && yum install -y fuse3 fuse3-devel ;;
     pacman) need_root && pacman -S --noconfirm fuse3 ;;
-    zypper) need_root && zypper --non-interactive install fuse3 ;;
+    zypper) need_root && zypper --non-interactive install fuse3 fuse3-devel ;;
     brew)   brew install macfuse || brew install fuse3 ;;
     *)      return 1 ;;
   esac
@@ -159,10 +161,24 @@ else
     ok "FUSE installed successfully"
   else
     warn "Could not install FUSE automatically."
-    warn "  Debian/Ubuntu:  sudo apt install fuse3"
-    warn "  Fedora:         sudo dnf install fuse3"
+    warn "  Debian/Ubuntu:  sudo apt install fuse3 libfuse3-dev"
+    warn "  Fedora:         sudo dnf install fuse3 fuse3-devel"
     warn "  Arch:           sudo pacman -S fuse3"
     warn "Server and client work without FUSE; only mount needs it."
+  fi
+fi
+
+# The cgo build below (-tags=fuse3) compiles against the fuse3 headers. The
+# device/fusermount checks above pass without them, so check separately.
+if [ "$(uname -s)" = "Linux" ] && [ ! -f /usr/include/fuse3/fuse.h ]; then
+  info "libfuse3 headers not found. Installing (needed to compile)..."
+  if install_fuse; then
+    ok "FUSE headers installed"
+  else
+    warn "Could not install fuse3 headers; the build below will fail."
+    warn "  Debian/Ubuntu:  sudo apt install libfuse3-dev"
+    warn "  RHEL/Fedora:    sudo dnf install fuse3-devel"
+    warn "  Arch:           sudo pacman -S fuse3"
   fi
 fi
 

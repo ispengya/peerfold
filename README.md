@@ -22,61 +22,7 @@
 
 ## 安装
 
-### 一行安装（推荐）
-
-不用 clone、不用装 Go，直接拿二进制。脚本和二进制都在 GitHub Releases 上，走 `github.com`，不依赖 `raw.githubusercontent.com`。
-
-**Linux / macOS**
-
-```sh
-curl -fsSL https://github.com/ispengya/peerfold/releases/latest/download/install.sh | sh
-```
-
-**Windows — PowerShell**
-
-```powershell
-irm https://github.com/ispengya/peerfold/releases/latest/download/install.ps1 | iex
-```
-
-**Windows — CMD**
-
-```cmd
-curl -fsSL -o install.bat https://github.com/ispengya/peerfold/releases/latest/download/install.bat && install.bat
-```
-
-装完 `peerfold` 就在 PATH 里。卸载：
-
-```sh
-install.sh --uninstall          # 或
-install.ps1 -Uninstall
-```
-
-指定版本：
-
-```sh
-curl -fsSL https://github.com/ispengya/peerfold/releases/download/v0.1.0/install.sh | sh -s -- v0.1.0
-```
-
-网络受限时也可以只要二进制：
-
-```sh
-# Linux
-curl -fsSL -o peerfold https://github.com/ispengya/peerfold/releases/latest/download/peerfold-linux-amd64
-chmod +x peerfold && sudo mv peerfold /usr/local/bin/
-```
-
-```powershell
-# Windows
-iwr https://github.com/ispengya/peerfold/releases/latest/download/peerfold-windows-amd64.exe -OutFile peerfold.exe
-```
-
-### 用 Go 装
-
-```sh
-go install github.com/ispengya/peerfold/cmd/peerfold@latest
-```
-
-### 从源码构建
+从源码构建：先 clone，再编译。
 
 ```sh
 git clone https://github.com/ispengya/peerfold.git
@@ -89,12 +35,16 @@ cd peerfold
 .\setup-client.ps1         # Windows
 ```
 
-脚本会装依赖（Go + FUSE/WinFsp）、编译、写 PATH、建配置目录。
+脚本会装依赖（Go + FUSE/WinFsp）、编译、写 PATH、建配置目录。需要 Go 1.27+；发行版的 `golang` 太旧时，先从 https://go.dev/dl/ 安装官方工具链。
 
 Linux 手工编译要带 fuse3 标签（脚本已处理）：
 
 ```sh
+# Debian/Ubuntu
 sudo apt install libfuse3-dev gcc
+# RHEL / OpenCloudOS 系
+sudo dnf install fuse3-devel gcc
+
 go build -tags=fuse3 -o peerfold ./cmd/peerfold
 ```
 
