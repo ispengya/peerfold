@@ -22,21 +22,27 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Native builds only: cgofuse needs CGO and a working FUSE
-          # toolchain, which cross-compiling multiplies. One runner per
-          # target keeps the recipe honest.
+          # Linux builds use CGO against libfuse3 (cgofuse -tags=fuse3).
+          # Windows uses CGO_ENABLED=0 so cgofuse's nocgo variant demand-loads
+          # winfsp.dll at runtime and the build needs no WinFsp headers.
           - os: ubuntu-latest
             asset: peerfold-linux-amd64
             goos: linux
             goarch: amd64
+            cgo: "1"
+            tags: fuse3
           - os: ubuntu-24.04-arm
             asset: peerfold-linux-arm64
             goos: linux
             goarch: arm64
+            cgo: "1"
+            tags: fuse3
           - os: windows-latest
             asset: peerfold-windows-amd64.exe
             goos: windows
             goarch: amd64
+            cgo: "0"
+            tags: ""
 
     steps:
       - name: Checkout
@@ -51,23 +57,20 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq libfuse3-dev gcc
-
-      - name: Install MinGW (Windows)
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: |
-          choco install mingw -y --no-progress
-          echo "C:\ProgramData\mingw64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          sudo apt-get install -y -qq libfuse3-dev gcc pkg-config
 
       - name: Build
         shell: bash
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "1"
+          CGO_ENABLED: ${{ matrix.cgo }}
         run: |
-          go build -trimpath -ldflags "-s -w" -o "${{ matrix.asset }}" ./cmd/peerfold
+          TAGS_FLAG=""
+          if [ -n "${{ matrix.tags }}" ]; then
+            TAGS_FLAG="-tags=${{ matrix.tags }}"
+          fi
+          go build -trimpath -ldflags "-s -w" $TAGS_FLAG -o "${{ matrix.asset }}" ./cmd/peerfold
           ls -la "${{ matrix.asset }}"
 
       - name: Upload artifact

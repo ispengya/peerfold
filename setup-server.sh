@@ -74,7 +74,13 @@ install_fuse() {
 }
 
 build_binary() {
-  if (cd "$PROJECT_ROOT" && go build -o "$BIN_PATH" ./cmd/peerfold); then
+  # cgofuse on Linux defaults to libfuse2. The scripts install fuse3, so the
+  # build asks for the fuse3 variant (CGO_CFLAGS picks /usr/include/fuse3).
+  local tags=""
+  case "$(uname -s | tr '[:upper:]' '[:lower:]')" in
+    linux) tags="-tags=fuse3" ;;
+  esac
+  if (cd "$PROJECT_ROOT" && go build $tags -o "$BIN_PATH" ./cmd/peerfold); then
     local size
     size="$(wc -c < "$BIN_PATH" | tr -d ' ')"
     ok "Build succeeded — ${BIN_PATH} ($((size / 1024 / 1024)) MB)"

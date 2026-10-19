@@ -78,6 +78,13 @@ cd peerfold
 
 脚本会装依赖（Go + FUSE/WinFsp）、编译、写 PATH、建配置目录。
 
+Linux 手工编译要带 fuse3 标签（脚本已处理）：
+
+```sh
+sudo apt install libfuse3-dev gcc
+go build -tags=fuse3 -o peerfold ./cmd/peerfold
+```
+
 ---
 
 ## 使用
