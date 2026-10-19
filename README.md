@@ -24,24 +24,24 @@
 
 ### 一行安装（推荐）
 
-不用 clone、不用装 Go，直接拿二进制：
+不用 clone、不用装 Go，直接拿二进制。脚本和二进制都在 GitHub Releases 上，走 `github.com`，不依赖 `raw.githubusercontent.com`。
 
 **Linux / macOS**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ispengya/peerfold/main/install.sh | sh
+curl -fsSL https://github.com/ispengya/peerfold/releases/latest/download/install.sh | sh
 ```
 
 **Windows — PowerShell**
 
 ```powershell
-irm https://raw.githubusercontent.com/ispengya/peerfold/main/install.ps1 | iex
+irm https://github.com/ispengya/peerfold/releases/latest/download/install.ps1 | iex
 ```
 
 **Windows — CMD**
 
 ```cmd
-curl -fsSL -o install.bat https://raw.githubusercontent.com/ispengya/peerfold/main/install.bat && install.bat
+curl -fsSL -o install.bat https://github.com/ispengya/peerfold/releases/latest/download/install.bat && install.bat
 ```
 
 装完 `peerfold` 就在 PATH 里。卸载：
@@ -54,7 +54,20 @@ install.ps1 -Uninstall
 指定版本：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ispengya/peerfold/main/install.sh | sh -s -- v1.0.0
+curl -fsSL https://github.com/ispengya/peerfold/releases/download/v0.1.0/install.sh | sh -s -- v0.1.0
+```
+
+网络受限时也可以只要二进制：
+
+```sh
+# Linux
+curl -fsSL -o peerfold https://github.com/ispengya/peerfold/releases/latest/download/peerfold-linux-amd64
+chmod +x peerfold && sudo mv peerfold /usr/local/bin/
+```
+
+```powershell
+# Windows
+iwr https://github.com/ispengya/peerfold/releases/latest/download/peerfold-windows-amd64.exe -OutFile peerfold.exe
 ```
 
 ### 用 Go 装

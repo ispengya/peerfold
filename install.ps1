@@ -1,6 +1,6 @@
 # install.ps1 — download the peerfold binary from GitHub Releases
 # Usage:
-#   irm https://raw.githubusercontent.com/ispengya/peerfold/main/install.ps1 | iex
+#   irm https://github.com/ispengya/peerfold/releases/latest/download/install.ps1 | iex
 #   .\install.ps1                # install the latest release
 #   .\install.ps1 -Version v1.0.0
 #   .\install.ps1 -Uninstall

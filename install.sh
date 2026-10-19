@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install.sh — download the peerfold binary from GitHub Releases
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/ispengya/peerfold/main/install.sh | sh
+#   curl -fsSL https://github.com/ispengya/peerfold/releases/latest/download/install.sh | sh
 #   ./install.sh              # install the latest release
 #   ./install.sh v1.0.0       # install a specific tag
 #   ./install.sh --uninstall

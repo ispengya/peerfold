@@ -88,16 +88,23 @@ jobs:
     # caller names a tag; otherwise this job just verifies the build.
     if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
-      - name: Generate checksums
-        working-directory: dist
+      - name: Stage installers
+        # The install scripts ride along as release assets so the one-liner
+        # can fetch them from github.com/.../releases/download/... . Hosts
+        # that block raw.githubusercontent.com still reach that URL.
         run: |
-          sha256sum peerfold-* > checksums.txt
+          cp install.sh install.ps1 install.bat dist/
+          cd dist
+          sha256sum peerfold-* install.* > checksums.txt
           cat checksums.txt
 
       - name: Create GitHub Release
