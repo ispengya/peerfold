@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # setup-server.sh — peerfold server one-click setup (Linux / macOS)
-# Installs Go + FUSE when possible, builds the binary, prepares config dirs.
+# Installs Go + FUSE when possible, builds the binary, prepares config dirs,
+# then starts the server through the interactive foreground/background prompt.
 # Mirrors setup-server.ps1.
 
 set -euo pipefail
@@ -313,37 +314,18 @@ section 4 "Install command"
 
 install_command
 
-# ── [5/5] Config directories ─────────────────────────────────
+# ── [5/5] Start server ───────────────────────────────────────
 
-section 5 "Configuration directories"
+section 5 "Start server"
 
-SERVER_DIR="${HOME_DIR}/peerfold-server"
-if [ -d "$SERVER_DIR" ]; then
-  ok "Already exists: $SERVER_DIR"
-else
-  mkdir -p "$SERVER_DIR"
-  ok "Created: $SERVER_DIR"
-fi
-
-# ls/cat/mount read the server address from this file, so a directory alone
-# leaves them saying "no server configured" after an otherwise successful
-# setup. "listen" is what the server binds; "server" is what local clients
-# dial. A config that already exists is never rewritten.
-CONFIG_FILE="${SERVER_DIR}/config.json"
-if [ -f "$CONFIG_FILE" ]; then
-  ok "Already exists: $CONFIG_FILE"
-  if ! grep -q '"server"' "$CONFIG_FILE" 2>/dev/null; then
-    warn "No \"server\" field in the config; peerfold ls/cat/mount need one."
-    info "Add e.g. \"server\": \"127.0.0.1:7000\""
-  fi
-else
-  cat > "$CONFIG_FILE" <<'EOF'
-{
-  "listen": "127.0.0.1:7000",
-  "server": "127.0.0.1:7000"
-}
-EOF
-  ok "Created: $CONFIG_FILE"
+# Hand over to the same interactive start `peerfold server` gives by hand:
+# with a config it loads the saved settings, and without one it asks for the
+# listen address and writes the config. Foreground vs background is asked next.
+code=0
+"$BIN_PATH" server || code=$?
+if [ "$code" -ne 0 ]; then
+  fail "Server exited with status $code"
+  exit "$code"
 fi
 
 # ── Summary ──────────────────────────────────────────────────
@@ -352,11 +334,9 @@ echo ""
 echo "  ------------------------------------"
 echo "  Setup complete!"
 echo ""
-echo "  Start server:"
-echo "    peerfold server"
-echo ""
-echo "  Config:  ${SERVER_DIR}/config.json"
-echo "  Log:     ${SERVER_DIR}/log.txt"
+echo "  Config:  ${HOME_DIR}/peerfold-server/config.json"
+echo "  Log:     ${HOME_DIR}/peerfold-server/log.txt"
+echo "  Status:  peerfold status"
 echo ""
 echo "  Next: run ./setup-client.sh on a client machine"
 echo ""

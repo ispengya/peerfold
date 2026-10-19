@@ -10,6 +10,24 @@ import (
 	"github.com/ispengya/peerfold/internal/config"
 )
 
+// TestDialAddress pins what the interactive server writes as the local dial
+// address for the listen address it was given. A wildcard bind is not a
+// dialable address everywhere, and ls/cat/mount read this value.
+func TestDialAddress(t *testing.T) {
+	cases := map[string]string{
+		":7000":          "127.0.0.1:7000",
+		"0.0.0.0:7000":   "127.0.0.1:7000",
+		"[::]:7000":      "127.0.0.1:7000",
+		"127.0.0.1:7000": "127.0.0.1:7000",
+		"10.0.0.13:7000": "10.0.0.13:7000",
+	}
+	for listen, want := range cases {
+		if got := dialAddress(listen); got != want {
+			t.Errorf("dialAddress(%q) = %q, want %q", listen, got, want)
+		}
+	}
+}
+
 // TestInteractiveMountSavesConfig pins that a no-flag `peerfold mount` asks
 // for the server and mount point, writes both into the config, and then
 // reports the values it is about to use — so the next run can skip the

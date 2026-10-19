@@ -135,4 +135,21 @@ func TestConfigPaths(t *testing.T) {
 	if other == clientPath {
 		t.Fatalf("ClientPath(alice) == ClientPath(bob) == %q, want distinct paths", other)
 	}
+
+	mountPath, err := config.MountPath()
+	if err != nil {
+		t.Fatalf("MountPath(): %v", err)
+	}
+	if !filepath.IsAbs(mountPath) {
+		t.Fatalf("MountPath() = %q, want an absolute path", mountPath)
+	}
+	if filepath.Base(mountPath) != "config.json" {
+		t.Fatalf("MountPath() = %q, want it to end in config.json", mountPath)
+	}
+	if got := filepath.Base(filepath.Dir(mountPath)); got != "peerfold-mount" {
+		t.Fatalf("MountPath() = %q, want its parent directory to be %q, got %q", mountPath, "peerfold-mount", got)
+	}
+	if mountPath == serverPath {
+		t.Fatalf("MountPath() == ServerPath() == %q, want the mount to have its own directory", mountPath)
+	}
 }

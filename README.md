@@ -35,7 +35,7 @@ cd peerfold
 .\setup-client.ps1         # Windows
 ```
 
-脚本会装依赖（Go + FUSE/WinFsp）、编译、写 PATH、建配置目录。需要 Go 1.27+；发行版的 `golang` 太旧时，先从 https://go.dev/dl/ 安装官方工具链。
+脚本会装依赖（Go + FUSE/WinFsp）、编译、写 PATH，最后直接进入交互式启动：已有配置就直接读取，没有就当场询问，然后选择前台或后台运行。需要 Go 1.27+；发行版的 `golang` 太旧时，先从 https://go.dev/dl/ 安装官方工具链。
 
 Linux 手工编译要带 fuse3 标签（脚本已处理）：
 
@@ -138,6 +138,12 @@ systemctl --user enable --now peerfold-server.service
 ```
 ~/peerfold-server/log.txt
 ~/peerfold-client-<名字>/log.txt
+```
+
+挂载端有自己的配置目录（server 地址、挂载点、缓存参数）：
+
+```
+~/peerfold-mount/config.json
 ```
 
 Windows 上是 `C:\Users\你\peerfold-server\log.txt` 这种形式。

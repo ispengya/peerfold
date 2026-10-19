@@ -1,5 +1,6 @@
 # setup-server.ps1 — peerfold server one-click setup
-# Installs Go + WinFsp, builds the binary, starts the server.
+# Installs Go + WinFsp, builds the binary, prepares config, then starts the
+# server through the interactive foreground/background prompt.
 # Run as Administrator.
 
 $ErrorActionPreference = "Stop"
@@ -183,16 +184,17 @@ if ($userPath -like "*$ProjectRoot*") {
 Info "For the current terminal, run: `$env:Path += ';$ProjectRoot'"
 Info "Or reopen a new terminal — 'peerfold' will work there."
 
-# ── [5/5] Config directories ─────────────────────────────────
+# ── [5/5] Start server ───────────────────────────────────────
 
-Section 5 $total "Configuration directories"
+Section 5 $total "Start server"
 
-$serverDir = Join-Path $Up "peerfold-server"
-if (Test-Path $serverDir) {
-    Ok "Already exists: $serverDir"
-} else {
-    New-Item -ItemType Directory -Path $serverDir -Force | Out-Null
-    Ok "Created: $serverDir"
+# Hand over to the same interactive start `peerfold server` gives by hand:
+# with a config it loads the saved settings, and without one it asks for the
+# listen address and writes the config. Foreground vs background comes next.
+& $BinPath server
+if ($LASTEXITCODE -ne 0) {
+    Fail "Server exited with status $LASTEXITCODE"
+    exit $LASTEXITCODE
 }
 
 # ── Summary ──────────────────────────────────────────────────
@@ -201,11 +203,9 @@ Write-Host ""
 Write-Host "  ------------------------------------" -ForegroundColor DarkGray
 Write-Host "  Setup complete!" -ForegroundColor Green
 Write-Host ""
-Write-Host "  Start server:" -ForegroundColor White
-Write-Host "    peerfold server" -ForegroundColor Yellow
-Write-Host ""
-Write-Host "  Config:  $serverDir\config.json" -ForegroundColor DarkGray
-Write-Host "  Log:     $serverDir\log.txt" -ForegroundColor DarkGray
+Write-Host "  Config:  $Up\peerfold-server\config.json" -ForegroundColor DarkGray
+Write-Host "  Log:     $Up\peerfold-server\log.txt" -ForegroundColor DarkGray
+Write-Host "  Status:  peerfold status" -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "  Next: run setup-client.bat on a client machine" -ForegroundColor DarkGray
 Write-Host ""

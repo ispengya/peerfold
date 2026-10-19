@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # setup-client.sh — peerfold client one-click setup (Linux / macOS)
-# Installs Go + FUSE when possible, builds the binary, prepares config dirs.
+# Installs Go + FUSE when possible, builds the binary, prepares config dirs,
+# then starts the client through the interactive foreground/background prompt.
 # Mirrors setup-client.ps1.
 #
 # Usage:
 #   ./setup-client.sh
-#   ./setup-client.sh --name alice --share-dir /home/alice/docs
 #   ./setup-client.sh --rebuild
 
 set -euo pipefail
@@ -15,17 +15,13 @@ BIN_PATH="${PROJECT_ROOT}/peerfold"
 HOME_DIR="${HOME:-$(eval echo ~)}"
 TOTAL=5
 
-NAME=""
-SHARE_DIR=""
 FORCE_REBUILD=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --name)      NAME="${2:-}"; shift 2 ;;
-    --share-dir) SHARE_DIR="${2:-}"; shift 2 ;;
-    --rebuild)   FORCE_REBUILD=1; shift ;;
+    --rebuild) FORCE_REBUILD=1; shift ;;
     -h|--help)
-      echo "usage: $0 [--name CLIENT] [--share-dir DIR] [--rebuild]"
+      echo "usage: $0 [--rebuild]"
       exit 0
       ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -335,33 +331,18 @@ section 4 "Install command"
 
 install_command
 
-# ── [5/5] Configuration ──────────────────────────────────────
+# ── [5/5] Start client ───────────────────────────────────────
 
-section 5 "Configuration"
+section 5 "Start client"
 
-if [ -z "$NAME" ]; then
-  NAME="$(hostname 2>/dev/null || echo peerfold)"
-  info "Using hostname as client name: $NAME"
-fi
-
-if [ -z "$SHARE_DIR" ]; then
-  SHARE_DIR="${HOME_DIR}/peerfold-demo/${NAME}"
-  info "Using default share directory: $SHARE_DIR"
-fi
-
-CLIENT_DIR="${HOME_DIR}/peerfold-client-${NAME}"
-if [ -d "$CLIENT_DIR" ]; then
-  ok "Config directory exists: $CLIENT_DIR"
-else
-  mkdir -p "$CLIENT_DIR"
-  ok "Created: $CLIENT_DIR"
-fi
-
-if [ -d "$SHARE_DIR" ]; then
-  ok "Share directory exists: $SHARE_DIR"
-else
-  mkdir -p "$SHARE_DIR"
-  ok "Created share directory: $SHARE_DIR"
+# Hand over to the interactive start. With an existing client config it loads
+# the saved server, name and shares; without one it asks for them — including
+# the share directory, which it creates. Foreground vs background comes next.
+code=0
+"$BIN_PATH" client || code=$?
+if [ "$code" -ne 0 ]; then
+  fail "Client exited with status $code"
+  exit "$code"
 fi
 
 # ── Summary ──────────────────────────────────────────────────
@@ -370,12 +351,8 @@ echo ""
 echo "  ------------------------------------"
 echo "  Setup complete!"
 echo ""
-echo "  Start client:"
-echo "    peerfold client"
-echo ""
-echo "  Or with flags:"
-echo "    peerfold client --server 127.0.0.1:7000 --name ${NAME} --share docs=${SHARE_DIR}"
-echo ""
-echo "  Config: ${CLIENT_DIR}/config.json"
-echo "  Log:    ${CLIENT_DIR}/log.txt"
+echo "  Config:  ${HOME_DIR}/peerfold-client-<name>/config.json"
+echo "  Log:     ${HOME_DIR}/peerfold-client-<name>/log.txt"
+echo "  Status:  peerfold status"
+echo "  Stop:    peerfold stop client <name>"
 echo ""

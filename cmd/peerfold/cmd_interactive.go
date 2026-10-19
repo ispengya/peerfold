@@ -4,12 +4,28 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 
 	"github.com/ispengya/peerfold/internal/config"
 	"github.com/ispengya/peerfold/internal/mount"
 )
+
+// dialAddress is the address a local client should dial for a server bound to
+// listen. A wildcard bind (":7000", "0.0.0.0:7000", "[::]:7000") is not a
+// dialable address on every platform, so local tools use loopback instead.
+func dialAddress(listen string) string {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return listen
+	}
+	switch host {
+	case "", "0.0.0.0", "::":
+		return net.JoinHostPort("127.0.0.1", port)
+	}
+	return listen
+}
 
 // daemonFlag is the internal flag that marks a process as the background
 // child of an interactive start. It suppresses prompts and runs normally.
@@ -35,6 +51,10 @@ func interactiveServer(input io.Reader, out, errw io.Writer) int {
 
 		cfg = config.Default()
 		cfg.Listen = listen
+		// The same file is what ls/cat/mount read the address from, so a
+		// config created here has to answer that question too: "listen" is
+		// what the server binds, "server" is what local clients dial.
+		cfg.Server = dialAddress(listen)
 
 		if err := config.Save(cfgPath, cfg); err != nil {
 			fmt.Fprintf(errw, "  [X] Failed to save config: %v\n", err)
@@ -43,6 +63,14 @@ func interactiveServer(input io.Reader, out, errw io.Writer) int {
 		fmt.Fprintf(out, "\n  [OK] Config saved: %s\n\n", cfgPath)
 	} else {
 		fmt.Fprintf(out, "  [OK] Loaded config: %s\n", cfgPath)
+		if cfg.Server == "" && cfg.Listen != "" {
+			// Older configs predate the two-field split and hold only the
+			// listen address. Fill in the dial address so ls/cat/mount work.
+			cfg.Server = dialAddress(cfg.Listen)
+			if err := config.Save(cfgPath, cfg); err != nil {
+				fmt.Fprintf(errw, "  [!] Could not save the server address: %v\n", err)
+			}
+		}
 		fmt.Fprintf(out, "       Listen: %s\n\n", cfg.Listen)
 	}
 
@@ -213,19 +241,26 @@ func interactiveClient(input io.Reader, out, errw io.Writer) int {
 // `peerfold mount` can skip the questions.
 func interactiveMount(input io.Reader, out, errw io.Writer) int {
 	in := bufio.NewReader(input)
-	home, _ := os.UserHomeDir()
-	cfgDir := filepath.Join(home, "peerfold-server")
-	cfgPath := filepath.Join(cfgDir, "config.json")
+	cfgPath, err := config.MountPath()
+	if err != nil {
+		fmt.Fprintf(errw, "  [X] Failed to locate the mount config: %v\n", err)
+		return 1
+	}
 
 	fmt.Fprintf(out, "\n  peerfold mount\n")
 	fmt.Fprintf(out, "  ------------------------------------\n\n")
 
-	cfg, err := config.Load(cfgPath)
-	if err != nil {
+	cfg, migrated, loadErr := loadMountConfig(cfgPath, false)
+	if loadErr != nil {
 		cfg = config.Default()
 		fmt.Fprintf(out, "  No config found. Let's set one up.\n\n")
 	} else {
-		fmt.Fprintf(out, "  [OK] Loaded config: %s\n", cfgPath)
+		if migrated {
+			fmt.Fprintf(out, "  [OK] Using the settings saved by the previous version\n")
+			fmt.Fprintf(out, "       They will be written to: %s\n", cfgPath)
+		} else {
+			fmt.Fprintf(out, "  [OK] Loaded config: %s\n", cfgPath)
+		}
 		if cfg.Server != "" {
 			fmt.Fprintf(out, "       Server: %s\n", cfg.Server)
 		}

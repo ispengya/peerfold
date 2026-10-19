@@ -1,11 +1,7 @@
 # setup-client.ps1 — peerfold client one-click setup
-# Installs Go + WinFsp, builds the binary, prints launch commands.
+# Installs Go + WinFsp, builds the binary, prepares config, then starts the
+# client through the interactive foreground/background prompt.
 # Run as Administrator.
-
-param(
-    [string]$Name = "",
-    [string]$ShareDir = ""
-)
 
 $ErrorActionPreference = "Stop"
 $ProjectRoot = $PSScriptRoot
@@ -174,33 +170,17 @@ if ($userPath -like "*$ProjectRoot*") {
 Info "For the current terminal, run: `$env:Path += ';$ProjectRoot'"
 Info "Or reopen a new terminal — 'peerfold' will work there."
 
-# ── [5/5] Config directories ─────────────────────────────────
+# ── [5/5] Start client ───────────────────────────────────────
 
-Section 5 $total "Configuration"
+Section 5 $total "Start client"
 
-if (-not $Name) {
-    $Name = $env:COMPUTERNAME
-    Info "Using hostname as client name: $Name"
-}
-
-if (-not $ShareDir) {
-    $ShareDir = "C:\peerfold-demo\$Name"
-    Info "Using default share directory: $ShareDir"
-}
-
-$clientDir = Join-Path $Up "peerfold-client-$Name"
-if (Test-Path $clientDir) {
-    Ok "Config directory exists: $clientDir"
-} else {
-    New-Item -ItemType Directory -Path $clientDir -Force | Out-Null
-    Ok "Created: $clientDir"
-}
-
-if (-not (Test-Path $ShareDir)) {
-    New-Item -ItemType Directory -Path $ShareDir -Force | Out-Null
-    Ok "Created share directory: $ShareDir"
-} else {
-    Ok "Share directory exists: $ShareDir"
+# Hand over to the interactive start. With an existing client config it loads
+# the saved server, name and shares; without one it asks for them — including
+# the share directory, which it creates. Foreground vs background comes next.
+& $BinPath client
+if ($LASTEXITCODE -ne 0) {
+    Fail "Client exited with status $LASTEXITCODE"
+    exit $LASTEXITCODE
 }
 
 # ── Summary ──────────────────────────────────────────────────
@@ -209,12 +189,8 @@ Write-Host ""
 Write-Host "  ------------------------------------" -ForegroundColor DarkGray
 Write-Host "  Setup complete!" -ForegroundColor Green
 Write-Host ""
-Write-Host "  Start client:" -ForegroundColor White
-Write-Host "    peerfold client" -ForegroundColor Yellow
-Write-Host ""
-Write-Host "  Or with flags:" -ForegroundColor DarkGray
-Write-Host "    peerfold client --server 127.0.0.1:7000 --name $Name --share docs=$ShareDir" -ForegroundColor Yellow
-Write-Host ""
-Write-Host "  Config: $clientDir\config.json" -ForegroundColor DarkGray
-Write-Host "  Log:    $clientDir\log.txt" -ForegroundColor DarkGray
+Write-Host "  Config:  $Up\peerfold-client-<name>\config.json" -ForegroundColor DarkGray
+Write-Host "  Log:     $Up\peerfold-client-<name>\log.txt" -ForegroundColor DarkGray
+Write-Host "  Status:  peerfold status" -ForegroundColor DarkGray
+Write-Host "  Stop:    peerfold stop client <name>" -ForegroundColor DarkGray
 Write-Host ""

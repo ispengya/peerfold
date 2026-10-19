@@ -108,6 +108,16 @@ func ClientPath(name string) (string, error) {
 	return homePath("peerfold-client-"+name, "config.json")
 }
 
+// MountPath returns the config path for the mount role.
+//
+// Mount is a client of the aggregated tree, not the server: its mount point
+// and read-cache settings belong to this machine's mount. Keeping them in the
+// server's directory made a viewer's file look like the server's, and a
+// machine that never runs a server still needed one to mount.
+func MountPath() (string, error) {
+	return homePath("peerfold-mount", "config.json")
+}
+
 // homePath joins a directory and file name onto the user's home directory.
 func homePath(dir, name string) (string, error) {
 	home, err := os.UserHomeDir()

@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -14,6 +15,35 @@ import (
 	"github.com/ispengya/peerfold/internal/mount"
 	"github.com/ispengya/peerfold/internal/viewer"
 )
+
+// loadMountConfig reads the mount role's config. When the default path has no
+// file yet, it seeds the values from the server config, which is where earlier
+// versions kept them; the interactive mount's save then moves them into the
+// mount's own directory. An explicit --config never falls back.
+//
+// migrated reports that the values came from the old location, so the
+// interactive flow can say where they were read from.
+func loadMountConfig(path string, explicit bool) (cfg config.Config, migrated bool, err error) {
+	cfg, err = config.Load(path)
+	if err == nil || explicit || !errors.Is(err, os.ErrNotExist) {
+		return cfg, false, err
+	}
+	oldPath, perr := config.ServerPath()
+	if perr != nil {
+		return config.Config{}, false, err
+	}
+	old, oerr := config.Load(oldPath)
+	if oerr != nil {
+		// The mount file is the one the caller asked about; report its absence.
+		return config.Config{}, false, err
+	}
+	return config.Config{
+		Server:      old.Server,
+		MountPoint:  old.MountPoint,
+		BufferLimit: old.BufferLimit,
+		BufferTotal: old.BufferTotal,
+	}, true, nil
+}
 
 // cmdMount is the entry point for `peerfold mount`.
 func cmdMount(args []string, stdout, stderr io.Writer) int {
@@ -123,14 +153,15 @@ func mountOptionsFrom(args []string) (mount.Options, string, string, string, err
 	// config is read here because it can supply the mount point and both buffer
 	// limits, so the three have to be resolved in one place.
 	path := *cfgPath
-	if path == "" {
-		p, err := config.ServerPath()
+	explicit := path != ""
+	if !explicit {
+		p, err := config.MountPath()
 		if err != nil {
 			return mount.Options{}, "", "", "", fmt.Errorf("locate config: %w", err)
 		}
 		path = p
 	}
-	cfg, err := loadOrDefault(path)
+	cfg, _, err := loadMountConfig(path, explicit)
 	if err != nil {
 		return mount.Options{}, "", "", "", fmt.Errorf("read config %s: %w", path, err)
 	}
