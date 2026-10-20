@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"log"
 	stdpath "path"
 	"sort"
 	"strings"
@@ -127,6 +128,15 @@ func statFor(n node.Node) Stat {
 // a save that grows a file corrupts it. A clean handle has nothing to say, so the
 // index's value is used.
 func (m *Mount) Getattr(path string, st *Stat, fh uint64) int {
+	started := time.Now()
+	defer func() {
+		// Most getattr calls are answered from the index and are not worth a
+		// line each. A slow one is: it is what Explorer's metadata storm looks
+		// like on a high-RTT link.
+		if d := time.Since(started); d > 100*time.Millisecond {
+			log.Printf("mount: getattr %s took=%s", path, d)
+		}
+	}()
 	n, code := m.lookup(path)
 	if code != 0 {
 		if body, ok := m.pendingContentSnapshot(path); ok {
@@ -183,10 +193,14 @@ func (m *Mount) Readdir(path string, fill func(name string, st *Stat, off int64)
 	if n.Kind != node.KindDir {
 		return -ENOTDIR
 	}
+	started := time.Now()
 	children, err := m.call().List(path)
+	took := time.Since(started)
 	if err != nil {
+		log.Printf("mount: list %s took=%s failed: %v", path, took, err)
 		return errnoFor(err)
 	}
+	log.Printf("mount: list %s entries=%d took=%s", path, len(children), took)
 	// Sorted so a listing is stable between reads. The index's own order is the
 	// server's business and may change without the tree changing, which would
 	// make a directory appear to shuffle for no reason the user can see.
@@ -435,7 +449,7 @@ func (m *Mount) Opendir(path string) (uint64, int) {
 // error share one int, and why a caller must not treat a small positive value as
 // a failure.
 //
-// The wire is asked in chunkSize blocks with a positive count every time. The
+// The wire is asked in readChunk() blocks with a positive count every time. The
 // caller's remaining length cannot be forwarded as-is because the wire's own Read
 // treats a negative n as "to the end" and a zero n as an empty slice rather than
 // an error, so forwarding would either return nothing or return everything for
@@ -499,33 +513,49 @@ func (m *Mount) Read(path string, buf []byte, off int64, fh uint64) int {
 		return 0
 	}
 
+	unit := m.readChunk()
 	total := 0
 	for total < len(buf) {
 		pos := off + int64(total)
-		chunkIdx := pos / chunkSize
-		chunkOff := chunkIdx * chunkSize
+		chunkIdx := pos / int64(unit)
+		chunkOff := chunkIdx * int64(unit)
 
 		chunk, ok := m.cache.get(fh, chunkIdx)
 		if !ok {
-			data, err := m.call().Read(t.path, chunkOff, chunkSize)
-			if err != nil {
-				// A partial read is returned rather than discarded. Throwing
-				// away the bytes already in the buffer would make a large file
-				// unreadable over a flaky link, because the retry starts from
-				// scratch and hits the same failure.
-				if total > 0 {
-					return total
+			m.fetchMu.Lock()
+			// Re-check with the fill lock held: another goroutine may have
+			// filled this chunk while this one was waiting, and the first
+			// check happened outside that window.
+			chunk, ok = m.cache.get(fh, chunkIdx)
+			if !ok {
+				started := time.Now()
+				data, err := m.call().Read(t.path, chunkOff, unit)
+				took := time.Since(started)
+				if err != nil {
+					m.fetchMu.Unlock()
+					log.Printf("mount: read %s off=%d n=%d took=%s failed: %v",
+						t.path, chunkOff, unit, took, err)
+					// A partial read is returned rather than discarded. Throwing
+					// away the bytes already in the buffer would make a large file
+					// unreadable over a flaky link, because the retry starts from
+					// scratch and hits the same failure.
+					if total > 0 {
+						return total
+					}
+					return errnoFor(err)
 				}
-				return errnoFor(err)
+				log.Printf("mount: read %s off=%d n=%d bytes=%d took=%s",
+					t.path, chunkOff, unit, len(data), took)
+				// The count asked for is always the unit, so the slice is already
+				// bounded; trimming is belt and braces so the cache can never hold
+				// a chunk larger than the unit the caps are expressed in.
+				if len(data) > unit {
+					data = data[:unit]
+				}
+				chunk = data
+				m.cache.put(fh, chunkIdx, chunk)
 			}
-			// The count asked for is always chunkSize, so the slice is already
-			// bounded; trimming is belt and braces so the cache can never hold a
-			// chunk larger than the unit the caps are expressed in.
-			if len(data) > chunkSize {
-				data = data[:chunkSize]
-			}
-			chunk = data
-			m.cache.put(fh, chunkIdx, chunk)
+			m.fetchMu.Unlock()
 		}
 		if len(chunk) == 0 {
 			break // end of file
@@ -535,7 +565,7 @@ func (m *Mount) Read(path string, buf []byte, off int64, fh uint64) int {
 			break // the chunk does not reach the offset, so the file ends here
 		}
 		total += copy(buf[total:], chunk[within:])
-		if len(chunk) < chunkSize {
+		if len(chunk) < unit {
 			break // a short chunk means the file ended
 		}
 		// No "buffer is full" check belongs here. Each iteration advances the
@@ -963,8 +993,9 @@ func (m *Mount) loadContent(h *openFile) error {
 func (m *Mount) readPath(path string) ([]byte, int64, error) {
 	var out []byte
 	var off int64
+	unit := m.readChunk()
 	for {
-		chunk, err := m.call().Read(path, off, chunkSize)
+		chunk, err := m.call().Read(path, off, unit)
 		if err != nil {
 			if len(out) > 0 {
 				// A partial read is worth more than none: it is at least the
@@ -978,7 +1009,7 @@ func (m *Mount) readPath(path string) ([]byte, int64, error) {
 		}
 		out = append(out, chunk...)
 		off += int64(len(chunk))
-		if len(chunk) < chunkSize {
+		if len(chunk) < unit {
 			return out, int64(len(out)), nil
 		}
 	}

@@ -224,6 +224,7 @@ func mountOptionsFrom(args []string) (mount.Options, string, string, string, err
 		mountPath = fs.String("mount", "", "where to mount (default: the per-user mount point)")
 		buffer    = fs.String("buffer", "", "read cache per open file (default: 64MiB)")
 		bufferTot = fs.String("buffer-total", "", "read cache across all open files (default: 256MiB)")
+		chunk     = fs.String("chunk", "", "bytes per read request (default: 512KiB, max 1MiB)")
 		cfgPath   = fs.String("config", "", "config file (default: the per-user config path)")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -268,6 +269,23 @@ func mountOptionsFrom(args []string) (mount.Options, string, string, string, err
 	}
 	if cfg.BufferTotal > 0 {
 		opts.BufferTotal = cfg.BufferTotal
+	}
+	if cfg.ChunkSize > 0 {
+		opts.ChunkSize = cfg.ChunkSize
+	}
+	if *chunk != "" {
+		n, err := parseSize(*chunk)
+		if err != nil {
+			return mount.Options{}, "", "", "", fmt.Errorf("--chunk: %w", err)
+		}
+		opts.ChunkSize = n
+	}
+	// A chunk is one read's answer; below one byte is meaningless and above
+	// the protocol's frame ceiling it only adds memory and first-byte latency.
+	if opts.ChunkSize <= 0 || opts.ChunkSize > mount.MaxChunkSize {
+		return mount.Options{}, "", "", "", fmt.Errorf(
+			"chunk size %d is outside the supported range (1..%d bytes)",
+			opts.ChunkSize, mount.MaxChunkSize)
 	}
 	if *buffer != "" {
 		n, err := parseSize(*buffer)
@@ -392,5 +410,6 @@ flags:
   --mount PATH          where to mount (config: mount_point; default: ~/peerfold)
   --buffer SIZE         read cache per open file (config: buffer_limit; default: 64MiB)
   --buffer-total SIZE   read cache across all open files (config: buffer_total; default: 256MiB)
+  --chunk SIZE          bytes per read request (config: chunk_size; default: 512KiB, max 1MiB)
   --config PATH         config file (default: the per-user config path)
 `

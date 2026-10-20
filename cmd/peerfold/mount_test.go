@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ispengya/peerfold/internal/config"
 	"github.com/ispengya/peerfold/internal/mount"
 )
 
@@ -52,6 +53,12 @@ func TestDispatcherKnowsEveryListedCommand(t *testing.T) {
 	}
 }
 func TestMountRequiresAServer(t *testing.T) {
+	// Isolate HOME: a real server config on this machine would be migrated
+	// into the mount's view and provide the address the test says is missing.
+	home := t.TempDir()
+	t.Setenv("HOME", home)        // unix
+	t.Setenv("USERPROFILE", home) // windows
+
 	var out, errOut bytes.Buffer
 	code := runMount([]string{"--mount", filepath.Join(t.TempDir(), "mp")}, &out, &errOut)
 	if code == 0 {
@@ -178,15 +185,26 @@ func TestMountRejectsABadBufferSize(t *testing.T) {
 // flag. Without it, every mount would have to repeat an address that is already
 // written down.
 func TestMountUsesTheConfiguredServer(t *testing.T) {
-	cfg := filepath.Join(t.TempDir(), "config.json")
-	var out, errOut bytes.Buffer
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	point := filepath.Join(dir, "mp")
 
-	// With no --server and an existing config, the flag is not the only source.
-	code := runMount([]string{"--config", cfg, "--mount", filepath.Join(t.TempDir(), "mp")}, &out, &errOut)
-	if code == 0 {
-		t.Errorf("mount with no server anywhere = %d, want non-zero", code)
+	cfg := config.Default()
+	cfg.Server = "127.0.0.1:9"
+	cfg.MountPoint = point
+	if err := config.Save(cfgPath, cfg); err != nil {
+		t.Fatalf("config.Save: %v", err)
 	}
-	if !strings.Contains(errOut.String(), "server") {
-		t.Errorf("stderr = %q, want it to name the missing server", errOut.String())
+
+	// With no --server and an existing config, the config is the source.
+	_, server, gotPoint, _, err := mountOptionsFrom([]string{"--config", cfgPath})
+	if err != nil {
+		t.Fatalf("mountOptionsFrom: %v", err)
+	}
+	if server != cfg.Server {
+		t.Errorf("server = %q, want the configured %q", server, cfg.Server)
+	}
+	if gotPoint != point {
+		t.Errorf("mount point = %q, want the configured %q", gotPoint, point)
 	}
 }

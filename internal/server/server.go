@@ -787,11 +787,15 @@ func (s *Server) replyList(c *proto.Conn, env proto.Envelope) error {
 	if err := json.Unmarshal(env.Body, &b); err != nil {
 		return c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: fmt.Sprintf("bad list request: %v", err)})
 	}
-	logging.Infof("server: list %s/%s", b.Client, b.Path)
+	started := time.Now()
 	nodes, err := s.Query().List(b.Client, b.Path)
 	if err != nil {
+		logging.Infof("server: list %s/%s took=%s failed: %v",
+			b.Client, b.Path, time.Since(started), err)
 		return c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind, Err: err.Error()})
 	}
+	logging.Infof("server: list %s/%s entries=%d took=%s",
+		b.Client, b.Path, len(nodes), time.Since(started))
 	out := toNodeJSON(nodes)
 	body, err := json.Marshal(proto.ListOKBody{Nodes: out})
 	if err != nil {
@@ -823,6 +827,7 @@ func (s *Server) replyList(c *proto.Conn, env proto.Envelope) error {
 // the control frame would leave the requester's next answer to be read from where
 // this answer's content should have been, because frames are one sequence.
 func (s *Server) replyRead(c *proto.Conn, env proto.Envelope) error {
+	started := time.Now()
 	var b proto.ReadBody
 	var fail error
 	var stream <-chan answerContent
@@ -858,6 +863,8 @@ func (s *Server) replyRead(c *proto.Conn, env proto.Envelope) error {
 		}
 	}
 	if fail != nil {
+		logging.Infof("server: read %s/%s off=%d n=%d took=%s failed: %v",
+			b.Client, b.Path, b.Off, b.N, time.Since(started), fail)
 		// The head frame is where "no such file" travels, and a failed read is an
 		// empty stream rather than a missing one.
 		if err := c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindReadOK, Err: fail.Error()}); err != nil {
@@ -874,6 +881,8 @@ func (s *Server) replyRead(c *proto.Conn, env proto.Envelope) error {
 	// once — and the reading failure, if there was one, is attached to the frame
 	// that is about to be sent.
 	content := <-stream
+	logging.Infof("server: read %s/%s off=%d n=%d bytes=%d took=%s",
+		b.Client, b.Path, b.Off, b.N, len(content.body), time.Since(started))
 	if err := c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindReadOK, Err: reply.Err}); err != nil {
 		return err
 	}

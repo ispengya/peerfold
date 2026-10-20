@@ -127,6 +127,12 @@ type Mount struct {
 	files map[uint64]*openFile
 	// cache holds read chunks under the two D3 caps.
 	cache *chunkCache
+	// fetchMu serialises cache-miss fills. The viewer connection carries one
+	// request at a time, so this costs no network concurrency; its purpose is
+	// the re-check after waiting. Concurrent FUSE reads of the same range all
+	// miss before the first fill completes, and without this each one goes to
+	// the wire for the same bytes.
+	fetchMu sync.Mutex
 
 	// events is what the watch channel has told this mount, keyed by full path.
 	//
@@ -234,10 +240,15 @@ type Options struct {
 	// WriteLimit is how many bytes of accumulated writing one open may hold.
 	// Past it a write is refused with ENOSPC rather than truncated.
 	WriteLimit int
+	// ChunkSize is how many bytes one ranged read asks the owner for. It is
+	// the knob that trades first-byte latency against sequential throughput on
+	// a high-RTT link; zero means the package default.
+	ChunkSize int
 	// AttrTimeout and EntryTimeout are how long the kernel may trust an
-	// attribute or a directory entry it was handed. Both are short because the
-	// index can change without this process knowing: a file the kernel believes
-	// is 10 bytes may have been replaced by the owner.
+	// attribute or a directory entry it was handed. Events invalidate a path
+	// when it actually changes, so these bound only the staleness the kernel
+	// can invent on its own; five seconds keeps Explorer's repeated stats off
+	// the wire without hiding a change for long.
 	AttrTimeout  time.Duration
 	EntryTimeout time.Duration
 	// RootMode is the permission bits reported for the mount root itself.
@@ -310,14 +321,24 @@ func DefaultOptions() Options {
 		BufferLimit:     64 << 20,
 		BufferTotal:     256 << 20,
 		WriteLimit:      8 << 20,
-		AttrTimeout:     time.Second,
-		EntryTimeout:    time.Second,
+		ChunkSize:       chunkSize,
+		AttrTimeout:     5 * time.Second,
+		EntryTimeout:    5 * time.Second,
 		RootMode:        0o755,
 		InvalidateTable: 4096,
 		ReconnectMin:    time.Second,
 		ReconnectMax:    30 * time.Second,
 		GiveUpAfter:     2 * time.Minute,
 	}
+}
+
+// readChunk is the ranged-read unit: the configured size, or the package
+// default for a Mount built without one.
+func (m *Mount) readChunk() int {
+	if m.opts.ChunkSize > 0 {
+		return m.opts.ChunkSize
+	}
+	return chunkSize
 }
 
 // call returns the current caller, under the lock.

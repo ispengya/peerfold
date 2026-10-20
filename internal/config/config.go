@@ -35,6 +35,11 @@ type Config struct {
 	// same limits by a program that could have asked.
 	BufferLimit int `json:"buffer_limit"`
 	BufferTotal int `json:"buffer_total"`
+
+	// ChunkSize is how many bytes one ranged read asks for. It is the knob
+	// that trades first-byte latency against throughput on a high-RTT link;
+	// zero means "use the mount package's default".
+	ChunkSize int `json:"chunk_size"`
 }
 
 // Default returns the values used when no config file exists yet.
@@ -61,6 +66,7 @@ func Default() Config {
 
 		BufferLimit: 64 << 20,
 		BufferTotal: 256 << 20,
+		ChunkSize:   512 << 10,
 	}
 }
 

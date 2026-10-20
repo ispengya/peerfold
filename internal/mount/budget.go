@@ -5,19 +5,20 @@ import (
 	"sync"
 )
 
-// chunkSize is the unit a ranged read is broken into.
+// chunkSize is the default unit a ranged read is broken into.
 //
-// proto.MaxPayload is 1 MiB and the probe measured the per-frame cost rising
-// with frame size (64 KiB took 533us, 256 KiB 1000us, 1 MiB 3000us), so a full
-// frame is the worst choice. 128 KiB stays well inside one frame with room to
-// spare, and it is large enough that a sequential reader of a big file is not
-// paying a request per few kilobytes.
-//
-// The measurement also shows the cost is not linear in size — 64 KiB is the
-// cheapest per byte of those three — so this is deliberately not tuned to the
-// smallest frame. Smaller chunks mean more round trips, and a round trip costs
-// far more than the per-frame overhead it saves.
-const chunkSize = 128 << 10
+// The number is a latency decision, not a CPU one. A mount on another machine
+// pays one round trip per chunk, so the ceiling on sequential throughput is
+// roughly chunkSize/RTT: 128 KiB over a 50 ms link is 2.5 MB/s regardless of
+// available bandwidth. 512 KiB reduces the round trips fourfold while still
+// fitting comfortably inside one 1 MiB wire frame; it is a field rather than a
+// constant so a deployment can trade first-byte latency for throughput.
+const chunkSize = 512 << 10
+
+// MaxChunkSize bounds the configured read unit. A read's content is split into
+// frames by the wire, so a larger unit only holds more memory for one cache
+// entry and delays the first byte of a small read.
+const MaxChunkSize = 1 << 20
 
 type chunkKey struct {
 	fh    uint64

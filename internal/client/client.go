@@ -438,6 +438,7 @@ func (c *Client) deliver(env proto.Envelope) {
 // which has to have finished reading the stream before it can resume reading
 // control frames off this connection.
 func (c *Client) satisfyRead(env proto.Envelope) error {
+	started := time.Now()
 	var req proto.ReadBody
 	reason, data, ok := error(nil), []byte(nil), false
 	if err := json.Unmarshal(env.Body, &req); err != nil {
@@ -460,6 +461,9 @@ func (c *Client) satisfyRead(env proto.Envelope) error {
 			ok = true
 		}
 	}
+
+	logging.Infof("client: read %s off=%d n=%d bytes=%d took=%s err=%v",
+		req.Path, req.Off, req.N, len(data), time.Since(started), reason)
 
 	head := proto.Envelope{ID: env.ID, Kind: proto.KindReadOK}
 	if reason != nil {
@@ -512,6 +516,7 @@ func (c *Client) satisfyRead(env proto.Envelope) error {
 // consumed as they arrive, so a file far larger than one frame never has to be
 // held whole, and the connection stays at a frame boundary throughout.
 func (c *Client) satisfyWrite(env proto.Envelope) error {
+	started := time.Now()
 	var reason error
 	switch env.Kind {
 	case proto.KindMkdir:
@@ -525,6 +530,7 @@ func (c *Client) satisfyWrite(env proto.Envelope) error {
 	default:
 		reason = fmt.Errorf("write request has unknown kind %q", env.Kind)
 	}
+	logging.Infof("client: %s took=%s err=%v", env.Kind, time.Since(started), reason)
 
 	head := proto.Envelope{ID: env.ID, Kind: proto.KindWriteOK}
 	if reason != nil {

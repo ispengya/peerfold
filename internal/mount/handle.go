@@ -3,6 +3,7 @@ package mount
 import (
 	"bytes"
 	"log"
+	"time"
 
 	"github.com/ispengya/peerfold/internal/node"
 )
@@ -185,9 +186,14 @@ func (m *Mount) flush(fh uint64) int {
 	c := m.caller
 	m.mu.Unlock()
 
-	if err := c.Put(path, bytes.NewReader(body)); err != nil {
+	started := time.Now()
+	err := c.Put(path, bytes.NewReader(body))
+	took := time.Since(started)
+	if err != nil {
+		log.Printf("mount: flush %s bytes=%d took=%s failed: %v", path, len(body), took, err)
 		return errnoFor(err)
 	}
+	log.Printf("mount: flush %s bytes=%d took=%s", path, len(body), took)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()

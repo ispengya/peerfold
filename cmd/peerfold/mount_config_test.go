@@ -2,12 +2,12 @@ package main
 
 import (
 	"bytes"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/ispengya/peerfold/internal/config"
+	"github.com/ispengya/peerfold/internal/mount"
 )
 
 // TestMountFlagsWorkWithoutAnyConfig pins that a fresh machine can mount with
@@ -35,6 +35,59 @@ func TestMountFlagsWorkWithoutAnyConfig(t *testing.T) {
 	}
 	if opts.BufferLimit <= 0 || opts.BufferTotal <= 0 {
 		t.Errorf("buffer defaults = (%d, %d), want the mount package's positive defaults", opts.BufferLimit, opts.BufferTotal)
+	}
+}
+
+// TestMountChunkSizeDefaultsAndOverrides pins the read-size knob: package
+// default, then config, then flag. The size is a latency decision, so a silent
+// fallback to the wrong number would show up only as unexplained slowness.
+func TestMountChunkSizeDefaultsAndOverrides(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)        // unix
+	t.Setenv("USERPROFILE", home) // windows
+	mp := filepath.Join(t.TempDir(), "mp")
+
+	opts, _, _, _, err := mountOptionsFrom([]string{
+		"--server", "127.0.0.1:1", "--mount", mp,
+	})
+	if err != nil {
+		t.Fatalf("mountOptionsFrom: %v", err)
+	}
+	if want := mount.DefaultOptions().ChunkSize; opts.ChunkSize != want {
+		t.Errorf("default ChunkSize = %d, want %d", opts.ChunkSize, want)
+	}
+
+	opts, _, _, _, err = mountOptionsFrom([]string{
+		"--server", "127.0.0.1:1", "--mount", mp, "--chunk", "256KiB",
+	})
+	if err != nil {
+		t.Fatalf("mountOptionsFrom with --chunk: %v", err)
+	}
+	if opts.ChunkSize != 256<<10 {
+		t.Errorf("ChunkSize = %d, want the flag's %d", opts.ChunkSize, 256<<10)
+	}
+
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	cfg := config.Default()
+	cfg.Server = "127.0.0.1:1"
+	cfg.MountPoint = mp
+	cfg.ChunkSize = 1 << 20
+	if err := config.Save(cfgPath, cfg); err != nil {
+		t.Fatalf("config.Save: %v", err)
+	}
+	opts, _, _, _, err = mountOptionsFrom([]string{"--config", cfgPath})
+	if err != nil {
+		t.Fatalf("mountOptionsFrom from config: %v", err)
+	}
+	if opts.ChunkSize != cfg.ChunkSize {
+		t.Errorf("ChunkSize = %d, want the configured %d", opts.ChunkSize, cfg.ChunkSize)
+	}
+
+	// Above one frame's worth is refused rather than quietly clamped.
+	if _, _, _, _, err := mountOptionsFrom([]string{
+		"--server", "127.0.0.1:1", "--mount", mp, "--chunk", "2MiB",
+	}); err == nil {
+		t.Error("a chunk larger than the protocol frame was accepted")
 	}
 }
 
@@ -141,13 +194,14 @@ func TestMountRejectsBufferAboveTheTotal(t *testing.T) {
 // has no config and no flag: the platform default has to be what is used, or
 // `peerfold mount --server ...` would not know where to mount.
 func TestMountUsesTheDefaultMountPointWhenNothingSaysOtherwise(t *testing.T) {
-	// A config path under a temporary directory, so a real config file on this
-	// machine cannot influence the result.
-	dir := t.TempDir()
-	_, _, point, _, err := mountOptionsFrom([]string{
-		"--server", "127.0.0.1:1",
-		"--config", filepath.Join(dir, "absent.json"),
-	})
+	// An isolated HOME is the "no config anywhere" case. Naming an absent
+	// --config is a different case: the user asked for a specific file, and its
+	// absence is an error rather than a reason to use defaults.
+	home := t.TempDir()
+	t.Setenv("HOME", home)        // unix
+	t.Setenv("USERPROFILE", home) // windows
+
+	_, _, point, _, err := mountOptionsFrom([]string{"--server", "127.0.0.1:1"})
 	if err != nil {
 		t.Fatalf("mountOptionsFrom: %v", err)
 	}
@@ -156,13 +210,6 @@ func TestMountUsesTheDefaultMountPointWhenNothingSaysOtherwise(t *testing.T) {
 	}
 	if !filepath.IsAbs(point) {
 		t.Errorf("the default mount point %q is not absolute", point)
-	}
-	if _, statErr := os.Stat(filepath.Join(dir, "absent.json")); statErr != nil {
-		// Not a requirement, just worth stating: reading a config that is not
-		// there must not create it, because a read that writes is a surprise.
-		if !os.IsNotExist(statErr) {
-			t.Errorf("reading a missing config reported %v", statErr)
-		}
 	}
 }
 

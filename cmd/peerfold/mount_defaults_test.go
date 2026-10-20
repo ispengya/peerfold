@@ -27,6 +27,10 @@ func TestConfigMountDefaultsAgreeWithTheMount(t *testing.T) {
 		t.Errorf("config.Default().BufferTotal = %d, mount.DefaultOptions().BufferTotal = %d",
 			cfg.BufferTotal, def.BufferTotal)
 	}
+	if cfg.ChunkSize != def.ChunkSize {
+		t.Errorf("config.Default().ChunkSize = %d, mount.DefaultOptions().ChunkSize = %d",
+			cfg.ChunkSize, def.ChunkSize)
+	}
 	// A config that declares no buffers must leave the mount's defaults alone,
 	// which is what the "zero means the package default" rule buys.
 	loaded := config.Config{}

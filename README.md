@@ -186,7 +186,9 @@ systemctl --user enable --now peerfold-server.service
 ~/peerfold-mount/config.json
 ```
 
-Windows 上是 `C:\Users\你\peerfold-server\log.txt` 这种形式。日志记录每次 list / read / write / mkdir / rename / remove / 文件变化推送。
+`chunk_size`（或 `--chunk`）控制每次向 owner 读取的字节数，默认 512 KiB，最大 1 MiB。高延迟链路可以调大以减少往返；小文件为主时可以调小以降低首字节延迟。`buffer_limit` / `buffer_total` 控制读缓存的单文件/总量上限。
+
+Windows 上是 `C:\Users\你\peerfold-server\log.txt` 这种形式。日志记录每次 list / read / write / mkdir / rename / remove / 文件变化推送，并带有耗时和字节数（例如 `mount: read ... took=... bytes=...`、`server: read ... took=...`、`client: read ... took=...`），可以直接对比慢在网络请求、server 转发还是 owner 读盘。
 
 ## 清理
 
