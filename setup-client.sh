@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # setup-client.sh — peerfold client one-click setup (Linux / macOS)
-# Installs Go + FUSE when possible, builds the binary, prepares config dirs,
-# then starts the client through the interactive foreground/background prompt.
+# Installs Go + FUSE when possible, builds the binary and installs the command.
+# Starting a client is deliberately a separate step: it is long-running and
+# interactive, while this script is safe to rerun to update the binary.
 # Mirrors setup-client.ps1.
 #
 # Usage:
@@ -13,7 +14,7 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_PATH="${PROJECT_ROOT}/peerfold"
 HOME_DIR="${HOME:-$(eval echo ~)}"
-TOTAL=5
+TOTAL=4
 
 FORCE_REBUILD=""
 
@@ -298,7 +299,7 @@ if [ "$(uname -s)" = "Linux" ] && ! command -v gcc >/dev/null 2>&1 && ! command 
   fi
 fi
 
-# ── [3/5] Build ──────────────────────────────────────────────
+# ── [3/4] Build ──────────────────────────────────────────────
 
 section 3 "Build peerfold"
 
@@ -325,34 +326,35 @@ else
   if build_binary; then :; else fail "Build failed"; exit 1; fi
 fi
 
-# ── [4/5] PATH ───────────────────────────────────────────────
+# ── [4/4] PATH ───────────────────────────────────────────────
 
 section 4 "Install command"
 
 install_command
 
-# ── [5/5] Start client ───────────────────────────────────────
-
-section 5 "Start client"
-
-# Hand over to the interactive start. With an existing client config it loads
-# the saved server, name and shares; without one it asks for them — including
-# the share directory, which it creates. Foreground vs background comes next.
-code=0
-"$BIN_PATH" client || code=$?
-if [ "$code" -ne 0 ]; then
-  fail "Client exited with status $code"
-  exit "$code"
-fi
-
 # ── Summary ──────────────────────────────────────────────────
 
+# Starting the client is left to an explicit command. It is a long-running,
+# interactive process, and tying it to the install step meant a rerun for a
+# rebuild would also try to bring a client up. The server script is different:
+# there is one server, and starting it right after setup is the point.
 echo ""
 echo "  ------------------------------------"
 echo "  Setup complete!"
 echo ""
-echo "  Config:  ${HOME_DIR}/peerfold-client-<name>/config.json"
+echo "  Share this machine's directories:"
+echo "    peerfold client"
+echo "        interactive: asks for server, name and share"
+echo ""
+echo "    peerfold client --server HOST:PORT --name NAME --share NAME=DIR"
+echo "        run directly, no questions"
+echo ""
+echo "  Mount the aggregated tree (separate role):"
+echo "    peerfold mount"
+echo ""
+echo "  Config:  ${HOME_DIR}/peerfold-client-<name>/config.json (created on first start)"
+echo "  Mount:   ${HOME_DIR}/peerfold-mount/config.json (created on first mount)"
 echo "  Log:     ${HOME_DIR}/peerfold-client-<name>/log.txt"
 echo "  Status:  peerfold status"
-echo "  Stop:    peerfold stop client <name>"
+echo "  Stop:    peerfold stop client <name> | peerfold stop mount"
 echo ""

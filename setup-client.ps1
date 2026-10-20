@@ -1,6 +1,7 @@
 # setup-client.ps1 — peerfold client one-click setup
-# Installs Go + WinFsp, builds the binary, prepares config, then starts the
-# client through the interactive foreground/background prompt.
+# Installs Go + WinFsp, builds the binary and adds it to PATH. Starting a
+# client is deliberately a separate step: it is long-running and interactive,
+# while this script is safe to rerun to update the binary.
 # Run as Administrator.
 
 $ErrorActionPreference = "Stop"
@@ -81,7 +82,7 @@ function BuildBinary {
 
 Header
 
-$total = 5
+$total = 4
 
 # ── [1/5] Go ─────────────────────────────────────────────────
 
@@ -170,27 +171,29 @@ if ($userPath -like "*$ProjectRoot*") {
 Info "For the current terminal, run: `$env:Path += ';$ProjectRoot'"
 Info "Or reopen a new terminal — 'peerfold' will work there."
 
-# ── [5/5] Start client ───────────────────────────────────────
-
-Section 5 $total "Start client"
-
-# Hand over to the interactive start. With an existing client config it loads
-# the saved server, name and shares; without one it asks for them — including
-# the share directory, which it creates. Foreground vs background comes next.
-& $BinPath client
-if ($LASTEXITCODE -ne 0) {
-    Fail "Client exited with status $LASTEXITCODE"
-    exit $LASTEXITCODE
-}
-
 # ── Summary ──────────────────────────────────────────────────
 
+# Starting the client is left to an explicit command. It is a long-running,
+# interactive process, and tying it to the install step meant a rerun for a
+# rebuild would also try to bring a client up. The server script is different:
+# there is one server, and starting it right after setup is the point.
 Write-Host ""
 Write-Host "  ------------------------------------" -ForegroundColor DarkGray
 Write-Host "  Setup complete!" -ForegroundColor Green
 Write-Host ""
-Write-Host "  Config:  $Up\peerfold-client-<name>\config.json" -ForegroundColor DarkGray
+Write-Host "  Share this machine's directories:" -ForegroundColor White
+Write-Host "    peerfold client" -ForegroundColor White
+Write-Host "        interactive: asks for server, name and share" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "    peerfold client --server HOST:PORT --name NAME --share NAME=DIR" -ForegroundColor White
+Write-Host "        run directly, no questions" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "  Mount the aggregated tree (separate role):" -ForegroundColor White
+Write-Host "    peerfold mount" -ForegroundColor White
+Write-Host ""
+Write-Host "  Config:  $Up\peerfold-client-<name>\config.json (created on first start)" -ForegroundColor DarkGray
+Write-Host "  Mount:   $Up\peerfold-mount\config.json (created on first mount)" -ForegroundColor DarkGray
 Write-Host "  Log:     $Up\peerfold-client-<name>\log.txt" -ForegroundColor DarkGray
 Write-Host "  Status:  peerfold status" -ForegroundColor DarkGray
-Write-Host "  Stop:    peerfold stop client <name>" -ForegroundColor DarkGray
+Write-Host "  Stop:    peerfold stop client <name> | peerfold stop mount" -ForegroundColor DarkGray
 Write-Host ""
