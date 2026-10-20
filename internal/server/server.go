@@ -86,9 +86,13 @@ type Server struct {
 	// the status query itself) are not recorded, because they are transient
 	// and listing them would drown out the mounts the registry exists for.
 	viewers map[*proto.Conn]proto.ViewerInfo
-	closing bool
-	closed  bool
-	wg      sync.WaitGroup
+	// clientInfos is every connected supplier, keyed by its connection. The
+	// Registry answers whether a name is live; this answers where it connected
+	// from and when, which is what status needs and the Registry does not keep.
+	clientInfos map[*proto.Conn]proto.ClientInfo
+	closing     bool
+	closed      bool
+	wg          sync.WaitGroup
 
 	// broadcastTimeout bounds one push to one watcher. It is a field rather than
 	// the constant so a test can drive the timeout path without waiting five
@@ -119,6 +123,7 @@ func New(listen string) *Server {
 		watchers:         make(map[*proto.Conn]struct{}),
 		watchFails:       make(map[*proto.Conn]int),
 		viewers:          make(map[*proto.Conn]proto.ViewerInfo),
+		clientInfos:      make(map[*proto.Conn]proto.ClientInfo),
 		router:           &Router{clients: make(map[string]*clientLink)},
 		broadcastTimeout: DefaultEventBroadcastTimeout,
 	}
@@ -334,6 +339,17 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.router.detach(hb.Name)
 	}()
 
+	// Record where this supplier connected from and when, for status on any
+	// machine. Like the mount registry it is filled before the hello is
+	// answered, so a completed handshake means the client is already visible.
+	s.registerClientInfo(c, proto.ClientInfo{
+		Name:       hb.Name,
+		RemoteAddr: conn.RemoteAddr().String(),
+		Since:      time.Now().Unix(),
+		Aggregate:  aggregate,
+	})
+	defer s.unregisterClientInfo(c)
+
 	if err := s.replyHello(c, env.ID, hb.Name, aggregate); err != nil {
 		return
 	}
@@ -432,6 +448,15 @@ func (s *Server) serveLoop(name string, c *proto.Conn) {
 		// no more privilege over that answer than a viewer does.
 		if env.Kind == proto.KindViewers {
 			if err := s.replyViewers(c, env); err != nil {
+				return
+			}
+			continue
+		}
+
+		// The supplier half of the same status view: who is connected, from
+		// where, and for how long.
+		if env.Kind == proto.KindClients {
+			if err := s.replyClients(c, env); err != nil {
 				return
 			}
 			continue

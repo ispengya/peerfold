@@ -105,7 +105,7 @@ usage: peerfold <command> [args]
 service:
   server      start the aggregation server (interactive without flags)
   client      start a client (interactive without flags)
-  status      show local components and mounts on the server
+  status      show local components and mounts/clients on the server
   stop        stop a running component (server|client|mount|all)
   restart     restart a component (server|client)
 

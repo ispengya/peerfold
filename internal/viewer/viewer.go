@@ -127,6 +127,18 @@ type Mount struct {
 	Since time.Time
 }
 
+// Client is one supplier connected to a server, as the server describes it.
+type Client struct {
+	Name       string
+	RemoteAddr string
+	// Since is when the server accepted the client's connection, or the zero
+	// time if the server did not say.
+	Since time.Time
+	// Aggregate is the server's ruling on the role, not the client's request:
+	// a second machine asking for it is downgraded.
+	Aggregate bool
+}
+
 // Dial connects to serverAddr and completes the viewer handshake: the server
 // replies to the hello with its name and aggregate ruling, and a viewer is not
 // registered, so it can observe but cannot publish.
@@ -223,51 +235,91 @@ func (v *Viewer) List(path string) ([]node.Node, error) {
 // ListMounts asks the server which mounts are attached to it. An empty list is
 // a server with no mounts, not an error.
 func (v *Viewer) ListMounts() ([]Mount, error) {
-	var out []Mount
+	raw, err := v.listBody(proto.KindViewers, proto.KindViewersOK, "mounts")
+	if err != nil {
+		return nil, err
+	}
+	var b proto.ViewersOKBody
+	if err := json.Unmarshal(raw, &b); err != nil {
+		return nil, fmt.Errorf("viewer: decode mounts reply: %w", err)
+	}
+	out := make([]Mount, 0, len(b.Viewers))
+	for _, m := range b.Viewers {
+		out = append(out, Mount{
+			Name:       m.Name,
+			MountPoint: m.MountPoint,
+			RemoteAddr: m.RemoteAddr,
+			Since:      unixTime(m.Since),
+		})
+	}
+	return out, nil
+}
+
+// ListClients asks the server which suppliers are connected to it. An empty
+// list is a server with no clients, not an error.
+func (v *Viewer) ListClients() ([]Client, error) {
+	raw, err := v.listBody(proto.KindClients, proto.KindClientsOK, "clients")
+	if err != nil {
+		return nil, err
+	}
+	var b proto.ClientsOKBody
+	if err := json.Unmarshal(raw, &b); err != nil {
+		return nil, fmt.Errorf("viewer: decode clients reply: %w", err)
+	}
+	out := make([]Client, 0, len(b.Clients))
+	for _, c := range b.Clients {
+		out = append(out, Client{
+			Name:       c.Name,
+			RemoteAddr: c.RemoteAddr,
+			Since:      unixTime(c.Since),
+			Aggregate:  c.Aggregate,
+		})
+	}
+	return out, nil
+}
+
+// listBody sends one list request whose answer is a small JSON body in the
+// control frame and returns that body. The mounts and clients queries differ
+// only in their request and reply kinds, so they share this.
+func (v *Viewer) listBody(kind, kindOK, what string) ([]byte, error) {
+	var body []byte
 	err := v.stream(func() error {
-		id, err := v.send(proto.KindViewers, nil)
+		id, err := v.send(kind, nil)
 		if err != nil {
 			return err
 		}
 		env, err := v.recv(callTimeout)
 		if err != nil {
-			return fmt.Errorf("viewer: read mounts reply: %w", err)
+			return fmt.Errorf("viewer: read %s reply: %w", what, err)
 		}
 		if env.Err != "" {
 			return fmt.Errorf("viewer: %s", env.Err)
 		}
 		if env.ID != id {
-			return fmt.Errorf("viewer: mounts reply ID = %d, want %d: replies are out of step", env.ID, id)
+			return fmt.Errorf("viewer: %s reply ID = %d, want %d: replies are out of step", what, env.ID, id)
 		}
-		if env.Kind != proto.KindViewersOK {
-			return fmt.Errorf("viewer: mounts reply kind = %q, want %q", env.Kind, proto.KindViewersOK)
+		if env.Kind != kindOK {
+			return fmt.Errorf("viewer: %s reply kind = %q, want %q", what, env.Kind, kindOK)
 		}
 		// The list is small and arrives whole in the envelope. A missing body
-		// is a protocol error rather than "no mounts": the server always sends
+		// is a protocol error rather than "no entries": the server always sends
 		// the field, even when it is empty.
 		if env.Body == nil {
-			return fmt.Errorf("viewer: mounts reply carried no body")
+			return fmt.Errorf("viewer: %s reply carried no body", what)
 		}
-		var b proto.ViewersOKBody
-		if err := json.Unmarshal(env.Body, &b); err != nil {
-			return fmt.Errorf("viewer: decode mounts reply: %w", err)
-		}
-		out = make([]Mount, 0, len(b.Viewers))
-		for _, m := range b.Viewers {
-			var since time.Time
-			if m.Since > 0 {
-				since = time.Unix(m.Since, 0)
-			}
-			out = append(out, Mount{
-				Name:       m.Name,
-				MountPoint: m.MountPoint,
-				RemoteAddr: m.RemoteAddr,
-				Since:      since,
-			})
-		}
+		body = env.Body
 		return nil
 	})
-	return out, err
+	return body, err
+}
+
+// unixTime turns the wire's Unix-seconds timestamp into a Time, or the zero
+// time when the peer did not send one.
+func unixTime(sec int64) time.Time {
+	if sec <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(sec, 0)
 }
 
 // list asks for one directory of the aggregated tree.

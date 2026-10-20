@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -10,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/ispengya/peerfold/internal/config"
+	"github.com/ispengya/peerfold/internal/proto"
 	"github.com/ispengya/peerfold/internal/server"
 	"github.com/ispengya/peerfold/internal/viewer"
 )
@@ -132,12 +135,33 @@ func TestStatusListsMountsOnAnotherMachine(t *testing.T) {
 	}
 	defer m.Close()
 
+	// A supplier on another machine, as seen by the server.
+	raw, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Dial client: %v", err)
+	}
+	defer raw.Close()
+	pc := proto.NewConn(raw)
+	hello, err := json.Marshal(proto.HelloBody{Name: "linuxbox", Role: proto.RoleClient})
+	if err != nil {
+		t.Fatalf("Marshal hello: %v", err)
+	}
+	if err := pc.Send(proto.Envelope{ID: 1, Kind: proto.KindHello, Body: hello}); err != nil {
+		t.Fatalf("Send hello: %v", err)
+	}
+	if env, err := pc.Recv(); err != nil || env.Kind != proto.KindHelloOK {
+		t.Fatalf("hello reply = %+v, err = %v; want hello_ok", env, err)
+	}
+
 	var out, errOut bytes.Buffer
 	if code := cmdStatus(nil, &out, &errOut); code != 0 {
 		t.Fatalf("cmdStatus() = %d, stderr = %q", code, errOut.String())
 	}
 	got := out.String()
-	for _, want := range []string{"Remote mounts via " + addr, "winbox", `C:\Users\me\peerfold`} {
+	for _, want := range []string{
+		"Remote mounts via " + addr, "winbox", `C:\Users\me\peerfold`,
+		"Clients via " + addr, "linuxbox",
+	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("status output missing %q:\n%s", want, got)
 		}

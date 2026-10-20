@@ -1,9 +1,12 @@
 package viewer_test
 
 import (
+	"encoding/json"
+	"net"
 	"testing"
 	"time"
 
+	"github.com/ispengya/peerfold/internal/proto"
 	"github.com/ispengya/peerfold/internal/server"
 	"github.com/ispengya/peerfold/internal/viewer"
 )
@@ -58,6 +61,61 @@ func TestDialMountIsVisibleToOtherViewers(t *testing.T) {
 	}
 	if got.Since.IsZero() {
 		t.Error("Since is zero; the server should stamp when it accepted the mount")
+	}
+}
+
+// TestListClientsShowsConnectedSuppliers pins the supplier half of the status
+// view. A client that completes the handshake is visible to a viewer with the
+// address it connected from, so status on another machine can report it.
+func TestListClientsShowsConnectedSuppliers(t *testing.T) {
+	_, addr := startServer(t)
+
+	raw, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer raw.Close()
+	pc := proto.NewConn(raw)
+	body, err := json.Marshal(proto.HelloBody{Name: "linuxbox", Role: proto.RoleClient})
+	if err != nil {
+		t.Fatalf("Marshal hello: %v", err)
+	}
+	if err := pc.Send(proto.Envelope{ID: 1, Kind: proto.KindHello, Body: body}); err != nil {
+		t.Fatalf("Send hello: %v", err)
+	}
+	env, err := pc.Recv()
+	if err != nil {
+		t.Fatalf("Recv hello reply: %v", err)
+	}
+	if env.Kind != proto.KindHelloOK || env.Err != "" {
+		t.Fatalf("hello reply = %+v, want hello_ok with no error", env)
+	}
+
+	q, err := viewer.Dial(addr)
+	if err != nil {
+		t.Fatalf("Dial viewer: %v", err)
+	}
+	defer q.Close()
+
+	clients, err := q.ListClients()
+	if err != nil {
+		t.Fatalf("ListClients: %v", err)
+	}
+	if len(clients) != 1 {
+		t.Fatalf("ListClients returned %d clients, want 1: %+v", len(clients), clients)
+	}
+	got := clients[0]
+	if got.Name != "linuxbox" {
+		t.Errorf("Name = %q, want linuxbox", got.Name)
+	}
+	if got.RemoteAddr == "" {
+		t.Error("RemoteAddr is empty; the server observed the connection and should say where it came from")
+	}
+	if got.Since.IsZero() {
+		t.Error("Since is zero; the server should stamp when it accepted the client")
+	}
+	if got.Aggregate {
+		t.Error("Aggregate = true, want false; the client did not ask for the role")
 	}
 }
 

@@ -275,53 +275,29 @@ func cmdStatus(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "           Point:   %s\n", point)
 	}
 
-	// Remote mounts. The state above describes only this machine, so the
-	// server is asked which mounts are attached to it -- that is the only way
-	// a mount on another machine becomes visible here. The query is itself an
-	// ordinary viewer and declares no mount point, so it never lists itself.
+	// Remote mounts and clients. The state above describes only this machine,
+	// so the server is asked what is attached to it -- that is the only way a
+	// mount or client on another machine becomes visible here. The query is
+	// itself an ordinary viewer: it declares no mount point and is not a
+	// supplier, so it never lists itself.
 	if addr := statusServerAddress(); addr != "" {
 		fmt.Fprintf(stdout, "\n")
 		v, err := viewer.DialTimeout(addr, statusQueryTimeout)
 		if err != nil {
-			fmt.Fprintf(stdout, "  Remote mounts: (server %s unreachable)\n", addr)
+			fmt.Fprintf(stdout, "  Remote server: (server %s unreachable)\n", addr)
 		} else {
-			mounts, queryErr := v.ListMounts()
+			mounts, mountsErr := v.ListMounts()
+			clients, clientsErr := v.ListClients()
 			v.Close()
-			switch {
-			case queryErr != nil:
-				// An older server does not know the request. Saying so is
-				// better than pretending there are no remote mounts, and the
-				// wire's own wording is not what a user needs to read: the
-				// fix is to update and restart the server.
-				if strings.Contains(queryErr.Error(), "not implemented") {
-					fmt.Fprintf(stdout, "  Remote mounts: (server does not support listing mounts; update and restart it)\n")
-				} else {
-					fmt.Fprintf(stdout, "  Remote mounts: (%v)\n", queryErr)
-				}
-			case len(mounts) == 0:
-				fmt.Fprintf(stdout, "  Remote mounts: (none)\n")
-			default:
-				fmt.Fprintf(stdout, "  Remote mounts via %s:\n", addr)
-				for _, m := range mounts {
-					name := m.Name
-					if name == "" {
-						name = "(unnamed)"
-					}
-					fmt.Fprintf(stdout, "    %s  %s", name, m.MountPoint)
-					if m.RemoteAddr != "" {
-						fmt.Fprintf(stdout, "  from %s", m.RemoteAddr)
-					}
-					if !m.Since.IsZero() {
-						up := time.Since(m.Since)
-						if up < 0 {
-							// Server and this machine disagree about the time;
-							// a negative age would read as nonsense.
-							up = 0
-						}
-						fmt.Fprintf(stdout, "  up %s", up.Round(time.Second))
-					}
-					fmt.Fprintln(stdout)
-				}
+
+			// A server from before either query existed answers both with
+			// "not implemented". One line says the fix; repeating it per query
+			// would read like two different problems.
+			if statusUnsupported(mountsErr) && statusUnsupported(clientsErr) {
+				fmt.Fprintf(stdout, "  Remote server: (does not support listing mounts or clients; update and restart it)\n")
+			} else {
+				printRemoteMounts(stdout, addr, mounts, mountsErr)
+				printRemoteClients(stdout, addr, clients, clientsErr)
 			}
 		}
 	}
@@ -330,8 +306,86 @@ func cmdStatus(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-// statusServerAddress returns the server whose mounts status should ask about,
-// or "" when no local config names one.
+// statusUnsupported reports whether err is an older server's answer to a query
+// it does not implement.
+func statusUnsupported(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "not implemented")
+}
+
+// printRemoteMounts writes the mounts attached to the configured server.
+func printRemoteMounts(out io.Writer, addr string, mounts []viewer.Mount, err error) {
+	switch {
+	case err != nil:
+		// The wire's own wording is not what a user needs to read: the fix is
+		// to update and restart the server.
+		if statusUnsupported(err) {
+			fmt.Fprintf(out, "  Remote mounts: (server does not support listing mounts; update and restart it)\n")
+		} else {
+			fmt.Fprintf(out, "  Remote mounts: (%v)\n", err)
+		}
+	case len(mounts) == 0:
+		fmt.Fprintf(out, "  Remote mounts: (none)\n")
+	default:
+		fmt.Fprintf(out, "  Remote mounts via %s:\n", addr)
+		for _, m := range mounts {
+			name := m.Name
+			if name == "" {
+				name = "(unnamed)"
+			}
+			fmt.Fprintf(out, "    %s  %s", name, m.MountPoint)
+			printPeerDetail(out, m.RemoteAddr, m.Since)
+			fmt.Fprintln(out)
+		}
+	}
+}
+
+// printRemoteClients writes the suppliers attached to the configured server.
+func printRemoteClients(out io.Writer, addr string, clients []viewer.Client, err error) {
+	switch {
+	case err != nil:
+		if statusUnsupported(err) {
+			fmt.Fprintf(out, "  Clients: (server does not support listing clients; update and restart it)\n")
+		} else {
+			fmt.Fprintf(out, "  Clients: (%v)\n", err)
+		}
+	case len(clients) == 0:
+		fmt.Fprintf(out, "  Clients via %s: (none)\n", addr)
+	default:
+		fmt.Fprintf(out, "  Clients via %s:\n", addr)
+		for _, c := range clients {
+			name := c.Name
+			if name == "" {
+				name = "(unnamed)"
+			}
+			fmt.Fprintf(out, "    %s", name)
+			if c.Aggregate {
+				fmt.Fprintf(out, "  (aggregate)")
+			}
+			printPeerDetail(out, c.RemoteAddr, c.Since)
+			fmt.Fprintln(out)
+		}
+	}
+}
+
+// printPeerDetail writes the "from ... up ..." tail shared by remote mounts and
+// clients. Missing values are omitted rather than printed as empty fields.
+func printPeerDetail(out io.Writer, remoteAddr string, since time.Time) {
+	if remoteAddr != "" {
+		fmt.Fprintf(out, "  from %s", remoteAddr)
+	}
+	if !since.IsZero() {
+		up := time.Since(since)
+		if up < 0 {
+			// Server and this machine disagree about the time; a negative age
+			// would read as nonsense.
+			up = 0
+		}
+		fmt.Fprintf(out, "  up %s", up.Round(time.Second))
+	}
+}
+
+// statusServerAddress returns the server whose mounts and clients status should
+// ask about, or "" when no local config names one.
 //
 // The server's own config comes first: on the machine that aggregates, that is
 // the authority. Then the mount config and any client config, so a machine that

@@ -47,6 +47,12 @@ const (
 	// is a viewer, and no local pid file can describe a process elsewhere.
 	KindViewers   = "viewers"
 	KindViewersOK = "viewers_ok"
+
+	// KindClients asks the server which suppliers are connected. It is the
+	// other half of the status view: a mount can be started on one machine,
+	// a client on another, and status should describe both from anywhere.
+	KindClients   = "clients"
+	KindClientsOK = "clients_ok"
 )
 
 // Write-body modes. A whole-file write-back either replaces what is there or
@@ -213,4 +219,21 @@ type ViewerInfo struct {
 // ViewersOKBody is the answer to KindViewers.
 type ViewersOKBody struct {
 	Viewers []ViewerInfo `json:"viewers"`
+}
+
+// ClientInfo describes one supplier connected to the server.
+//
+// Like ViewerInfo it is the server's account: Name comes from the client's
+// hello, RemoteAddr is what the server observed, and Aggregate is the server's
+// ruling rather than the client's request.
+type ClientInfo struct {
+	Name       string `json:"name"`
+	RemoteAddr string `json:"remote_addr"`
+	Since      int64  `json:"since"`
+	Aggregate  bool   `json:"aggregate,omitempty"`
+}
+
+// ClientsOKBody is the answer to KindClients.
+type ClientsOKBody struct {
+	Clients []ClientInfo `json:"clients"`
 }
