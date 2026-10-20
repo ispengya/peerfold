@@ -134,7 +134,7 @@ systemctl --user enable --now peerfold-server.service
 .\cleanup.ps1         # Windows
 ```
 
-删配置、日志、自启项、演示目录、构建产物。不动 FUSE/WinFsp 和系统 PATH。
+先停掉正在运行的进程（前台、后台都包括，mount 会正常卸载），再删配置、日志、自启项、演示目录、构建产物。不动 FUSE/WinFsp 和系统 PATH。
 
 ---
 

@@ -33,7 +33,7 @@ Header
 
 Write-Host "  This will remove peerfold's own data:" -ForegroundColor Yellow
 Write-Host ""
-Write-Host "    [x] Server & client processes" -ForegroundColor DarkGray
+Write-Host "    [x] Running processes (foreground & background)" -ForegroundColor DarkGray
 Write-Host "    [x] Config directories and logs" -ForegroundColor DarkGray
 Write-Host "    [x] Auto-start registry entries" -ForegroundColor DarkGray
 Write-Host "    [x] Demo / test files" -ForegroundColor DarkGray
@@ -55,6 +55,8 @@ $total = 5
 
 Section 1 $total "Stop peerfold processes"
 
+# Sweep by process name: foreground runs started with explicit flags never
+# write a PID file, and a stale PID file could point at an unrelated process.
 $procs = Get-Process peerfold -ErrorAction SilentlyContinue
 if ($procs) {
     $procs | Stop-Process -Force
@@ -70,6 +72,8 @@ Section 2 $total "Remove config and log directories"
 
 $dirs = @()
 $dirs += Join-Path $Up "peerfold-server"
+$dirs += Join-Path $Up "peerfold-mount"
+$dirs += Join-Path $Up "peerfold-client"
 Get-ChildItem -Path $Up -Directory -Filter "peerfold-client-*" -ErrorAction SilentlyContinue | ForEach-Object {
     $dirs += $_.FullName
 }

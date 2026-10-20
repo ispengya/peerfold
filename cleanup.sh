@@ -34,7 +34,7 @@ header
 
 echo "  This will remove peerfold's own data:"
 echo ""
-echo "    [x] Server & client processes"
+echo "    [x] Running processes (foreground & background)"
 echo "    [x] Config directories and logs"
 echo "    [x] Auto-start entries (XDG)"
 echo "    [x] Demo / test files"
@@ -55,22 +55,48 @@ esac
 
 section 1 "Stop peerfold processes"
 
-if command -v pkill >/dev/null 2>&1; then
-  if pkill -f "${PROJECT_ROOT}/peerfold" 2>/dev/null || pkill -x peerfold 2>/dev/null; then
-    sleep 1
-    ok "Stopped peerfold processes"
+# Sweep by process name rather than PID files: foreground runs started with
+# explicit flags (`peerfold server --listen ...`) never write a PID file, and a
+# stale PID file could point at an unrelated process after the PID is reused.
+# SIGTERM is the signal a mount handles by unmounting and flushing, so the
+# mount role still shuts down cleanly.
+list_pids() {
+  pgrep -x peerfold 2>/dev/null || true
+}
+
+if command -v pgrep >/dev/null 2>&1; then
+  if [ -n "$(list_pids)" ]; then
+    kill -TERM $(list_pids) 2>/dev/null || true
+    # A mount needs a moment to flush and unmount on SIGTERM.
+    for _ in $(seq 1 50); do
+      sleep 0.1
+      [ -z "$(list_pids)" ] && break
+    done
+    # Anything that ignored SIGTERM (or is stuck in the kernel) goes now.
+    if [ -n "$(list_pids)" ]; then
+      kill -KILL $(list_pids) 2>/dev/null || true
+      sleep 0.2
+    fi
+    if [ -n "$(list_pids)" ]; then
+      info "Some peerfold processes are still running (owned by another user? try sudo)"
+    else
+      ok "Stopped peerfold processes"
+    fi
   else
     ok "No running processes"
   fi
+elif command -v pkill >/dev/null 2>&1; then
+  pkill -x peerfold 2>/dev/null && sleep 1 && ok "Stopped peerfold processes" \
+    || ok "No running processes"
 else
-  ok "pkill not available; skip process stop"
+  ok "pgrep/pkill not available; skip process stop"
 fi
 
 # ── [2/5] Config & logs ──────────────────────────────────────
 
 section 2 "Remove config and log directories"
 
-for dir in "${HOME_DIR}/peerfold-server"; do
+for dir in "${HOME_DIR}/peerfold-server" "${HOME_DIR}/peerfold-mount" "${HOME_DIR}/peerfold-client"; do
   if [ -d "$dir" ]; then
     rm -rf "$dir"
     gone "$dir"
