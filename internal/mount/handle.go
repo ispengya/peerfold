@@ -210,6 +210,8 @@ func (m *Mount) flush(fh uint64) int {
 	if _, pending := m.pendingPaths[path]; pending {
 		m.pendingContent[path] = append([]byte(nil), body...)
 	}
+	// The file's size and mtime are new, and its parent listing carries them.
+	m.invalidateListings(path)
 	return 0
 }
 

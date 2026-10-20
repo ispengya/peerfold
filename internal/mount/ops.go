@@ -194,13 +194,12 @@ func (m *Mount) Readdir(path string, fill func(name string, st *Stat, off int64)
 		return -ENOTDIR
 	}
 	started := time.Now()
-	children, err := m.call().List(path)
+	children, cached, err := m.listDir(path)
 	took := time.Since(started)
 	if err != nil {
-		log.Printf("mount: list %s took=%s failed: %v", path, took, err)
 		return errnoFor(err)
 	}
-	log.Printf("mount: list %s entries=%d took=%s", path, len(children), took)
+	log.Printf("mount: list %s entries=%d took=%s cached=%t", path, len(children), took, cached)
 	// Sorted so a listing is stable between reads. The index's own order is the
 	// server's business and may change without the tree changing, which would
 	// make a directory appear to shuffle for no reason the user can see.
@@ -802,6 +801,8 @@ func (m *Mount) Create(path string, mode uint32, access int) (uint64, int) {
 		h.contentSize = int64(len(body))
 		h.dirtyVersion = h.version
 	}
+	// A new name (or a changed size) invalidates the directory's listing.
+	m.invalidateListings(cleaned)
 	return fh, 0
 }
 
@@ -1216,6 +1217,7 @@ func (m *Mount) Mkdir(path string, mode uint32) int {
 	if m.invalidatePath != nil {
 		m.invalidatePath(cleaned)
 	}
+	m.invalidateListings(cleaned)
 	return 0
 }
 
@@ -1313,6 +1315,7 @@ func (m *Mount) Unlink(path string) int {
 	delete(m.pendingPaths, cleaned)
 	delete(m.pendingContent, cleaned)
 	m.mu.Unlock()
+	m.invalidateListings(cleaned)
 	return 0
 }
 
@@ -1350,6 +1353,7 @@ func (m *Mount) Rmdir(path string) int {
 		delete(m.pendingPaths, cleaned)
 		delete(m.pendingContent, cleaned)
 		m.mu.Unlock()
+		m.invalidateListings(cleaned)
 		return 0
 	}
 	n, code := m.lookup(cleaned)
@@ -1369,6 +1373,7 @@ func (m *Mount) Rmdir(path string) int {
 	if err := m.call().Remove(cleaned); err != nil {
 		return errnoFor(err)
 	}
+	m.invalidateListings(cleaned)
 	return 0
 }
 
@@ -1503,5 +1508,7 @@ func (m *Mount) Rename(oldPath, newPath string) int {
 	}
 	delete(m.pendingPaths, oldClean)
 	delete(m.pendingContent, oldClean)
+	m.invalidateListings(oldClean)
+	m.invalidateListings(newClean)
 	return 0
 }

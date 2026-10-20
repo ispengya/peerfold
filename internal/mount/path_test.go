@@ -6,6 +6,59 @@ import (
 	"github.com/ispengya/peerfold/internal/node"
 )
 
+// TestLookupReusesTheDirectoryListing pins the metadata cache: resolving two
+// paths in one directory must transfer that directory once, not once per path.
+// Before the cache every Getattr transferred the whole parent listing.
+func TestLookupReusesTheDirectoryListing(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addFile("/a.txt", 4)
+	f.addFile("/b.txt", 4)
+
+	if _, code := m.lookup("/a.txt"); code != 0 {
+		t.Fatalf("lookup(/a.txt) = %d", code)
+	}
+	afterFirst := f.countCalls("List /")
+	if afterFirst == 0 {
+		t.Fatal("the first lookup did not list the parent")
+	}
+
+	if _, code := m.lookup("/b.txt"); code != 0 {
+		t.Fatalf("lookup(/b.txt) = %d", code)
+	}
+	for i := 0; i < 3; i++ {
+		if _, code := m.lookup("/a.txt"); code != 0 {
+			t.Fatalf("repeat lookup(/a.txt) = %d", code)
+		}
+	}
+	if got := f.countCalls("List /"); got != afterFirst {
+		t.Fatalf("repeated lookups made %d extra List calls, want 0", got-afterFirst)
+	}
+}
+
+// TestListingCacheIsInvalidatedByAPathChange pins the other half: a mutation
+// must not leave a stale listing answering lookups for the rest of the TTL.
+func TestListingCacheIsInvalidatedByAPathChange(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addFile("/a.txt", 4)
+
+	if _, code := m.lookup("/a.txt"); code != 0 {
+		t.Fatalf("lookup(/a.txt) = %d", code)
+	}
+	before := f.countCalls("List /")
+
+	f.addFile("/b.txt", 4)
+	m.invalidateListings("/b.txt")
+
+	if _, code := m.lookup("/b.txt"); code != 0 {
+		t.Fatalf("lookup(/b.txt) after invalidation = %d", code)
+	}
+	if got := f.countCalls("List /"); got <= before {
+		t.Fatalf("the invalidated parent was not listed again (List calls %d, want > %d)", got, before)
+	}
+}
+
 func TestCleanRejectsEscape(t *testing.T) {
 	for _, in := range []string{"/../etc/passwd", "/a/../../b", "..", "/.."} {
 		if got, err := Clean(in); err == nil {

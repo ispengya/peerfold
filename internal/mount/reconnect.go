@@ -185,6 +185,7 @@ func (m *Mount) adopt(c Caller) {
 	m.lastSeq = 0
 	m.mu.Unlock()
 
+	m.clearListings()
 	m.discardDirtyOnDisconnect()
 	m.invalidateAll()
 	m.startWatch()

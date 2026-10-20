@@ -170,6 +170,9 @@ func (m *Mount) applyEvent(b Batch) bool {
 
 	withdrawn := false
 	for _, n := range b.Nodes {
+		// The path and its parent both changed as far as listings are
+		// concerned: membership, attributes, or (for a directory) children.
+		m.invalidateListings(n.Path)
 		delete(m.pendingPaths, n.Path)
 		delete(m.pendingContent, n.Path)
 		if n.Kind == node.KindDeleted {

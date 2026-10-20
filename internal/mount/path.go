@@ -1,11 +1,106 @@
 package mount
 
 import (
+	"log"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/ispengya/peerfold/internal/node"
 )
+
+// dirCacheEntry is one cached directory listing. fetched is when the wire
+// answered, so the entry can expire on the same clock the kernel uses for
+// entry attributes.
+type dirCacheEntry struct {
+	children []node.Node
+	fetched  time.Time
+}
+
+// maxDirCacheEntries bounds how many directories are remembered. The entries
+// themselves are bounded by the tree, but a mount pointed at a huge federation
+// should not accumulate one slice per directory it ever listed.
+const maxDirCacheEntries = 4096
+
+// listDir returns dir's children, reusing a recent listing.
+//
+// lookup() resolves paths by listing the parent. Without this cache every
+// Getattr and Open was a whole-directory transfer over the wire, so a directory
+// the kernel walked entry by entry produced one listing per entry. The cached
+// copy is returned, never the one held under the lock, because Readdir sorts
+// the slice it is given and two readers must not share one backing array.
+func (m *Mount) listDir(dir string) (children []node.Node, cached bool, err error) {
+	ttl := m.opts.EntryTimeout
+	if ttl <= 0 {
+		ttl = 5 * time.Second
+	}
+
+	m.listingMu.Lock()
+	if e, ok := m.listings[dir]; ok && time.Since(e.fetched) < ttl {
+		children = append([]node.Node(nil), e.children...)
+		m.listingMu.Unlock()
+		return children, true, nil
+	}
+	m.listingMu.Unlock()
+
+	started := time.Now()
+	children, err = m.call().List(dir)
+	took := time.Since(started)
+	if err != nil {
+		log.Printf("mount: list %s took=%s failed: %v", dir, took, err)
+		return nil, false, err
+	}
+	log.Printf("mount: list %s entries=%d took=%s cached=false", dir, len(children), took)
+
+	m.listingMu.Lock()
+	if m.listings == nil {
+		m.listings = map[string]dirCacheEntry{}
+	}
+	if len(m.listings) >= maxDirCacheEntries {
+		// Evict the oldest entry. This runs only when the cache is full, so the
+		// scan is off the hot path; it keeps the bound without an LRU list.
+		var oldest string
+		var oldestAt time.Time
+		for p, e := range m.listings {
+			if oldest == "" || e.fetched.Before(oldestAt) {
+				oldest, oldestAt = p, e.fetched
+			}
+		}
+		delete(m.listings, oldest)
+	}
+	m.listings[dir] = dirCacheEntry{
+		children: append([]node.Node(nil), children...),
+		fetched:  time.Now(),
+	}
+	m.listingMu.Unlock()
+	return children, false, nil
+}
+
+// invalidateListings drops the listing for path and for its parent.
+//
+// A change to path alters both: the directory it is in (membership, size) and,
+// if it is a directory, its own children. Called from watch events and from
+// every local mutation, so a listing that answers a lookup is never older than
+// the mount's own knowledge of a change.
+func (m *Mount) invalidateListings(path string) {
+	if path == "" {
+		return
+	}
+	m.listingMu.Lock()
+	delete(m.listings, path)
+	if parent, _, err := SplitParent(path); err == nil {
+		delete(m.listings, parent)
+	}
+	m.listingMu.Unlock()
+}
+
+// clearListings forgets every cached listing. A reconnect replaces the whole
+// tree, so an entry from the old connection must not answer for the new one.
+func (m *Mount) clearListings() {
+	m.listingMu.Lock()
+	m.listings = map[string]dirCacheEntry{}
+	m.listingMu.Unlock()
+}
 
 // Clean normalises a FUSE path and refuses anything that would escape the
 // mount root. FUSE hands us absolute slash-separated paths; the caller of this
@@ -180,7 +275,7 @@ func (m *Mount) lookup(p string) (node.Node, int) {
 	if err != nil {
 		return node.Node{}, -EINVAL
 	}
-	children, err := m.call().List(parent)
+	children, _, err := m.listDir(parent)
 	if err != nil {
 		// The parent could not be listed, and that error is the diagnosis, so
 		// it is passed through rather than flattened. See the comment above for

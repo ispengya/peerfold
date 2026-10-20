@@ -133,6 +133,14 @@ type Mount struct {
 	// miss before the first fill completes, and without this each one goes to
 	// the wire for the same bytes.
 	fetchMu sync.Mutex
+	// listingMu guards listings, the directory cache.
+	//
+	// lookup() resolves a path by listing its parent, so without this every
+	// Getattr and Open transferred a whole directory. The cache is separate
+	// from m.mu because a listing is taken over the wire and must never be held
+	// across a network call.
+	listingMu sync.Mutex
+	listings  map[string]dirCacheEntry
 
 	// events is what the watch channel has told this mount, keyed by full path.
 	//
@@ -221,6 +229,7 @@ func New(caller Caller, opts Options) *Mount {
 		files:          map[uint64]*openFile{},
 		cache:          newChunkCache(opts.BufferLimit, opts.BufferTotal),
 		events:         map[string]node.Node{},
+		listings:       map[string]dirCacheEntry{},
 		pendingPaths:   map[string]node.Kind{},
 		pendingContent: map[string][]byte{},
 		handed:         map[string]struct{}{},

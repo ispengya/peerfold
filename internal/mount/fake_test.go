@@ -236,6 +236,19 @@ func fakeOf(t *testing.T, m *Mount) *fakeCaller {
 	return f
 }
 
+// countCalls counts the recorded calls whose description starts with prefix.
+func (f *fakeCaller) countCalls(prefix string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
 func (f *fakeCaller) List(path string) ([]node.Node, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, "List "+path)
