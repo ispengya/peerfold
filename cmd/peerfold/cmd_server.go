@@ -53,7 +53,7 @@ func cmdServerWith(args []string, stdout, stderr io.Writer, interrupt <-chan str
 	fs.SetOutput(stderr)
 
 	var (
-		listen  = fs.String("listen", "", "address to listen on (default: the config's listen, else :7000)")
+		listen  = fs.String("listen", "", "address to listen on (default: the config's listen, else 0.0.0.0:7000)")
 		cfgPath = fs.String("config", "", "config file (default: the per-user config path)")
 	)
 	fs.Usage = func() {

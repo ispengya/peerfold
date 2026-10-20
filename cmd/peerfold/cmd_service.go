@@ -523,7 +523,7 @@ func cmdRestart(args []string, stdout, stderr io.Writer) int {
 		}
 		listen := cfg.Listen
 		if listen == "" {
-			listen = "127.0.0.1:7000"
+			listen = config.Default().Listen
 		}
 		pid, err := launchBackground([]string{"server", "--daemon", "--listen", listen})
 		if err != nil {

@@ -47,7 +47,10 @@ func interactiveServer(input io.Reader, out, errw io.Writer) int {
 	if err != nil {
 		// No config yet — prompt for settings
 		fmt.Fprintf(out, "  No config found. Let's set one up.\n\n")
-		listen := promptString(in, out, "Listen address", "127.0.0.1:7000")
+		// The default is the wildcard on purpose: a loopback-only server
+		// cannot serve a mount on another machine, which is the reason most
+		// people run one.
+		listen := promptString(in, out, "Listen address", "0.0.0.0:7000")
 
 		cfg = config.Default()
 		cfg.Listen = listen
@@ -97,7 +100,7 @@ func interactiveServer(input io.Reader, out, errw io.Writer) int {
 	// 4. Start
 	listenFlag := cfg.Listen
 	if listenFlag == "" {
-		listenFlag = "127.0.0.1:7000"
+		listenFlag = "0.0.0.0:7000"
 	}
 
 	if mode == 1 {

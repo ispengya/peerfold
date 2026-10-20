@@ -11,8 +11,10 @@ import (
 )
 
 func TestConfigDefaultListen(t *testing.T) {
-	if got := config.Default().Listen; got != ":7000" {
-		t.Fatalf("Default().Listen = %q, want %q", got, ":7000")
+	// The wildcard, not loopback: the server exists to be reached by other
+	// machines. A local-only deployment opts into 127.0.0.1 explicitly.
+	if got := config.Default().Listen; got != "0.0.0.0:7000" {
+		t.Fatalf("Default().Listen = %q, want %q", got, "0.0.0.0:7000")
 	}
 }
 
