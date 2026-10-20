@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="420" viewBox="0 0 1200 420"
+     role="img" aria-labelledby="hero-title hero-desc">
+  <title id="hero-title">peerfold — 把多台机器的目录挂成一棵树</title>
+  <desc id="hero-desc">peerfold 是联邦文件系统：server 保存全局索引，client 共享本机目录，mount 把多台机器的目录挂成一个普通文件夹。</desc>
+
+  <rect width="1200" height="420" rx="28" fill="#0B0F14"/>
+  <rect x="0.75" y="0.75" width="1198.5" height="418.5" rx="27.25" fill="none" stroke="#1E2A35" stroke-width="1.5"/>
+
+  <!-- Title block -->
+  <g id="title-block">
+    <rect x="64" y="70" width="8" height="8" rx="2" fill="#5EEAD4"/>
+    <text x="84" y="78" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', 'WenQuanYi Micro Hei', sans-serif"
+          font-size="18" font-weight="600" letter-spacing="2.4" fill="#8B98A5">FEDERATED FILESYSTEM</text>
+
+    <text x="62" y="170" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', 'WenQuanYi Micro Hei', sans-serif"
+          font-size="86" font-weight="700" letter-spacing="-2" fill="#F2F6F7">peerfold</text>
+
+    <text x="64" y="222" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', 'WenQuanYi Micro Hei', sans-serif"
+          font-size="38" font-weight="600" fill="#E8EEF1">多台机器的目录，挂成一棵树。</text>
+
+    <text x="64" y="266" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', 'WenQuanYi Micro Hei', sans-serif"
+          font-size="21" fill="#A9B4BF">server 聚合索引，client 共享目录，</text>
+    <text x="64" y="298" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', 'WenQuanYi Micro Hei', sans-serif"
+          font-size="21" fill="#A9B4BF">mount 给你一个普通文件夹。</text>
+
+    <line x1="64" y1="336" x2="200" y2="336" stroke="#26313C" stroke-width="1.5"/>
+
+    <text x="64" y="374" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', monospace"
+          font-size="18" letter-spacing="1.4" fill="#8B98A5">LINUX · WINDOWS · TCP · MIT</text>
+  </g>
+
+  <!-- System map: clients and mount all dial the server; the server holds the index -->
+  <g id="system-map" transform="translate(688 44)">
+    <rect width="448" height="348" rx="20" fill="#0E141B" stroke="#22303C" stroke-width="1.5"/>
+
+    <text x="24" y="32" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', monospace"
+          font-size="16" letter-spacing="1.6" fill="#8B98A5">SHARE  →  INDEX  →  MOUNT</text>
+
+    <!-- Connections -->
+    <g stroke="#2C3A46" stroke-width="1.5" stroke-dasharray="5 6" fill="none">
+      <path d="M192 128 L112 148"/>
+      <path d="M256 128 L336 148"/>
+      <path d="M224 128 L224 244"/>
+    </g>
+
+    <!-- Ports -->
+    <circle cx="192" cy="128" r="3.5" fill="#5EEAD4"/>
+    <circle cx="256" cy="128" r="3.5" fill="#5EEAD4"/>
+    <circle cx="112" cy="148" r="3.5" fill="#5EEAD4"/>
+    <circle cx="336" cy="148" r="3.5" fill="#5EEAD4"/>
+    <circle cx="224" cy="244" r="3.5" fill="#F5C77E"/>
+
+    <!-- Server -->
+    <g id="node-server">
+      <rect x="144" y="64" width="160" height="64" rx="12" fill="#121C24" stroke="#5EEAD4" stroke-width="1.5"/>
+      <text x="224" y="92" text-anchor="middle" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', monospace"
+            font-size="22" fill="#F2F6F7">server</text>
+      <text x="224" y="114" text-anchor="middle" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', monospace"
+            font-size="18" fill="#5EEAD4">index</text>
+    </g>
+
+    <!-- Clients -->
+    <g id="node-client-a">
+      <rect x="24" y="148" width="176" height="64" rx="12" fill="#101820" stroke="#2C3A46" stroke-width="1.5"/>
+      <text x="112" y="176" text-anchor="middle" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', monospace"
+            font-size="21" fill="#E8EEF1">client A</text>
+      <text x="112" y="198" text-anchor="middle" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', monospace"
+            font-size="18" fill="#8B98A5">docs/</text>
+    </g>
+    <g id="node-client-b">
+      <rect x="248" y="148" width="176" height="64" rx="12" fill="#101820" stroke="#2C3A46" stroke-width="1.5"/>
+      <text x="336" y="176" text-anchor="middle" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', monospace"
+            font-size="21" fill="#E8EEF1">client B</text>
+      <text x="336" y="198" text-anchor="middle" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', monospace"
+            font-size="18" fill="#8B98A5">photos/</text>
+    </g>
+
+    <!-- Mount -->
+    <g id="node-mount">
+      <rect x="128" y="244" width="192" height="64" rx="12" fill="#121A21" stroke="#F5C77E" stroke-width="1.5"/>
+      <text x="224" y="272" text-anchor="middle" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', monospace"
+            font-size="22" fill="#F2F6F7">mount</text>
+      <text x="224" y="294" text-anchor="middle" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', monospace"
+            font-size="18" fill="#F5C77E">~/peerfold</text>
+    </g>
+
+    <text x="24" y="332" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', 'WenQuanYi Micro Hei', sans-serif"
+          font-size="18" fill="#93A1AE">文件仍在原机器上，server 只保存索引。</text>
+  </g>
+</svg>
