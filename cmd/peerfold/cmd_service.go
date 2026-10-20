@@ -201,41 +201,94 @@ func cmdStatus(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "\n  peerfold status\n")
 	fmt.Fprintf(stdout, "  ------------------------------------\n\n")
 
+	// Ask the configured server first. Its reachability decides whether the
+	// Server line describes a local process or the remote aggregation this
+	// machine belongs to: "stopped" here means "no local server", and on a
+	// machine that only mounts or supplies that would be misleading.
+	addr := statusServerAddress()
+	var (
+		remoteMounts    []viewer.Mount
+		remoteClients   []viewer.Client
+		mountsErr       error
+		clientsErr      error
+		remoteReachable bool
+	)
+	if addr != "" {
+		if v, err := viewer.DialTimeout(addr, statusQueryTimeout); err == nil {
+			remoteReachable = true
+			remoteMounts, mountsErr = v.ListMounts()
+			remoteClients, clientsErr = v.ListClients()
+			v.Close()
+		}
+	}
+
+	// A local server config means this machine is meant to run the server.
+	// Only then are the log path and auto-start line about anything here.
+	localServerConfigured := false
+	if path, err := config.ServerPath(); err == nil {
+		if _, err := config.Load(path); err == nil {
+			localServerConfigured = true
+		}
+	}
+
 	// Server
 	serverPID, serverAlive, _ := readPID("server")
-	serverStatus := "stopped"
-	if serverAlive {
-		serverStatus = fmt.Sprintf("running (PID %d)", serverPID)
+	fmt.Fprintf(stdout, "  Server:  ")
+	switch {
+	case serverAlive:
+		fmt.Fprintf(stdout, "running (PID %d)\n", serverPID)
+	case remoteReachable:
+		// A reachable server is the fact that matters, whether it is this
+		// machine's process or another one's. The log and auto-start lines
+		// describe a local server and are omitted: they would point at a
+		// process that is not the one answering.
+		fmt.Fprintf(stdout, "running at %s (remote)\n", addr)
+	case localServerConfigured:
+		fmt.Fprintf(stdout, "stopped\n")
+	case addr != "":
+		fmt.Fprintf(stdout, "unreachable (%s)\n", addr)
+	default:
+		fmt.Fprintf(stdout, "stopped\n")
 	}
-	fmt.Fprintf(stdout, "  Server:  %s\n", serverStatus)
-	fmt.Fprintf(stdout, "           Log: %s\n", filepath.Join(home, "peerfold-server", "log.txt"))
-
-	// Auto-start
-	if hasAutoStart("server") {
-		fmt.Fprintf(stdout, "           Auto-start: enabled\n")
-	} else {
-		fmt.Fprintf(stdout, "           Auto-start: disabled\n")
+	if localServerConfigured && (serverAlive || !remoteReachable) {
+		fmt.Fprintf(stdout, "           Log: %s\n", filepath.Join(home, "peerfold-server", "log.txt"))
+		if hasAutoStart("server") {
+			fmt.Fprintf(stdout, "           Auto-start: enabled\n")
+		}
 	}
 
-	// Clients
+	// Clients: the local processes plus the suppliers the server reports. The
+	// name is the identity, so a client that is both local and connected is
+	// printed once, as local. A local config whose process is stopped is
+	// skipped when the server still reports that name: the connection is the
+	// fact that matters.
 	clientDirs, _ := filepath.Glob(filepath.Join(home, "peerfold-client-*"))
+	remoteByName := make(map[string]viewer.Client, len(remoteClients))
+	for _, c := range remoteClients {
+		remoteByName[c.Name] = c
+	}
 	fmt.Fprintf(stdout, "\n")
+	shown := make(map[string]bool, len(clientDirs)+len(remoteClients))
 	for _, dir := range clientDirs {
 		name := strings.TrimPrefix(filepath.Base(dir), "peerfold-client-")
-		component := "client-" + name
-		pid, alive, _ := readPID(component)
-		status := "stopped"
-		if alive {
-			status = fmt.Sprintf("running (PID %d)", pid)
-		}
-		fmt.Fprintf(stdout, "  Client %-15s %s\n", name+":", status)
-		fmt.Fprintf(stdout, "                   Log: %s\n", filepath.Join(dir, "log.txt"))
-		if hasAutoStart(component) {
-			fmt.Fprintf(stdout, "                   Auto-start: enabled\n")
+		pid, alive, _ := readPID("client-" + name)
+		switch {
+		case alive:
+			fmt.Fprintf(stdout, "  Client:  %s (running, PID %d)\n", name, pid)
+			shown[name] = true
+		case remoteByName[name].Name == "":
+			fmt.Fprintf(stdout, "  Client:  %s (stopped)\n", name)
+			shown[name] = true
 		}
 	}
-
-	if len(clientDirs) == 0 {
+	for _, c := range remoteClients {
+		if shown[c.Name] {
+			continue
+		}
+		fmt.Fprintf(stdout, "  Client:  %s (remote)\n", c.Name)
+		shown[c.Name] = true
+	}
+	if len(shown) == 0 {
 		fmt.Fprintf(stdout, "  Client:  (none configured)\n")
 	}
 
@@ -254,9 +307,9 @@ func cmdStatus(args []string, stdout, stderr io.Writer) int {
 	} else {
 		mountCfg, mountCfgErr = config.Load(path)
 	}
-	server, point := mountCfg.Server, mountCfg.MountPoint
+	point := mountCfg.MountPoint
 	if stateErr == nil {
-		server, point = state.Server, state.MountPoint
+		point = state.MountPoint
 	}
 
 	fmt.Fprintf(stdout, "\n")
@@ -268,38 +321,36 @@ func cmdStatus(args []string, stdout, stderr io.Writer) int {
 	default:
 		fmt.Fprintf(stdout, "  Mount:   (none configured)\n")
 	}
-	if server != "" {
-		fmt.Fprintf(stdout, "           Server:  %s\n", server)
-	}
 	if point != "" {
 		fmt.Fprintf(stdout, "           Point:   %s\n", point)
 	}
 
-	// Remote mounts and clients. The state above describes only this machine,
-	// so the server is asked what is attached to it -- that is the only way a
-	// mount or client on another machine becomes visible here. The query is
-	// itself an ordinary viewer: it declares no mount point and is not a
-	// supplier, so it never lists itself.
-	if addr := statusServerAddress(); addr != "" {
-		fmt.Fprintf(stdout, "\n")
-		v, err := viewer.DialTimeout(addr, statusQueryTimeout)
-		if err != nil {
-			fmt.Fprintf(stdout, "  Remote server: (server %s unreachable)\n", addr)
-		} else {
-			mounts, mountsErr := v.ListMounts()
-			clients, clientsErr := v.ListClients()
-			v.Close()
-
-			// A server from before either query existed answers both with
-			// "not implemented". One line says the fix; repeating it per query
-			// would read like two different problems.
-			if statusUnsupported(mountsErr) && statusUnsupported(clientsErr) {
-				fmt.Fprintf(stdout, "  Remote server: (does not support listing mounts or clients; update and restart it)\n")
-			} else {
-				printRemoteMounts(stdout, addr, mounts, mountsErr)
-				printRemoteClients(stdout, addr, clients, clientsErr)
-			}
+	// Other machines' mounts. This machine's own mount is filtered out by its
+	// point: it is already the Mount line above, and listing it twice under two
+	// names (local and server view) reads like two mounts.
+	var others []viewer.Mount
+	for _, m := range remoteMounts {
+		if mountAlive && point != "" && m.MountPoint == point {
+			continue
 		}
+		others = append(others, m)
+	}
+	if len(others) > 0 {
+		fmt.Fprintf(stdout, "\n  Remote mounts:\n")
+		for _, m := range others {
+			name := m.Name
+			if name == "" {
+				name = "(unnamed)"
+			}
+			fmt.Fprintf(stdout, "    %s  %s\n", name, m.MountPoint)
+		}
+	}
+
+	// A server from before these queries existed answers with "not
+	// implemented". One line says the fix; the rest of the output is already
+	// accurate.
+	if remoteReachable && statusUnsupported(mountsErr) && statusUnsupported(clientsErr) {
+		fmt.Fprintf(stdout, "\n  Remote details: (server does not support them; update and restart it)\n")
 	}
 
 	fmt.Fprintf(stdout, "\n")
@@ -310,78 +361,6 @@ func cmdStatus(args []string, stdout, stderr io.Writer) int {
 // it does not implement.
 func statusUnsupported(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "not implemented")
-}
-
-// printRemoteMounts writes the mounts attached to the configured server.
-func printRemoteMounts(out io.Writer, addr string, mounts []viewer.Mount, err error) {
-	switch {
-	case err != nil:
-		// The wire's own wording is not what a user needs to read: the fix is
-		// to update and restart the server.
-		if statusUnsupported(err) {
-			fmt.Fprintf(out, "  Remote mounts: (server does not support listing mounts; update and restart it)\n")
-		} else {
-			fmt.Fprintf(out, "  Remote mounts: (%v)\n", err)
-		}
-	case len(mounts) == 0:
-		fmt.Fprintf(out, "  Remote mounts: (none)\n")
-	default:
-		fmt.Fprintf(out, "  Remote mounts via %s:\n", addr)
-		for _, m := range mounts {
-			name := m.Name
-			if name == "" {
-				name = "(unnamed)"
-			}
-			fmt.Fprintf(out, "    %s  %s", name, m.MountPoint)
-			printPeerDetail(out, m.RemoteAddr, m.Since)
-			fmt.Fprintln(out)
-		}
-	}
-}
-
-// printRemoteClients writes the suppliers attached to the configured server.
-func printRemoteClients(out io.Writer, addr string, clients []viewer.Client, err error) {
-	switch {
-	case err != nil:
-		if statusUnsupported(err) {
-			fmt.Fprintf(out, "  Clients: (server does not support listing clients; update and restart it)\n")
-		} else {
-			fmt.Fprintf(out, "  Clients: (%v)\n", err)
-		}
-	case len(clients) == 0:
-		fmt.Fprintf(out, "  Clients via %s: (none)\n", addr)
-	default:
-		fmt.Fprintf(out, "  Clients via %s:\n", addr)
-		for _, c := range clients {
-			name := c.Name
-			if name == "" {
-				name = "(unnamed)"
-			}
-			fmt.Fprintf(out, "    %s", name)
-			if c.Aggregate {
-				fmt.Fprintf(out, "  (aggregate)")
-			}
-			printPeerDetail(out, c.RemoteAddr, c.Since)
-			fmt.Fprintln(out)
-		}
-	}
-}
-
-// printPeerDetail writes the "from ... up ..." tail shared by remote mounts and
-// clients. Missing values are omitted rather than printed as empty fields.
-func printPeerDetail(out io.Writer, remoteAddr string, since time.Time) {
-	if remoteAddr != "" {
-		fmt.Fprintf(out, "  from %s", remoteAddr)
-	}
-	if !since.IsZero() {
-		up := time.Since(since)
-		if up < 0 {
-			// Server and this machine disagree about the time; a negative age
-			// would read as nonsense.
-			up = 0
-		}
-		fmt.Fprintf(out, "  up %s", up.Round(time.Second))
-	}
 }
 
 // statusServerAddress returns the server whose mounts and clients status should

@@ -91,7 +91,7 @@ func TestStatusReportsTheMount(t *testing.T) {
 		t.Fatalf("cmdStatus() = %d, stderr = %q", code, errOut.String())
 	}
 	got := out.String()
-	for _, want := range []string{"Mount:", "running (PID " + itoa(os.Getpid()) + ")", "10.0.0.9:7000", filepath.Join(home, "mnt")} {
+	for _, want := range []string{"Mount:", "running (PID " + itoa(os.Getpid()) + ")", filepath.Join(home, "mnt")} {
 		if !strings.Contains(got, want) {
 			t.Errorf("status output missing %q:\n%s", want, got)
 		}
@@ -101,6 +101,51 @@ func TestStatusReportsTheMount(t *testing.T) {
 // itoa is strconv.Itoa under a shorter name, so the test above reads as the
 // sentence it is making.
 func itoa(n int) string { return strconv.Itoa(n) }
+
+// TestStatusReportsARemoteServerAsRunning pins the mount-only machine: there is
+// no local server process and no local server config, but the configured
+// server is reachable. Calling that "stopped" is what a Windows mount saw
+// while both the server and a client were running on the other machine.
+func TestStatusReportsARemoteServerAsRunning(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)        // unix
+	t.Setenv("USERPROFILE", home) // windows
+
+	s := server.New("127.0.0.1:0")
+	if err := s.Err(); err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+	go s.Serve()
+	defer s.Close()
+	addr := s.Addr().String()
+
+	// The address lives in the mount config: this machine only mounts.
+	cfgPath, err := config.MountPath()
+	if err != nil {
+		t.Fatalf("MountPath: %v", err)
+	}
+	cfg := config.Default()
+	cfg.Server = addr
+	cfg.MountPoint = filepath.Join(home, "mnt")
+	if err := config.Save(cfgPath, cfg); err != nil {
+		t.Fatalf("config.Save: %v", err)
+	}
+
+	var out, errOut bytes.Buffer
+	if code := cmdStatus(nil, &out, &errOut); code != 0 {
+		t.Fatalf("cmdStatus() = %d, stderr = %q", code, errOut.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, "running at "+addr+" (remote)") {
+		t.Errorf("status does not report the reachable remote server as running:\n%s", got)
+	}
+	if strings.Contains(got, "Server:  stopped") {
+		t.Errorf("status calls the server stopped even though %s answers:\n%s", addr, got)
+	}
+	if !strings.Contains(got, "Client:  (none configured)") {
+		t.Errorf("status does not report the empty client list plainly:\n%s", got)
+	}
+}
 
 // TestStatusListsMountsOnAnotherMachine pins the reason the viewer registry
 // exists: the mount and the status command that sees it are different
@@ -159,8 +204,8 @@ func TestStatusListsMountsOnAnotherMachine(t *testing.T) {
 	}
 	got := out.String()
 	for _, want := range []string{
-		"Remote mounts via " + addr, "winbox", `C:\Users\me\peerfold`,
-		"Clients via " + addr, "linuxbox",
+		"Remote mounts:", "winbox", `C:\Users\me\peerfold`,
+		"Client:  linuxbox (remote)",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("status output missing %q:\n%s", want, got)
