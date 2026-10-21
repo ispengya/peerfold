@@ -164,6 +164,10 @@ func (m *Mount) applyEvent(b Batch) bool {
 			log.Printf("mount: the event sequence jumped from %d to %d, so "+
 				"events were lost and the tree cannot be trusted", m.lastSeq, b.Seq)
 			m.isStale = true
+			// A lost batch may have changed any directory. The per-path
+			// invalidation below cannot name what was missed, so every cached
+			// listing is suspect until it is fetched again.
+			m.clearListings()
 		}
 		m.lastSeq = b.Seq
 	}

@@ -199,6 +199,7 @@ func (m *Mount) Readdir(path string, fill func(name string, st *Stat, off int64)
 	if err != nil {
 		return errnoFor(err)
 	}
+	children = m.overlayLocalListing(path, children)
 	log.Printf("mount: list %s entries=%d took=%s cached=%t", path, len(children), took, cached)
 	// Sorted so a listing is stable between reads. The index's own order is the
 	// server's business and may change without the tree changing, which would
@@ -240,6 +241,45 @@ func (m *Mount) Readdir(path string, fill func(name string, st *Stat, off int64)
 	}
 	m.noteInode(fh, n.Path)
 	return 0
+}
+
+// overlayLocalListing applies this mount's own pending creations and tombstones
+// to a directory listing.
+//
+// The server's index is updated by the owner's watcher, so a name this mount
+// just created or deleted can still be absent from (or present in) the listing
+// for one round trip. lookup already covers the exact path through
+// pendingPaths and the event table; this is the directory-wide counterpart, so
+// a listing never contradicts what the caller just did.
+func (m *Mount) overlayLocalListing(dir string, children []node.Node) []node.Node {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	present := make(map[string]bool, len(children))
+	out := make([]node.Node, 0, len(children)+len(m.pendingPaths))
+	for _, c := range children {
+		if ev, ok := m.events[c.Path]; ok && ev.Kind == node.KindDeleted {
+			continue
+		}
+		out = append(out, c)
+		present[c.Path] = true
+	}
+	for p, kind := range m.pendingPaths {
+		if present[p] {
+			continue
+		}
+		parent, _, err := SplitParent(p)
+		if err != nil || parent != dir {
+			continue
+		}
+		n := node.Node{Path: p, Kind: kind, Mode: 0o777, Mtime: time.Now().Unix()}
+		if body, ok := m.pendingContent[p]; ok {
+			n.Size = int64(len(body))
+		}
+		out = append(out, n)
+		present[p] = true
+	}
+	return out
 }
 
 // Statfs reports invented figures for the whole federation.
@@ -801,6 +841,9 @@ func (m *Mount) Create(path string, mode uint32, access int) (uint64, int) {
 		h.contentSize = int64(len(body))
 		h.dirtyVersion = h.version
 	}
+	// A tombstone from an earlier delete must not shadow a name the caller is
+	// creating again before the owner's event arrives.
+	delete(m.events, cleaned)
 	// A new name (or a changed size) invalidates the directory's listing.
 	m.invalidateListings(cleaned)
 	return fh, 0
@@ -1210,6 +1253,7 @@ func (m *Mount) Mkdir(path string, mode uint32) int {
 	}
 	m.mu.Lock()
 	m.pendingPaths[cleaned] = node.KindDir
+	delete(m.events, cleaned)
 	m.mu.Unlock()
 	// A new name has appeared, and the kernel may have cached a negative lookup
 	// for it. Invalidating the new path keeps Windows from rejecting the first
@@ -1314,6 +1358,10 @@ func (m *Mount) Unlink(path string) int {
 	// the exact window the tombstone exists to close.
 	delete(m.pendingPaths, cleaned)
 	delete(m.pendingContent, cleaned)
+	// The owner's watch event arrives a round trip later. Until then the
+	// server's index still lists this name, so the tombstone is what keeps
+	// lookup and Readdir from bringing it back.
+	m.events[cleaned] = node.Node{Path: cleaned, Kind: node.KindDeleted}
 	m.mu.Unlock()
 	m.invalidateListings(cleaned)
 	return 0
@@ -1352,6 +1400,7 @@ func (m *Mount) Rmdir(path string) int {
 		m.mu.Lock()
 		delete(m.pendingPaths, cleaned)
 		delete(m.pendingContent, cleaned)
+		m.events[cleaned] = node.Node{Path: cleaned, Kind: node.KindDeleted}
 		m.mu.Unlock()
 		m.invalidateListings(cleaned)
 		return 0
@@ -1373,6 +1422,9 @@ func (m *Mount) Rmdir(path string) int {
 	if err := m.call().Remove(cleaned); err != nil {
 		return errnoFor(err)
 	}
+	m.mu.Lock()
+	m.events[cleaned] = node.Node{Path: cleaned, Kind: node.KindDeleted}
+	m.mu.Unlock()
 	m.invalidateListings(cleaned)
 	return 0
 }
@@ -1508,6 +1560,10 @@ func (m *Mount) Rename(oldPath, newPath string) int {
 	}
 	delete(m.pendingPaths, oldClean)
 	delete(m.pendingContent, oldClean)
+	// The old name is gone on the owner, but its event has not arrived; the
+	// destination replaces whatever was there, so any tombstone must go.
+	m.events[oldClean] = node.Node{Path: oldClean, Kind: node.KindDeleted}
+	delete(m.events, newClean)
 	m.invalidateListings(oldClean)
 	m.invalidateListings(newClean)
 	return 0

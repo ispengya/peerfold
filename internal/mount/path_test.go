@@ -59,6 +59,57 @@ func TestListingCacheIsInvalidatedByAPathChange(t *testing.T) {
 	}
 }
 
+// readdirNames collects the names Readdir reports for dir.
+func readdirNames(t *testing.T, m *Mount, dir string) map[string]bool {
+	t.Helper()
+	names := map[string]bool{}
+	code := m.Readdir(dir, func(name string, _ *Stat, _ int64) bool {
+		names[name] = true
+		return true
+	}, 0, 0)
+	if code != 0 {
+		t.Fatalf("Readdir(%q) = %d", dir, code)
+	}
+	return names
+}
+
+// TestReaddirShowsAPendingCreate pins the local-create window: the owner's
+// watcher has not pushed the new name yet, so the server's listing does not
+// contain it. The directory listing must still agree with the create the
+// caller just performed.
+func TestReaddirShowsAPendingCreate(t *testing.T) {
+	m := newTestMount(t)
+	if _, code := m.Create("/new.txt", 0o644, OReadWrite); code != 0 {
+		t.Fatalf("Create = %d", code)
+	}
+	if !readdirNames(t, m, "/")["new.txt"] {
+		t.Fatal("Readdir does not show the file that was just created")
+	}
+}
+
+// TestReaddirHidesATombstonedName pins the local-delete window: the cached
+// listing still contains the name, and the server still will until the owner's
+// event arrives. The tombstone must win in the listing, as it already does in
+// lookup.
+func TestReaddirHidesATombstonedName(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addFile("/a.txt", 4)
+
+	// Populate the listing cache from the caller before deleting locally.
+	if _, code := m.lookup("/a.txt"); code != 0 {
+		t.Fatalf("lookup(/a.txt) = %d", code)
+	}
+
+	m.mu.Lock()
+	m.events["/a.txt"] = node.Node{Path: "/a.txt", Kind: node.KindDeleted}
+	m.mu.Unlock()
+
+	if readdirNames(t, m, "/")["a.txt"] {
+		t.Fatal("Readdir brought back a name with a local tombstone")
+	}
+}
+
 func TestCleanRejectsEscape(t *testing.T) {
 	for _, in := range []string{"/../etc/passwd", "/a/../../b", "..", "/.."} {
 		if got, err := Clean(in); err == nil {
