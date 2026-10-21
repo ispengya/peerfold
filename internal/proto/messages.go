@@ -53,6 +53,14 @@ const (
 	// a client on another, and status should describe both from anywhere.
 	KindClients   = "clients"
 	KindClientsOK = "clients_ok"
+
+	// KindBye is a peer telling the server it is about to leave. The socket
+	// closing would say the same thing eventually, but a client that is
+	// stopping gracefully wants the withdrawal to happen while it can still
+	// wait for confirmation, so the next start does not race the server still
+	// believing the old name is connected.
+	KindBye   = "bye"
+	KindByeOK = "bye_ok"
 )
 
 // Write-body modes. A whole-file write-back either replaces what is there or

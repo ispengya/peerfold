@@ -1,10 +1,40 @@
 package mount
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/ispengya/peerfold/internal/node"
 )
+
+// relativeCaller mimics the real viewer adapter, which returns index paths
+// without a leading slash. The core must normalise them before it caches them.
+type relativeCaller struct{ *fakeCaller }
+
+func (c relativeCaller) List(path string) ([]node.Node, error) {
+	children, err := c.fakeCaller.List(path)
+	for i := range children {
+		children[i].Path = strings.TrimPrefix(children[i].Path, "/")
+	}
+	return children, err
+}
+
+func TestAListingIsNormalizedToFusePaths(t *testing.T) {
+	f := newFakeCaller()
+	f.addFile("/a.txt", 3)
+	m := New(relativeCaller{f}, DefaultOptions())
+
+	children, _, err := m.listDir("/")
+	if err != nil {
+		t.Fatalf("listDir(/): %v", err)
+	}
+	if len(children) != 1 || children[0].Path != "/a.txt" {
+		t.Fatalf("listDir(/) = %+v, want one child at /a.txt", children)
+	}
+	if _, code := m.lookup("/a.txt"); code != 0 {
+		t.Fatalf("lookup(/a.txt) = %d: the normalized child was not resolvable", code)
+	}
+}
 
 // TestLookupReusesTheDirectoryListing pins the metadata cache: resolving two
 // paths in one directory must transfer that directory once, not once per path.

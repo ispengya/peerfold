@@ -34,7 +34,25 @@ const (
 	// costs bytes too, and a batch that only just fits would be refused by the
 	// frame writer with the tree already half sent.
 	maxBatchBody = proto.MaxPayload / 2
+
+	// DefaultShutdownGrace is how long Shutdown waits for requests already in
+	// flight. It is shorter than the stop command's own grace, so the process
+	// gets to say goodbye rather than being killed halfway through.
+	DefaultShutdownGrace = 5 * time.Second
+
+	// byeTimeout bounds the wait for the server's acknowledgement of the
+	// goodbye. The connection close that follows withdraws the tree anyway, so
+	// a server that has stopped answering is not worth waiting longer for.
+	byeTimeout = 2 * time.Second
 )
+
+// errShuttingDown is the answer a forwarded request gets once Shutdown has
+// started and the request was not already being served.
+//
+// It is different from a transport failure: the connection is healthy and the
+// data is intact, this client simply will not start new work. The mount maps it
+// to EIO like any other owner-side refusal.
+var errShuttingDown = errors.New("client is shutting down")
 
 // errContentTruncated reports that the server said the content of a write
 // stopped part-way.
@@ -93,6 +111,18 @@ type Client struct {
 	closed    bool
 	loopEnded chan struct{}
 	done      chan struct{}
+
+	// serving counts the forwarded requests the read loop is inside right now.
+	// Shutdown waits for it to reach zero, so an upload that has already begun
+	// is finished rather than cut off mid-stream.
+	serving int
+	// draining makes new forwarded requests be refused instead of started.
+	// Existing ones are unaffected: they were admitted before this was set.
+	draining bool
+	// idle is closed when draining is set and serving reaches zero. It is nil
+	// when nobody is waiting, and never closed twice: endServe clears it after
+	// closing it.
+	idle chan struct{}
 }
 
 // Dial connects to addr, shakes hands, and starts serving requests.
@@ -357,7 +387,10 @@ func (c *Client) readLoop() {
 		}
 
 		if env.Kind == proto.KindRead && env.ID != 0 {
-			if err := c.satisfyRead(env); err != nil {
+			c.beginServe()
+			err := c.satisfyRead(env)
+			c.endServe()
+			if err != nil {
 				debugf("client serving a read: %v", err)
 				c.endLoop(err)
 				return
@@ -365,7 +398,10 @@ func (c *Client) readLoop() {
 			continue
 		}
 		if isWriteRequest(env.Kind) && env.ID != 0 {
-			if err := c.satisfyWrite(env); err != nil {
+			c.beginServe()
+			err := c.satisfyWrite(env)
+			c.endServe()
+			if err != nil {
 				debugf("client serving a write: %v", err)
 				c.endLoop(err)
 				return
@@ -441,7 +477,12 @@ func (c *Client) satisfyRead(env proto.Envelope) error {
 	started := time.Now()
 	var req proto.ReadBody
 	reason, data, ok := error(nil), []byte(nil), false
-	if err := json.Unmarshal(env.Body, &req); err != nil {
+	if c.shuttingDown() {
+		// The request was read after Shutdown began, so it is refused rather than
+		// started. The answer keeps the three-part shape every read answer has,
+		// or the server's frame sequence would no longer line up.
+		reason = errShuttingDown
+	} else if err := json.Unmarshal(env.Body, &req); err != nil {
 		reason = fmt.Errorf("bad read request: %v", err)
 	} else if req.Client != c.name {
 		// The request names a client this one is not. That is a server-side
@@ -518,17 +559,26 @@ func (c *Client) satisfyRead(env proto.Envelope) error {
 func (c *Client) satisfyWrite(env proto.Envelope) error {
 	started := time.Now()
 	var reason error
-	switch env.Kind {
-	case proto.KindMkdir:
-		reason = c.serveMkdir(env)
-	case proto.KindRemove:
-		reason = c.serveRemove(env)
-	case proto.KindRename:
-		reason = c.serveRename(env)
-	case proto.KindWrite:
-		reason = c.servePut(env)
-	default:
-		reason = fmt.Errorf("write request has unknown kind %q", env.Kind)
+	if c.shuttingDown() {
+		// Every write request is followed by a content stream, empty or not, and
+		// the server waits for it to be consumed before it reads any other frame
+		// on this connection. Refusing without draining would leave the stream
+		// to be parsed as the next control frame.
+		_ = c.drainContent(env.ID)
+		reason = errShuttingDown
+	} else {
+		switch env.Kind {
+		case proto.KindMkdir:
+			reason = c.serveMkdir(env)
+		case proto.KindRemove:
+			reason = c.serveRemove(env)
+		case proto.KindRename:
+			reason = c.serveRename(env)
+		case proto.KindWrite:
+			reason = c.servePut(env)
+		default:
+			reason = fmt.Errorf("write request has unknown kind %q", env.Kind)
+		}
 	}
 	logging.Infof("client: %s took=%s err=%v", env.Kind, time.Since(started), reason)
 
@@ -899,6 +949,119 @@ func (c *Client) Close() error {
 	// released by the close rather than by the read loop's subsequent failure.
 	close(c.done)
 	return c.conn.Close()
+}
+
+// Shutdown stops accepting new forwarded requests, waits up to grace for the
+// ones already being served, says goodbye, and closes the connection.
+//
+// A plain Close is correct for a process that is going away, but it can cut an
+// upload in half and it leaves the server to discover the departure from a
+// socket close. Shutdown is the version a signal handler uses: the in-flight
+// request finishes, the server acknowledges the withdrawal, and only then does
+// the connection go.
+//
+// The caller is expected to stop its filesystem watcher first. This method
+// knows nothing about the watcher, and a change reported after draining starts
+// would be sent on a connection that is about to close.
+//
+// A negative or zero grace means DefaultShutdownGrace. Shutdown is safe to call
+// more than once.
+func (c *Client) Shutdown(grace time.Duration) error {
+	if grace <= 0 {
+		grace = DefaultShutdownGrace
+	}
+
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil
+	}
+	if c.draining {
+		// Another caller is already running the shutdown; closing again is the
+		// one thing this one can do without racing the wait below.
+		c.mu.Unlock()
+		return c.Close()
+	}
+	c.draining = true
+	idle := make(chan struct{})
+	if c.serving == 0 {
+		close(idle)
+	} else {
+		c.idle = idle
+	}
+	c.mu.Unlock()
+
+	select {
+	case <-idle:
+	case <-time.After(grace):
+		logging.Infof("client: shutdown grace expired with %d request(s) in flight", c.servingCount())
+	}
+
+	c.sendBye(byeTimeout)
+	return c.Close()
+}
+
+// beginServe records that the read loop is starting one forwarded request.
+func (c *Client) beginServe() {
+	c.mu.Lock()
+	c.serving++
+	c.mu.Unlock()
+}
+
+// endServe records that the request is finished, and releases a shutdown that
+// was waiting for exactly that.
+func (c *Client) endServe() {
+	c.mu.Lock()
+	c.serving--
+	if c.draining && c.serving == 0 && c.idle != nil {
+		close(c.idle)
+		c.idle = nil
+	}
+	c.mu.Unlock()
+}
+
+// shuttingDown reports whether new forwarded requests should be refused.
+func (c *Client) shuttingDown() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.draining
+}
+
+// servingCount is used only for the log line about an expired grace.
+func (c *Client) servingCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.serving
+}
+
+// sendBye tells the server this client is leaving and waits, briefly, for the
+// acknowledgement.
+//
+// The wait is bounded and its failure is not returned: the close that follows
+// withdraws the tree either way, and a server that is not answering is not a
+// reason to hang the shutdown.
+func (c *Client) sendBye(timeout time.Duration) {
+	c.mu.Lock()
+	if c.closed || c.loopErr != nil {
+		c.mu.Unlock()
+		return
+	}
+	c.nextID++
+	id := c.nextID
+	ch := make(chan proto.Envelope, 1)
+	c.waiting[id] = ch
+	c.mu.Unlock()
+
+	if err := c.pc.Send(proto.Envelope{ID: id, Kind: proto.KindBye}); err != nil {
+		c.unregister(id)
+		return
+	}
+	select {
+	case <-ch:
+	case <-time.After(timeout):
+	case <-c.done:
+	}
+	c.unregister(id)
 }
 
 // send writes one control message and returns the ID it was given.

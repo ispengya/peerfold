@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"syscall"
 
 	"github.com/ispengya/peerfold/internal/config"
 	"github.com/ispengya/peerfold/internal/logging"
@@ -33,7 +34,12 @@ import (
 // it is running in, so it drives cmdServerWith instead.
 func cmdServer(args []string, stdout, stderr io.Writer) int {
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt)
+	// SIGTERM is what `peerfold stop server` sends. Handling it means the
+	// listener and every live connection are closed by the server rather than
+	// by the default signal action, so the shutdown path is the one that drains
+	// handlers instead of the process disappearing underneath them.
+	// Windows has no SIGTERM to deliver; Ctrl-C takes the interrupt path.
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sig)
 
 	interrupt := make(chan struct{}, 1)

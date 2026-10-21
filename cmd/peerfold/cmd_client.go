@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/ispengya/peerfold/internal/client"
 	"github.com/ispengya/peerfold/internal/config"
@@ -167,6 +168,7 @@ func cmdClient(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "client: watching for changes: %v\n", err)
 		fmt.Fprintln(stderr, "client: the tree is indexed but will not follow changes on disk")
+		watcher = nil
 	} else {
 		defer watcher.Close()
 	}
@@ -194,11 +196,24 @@ func cmdClient(args []string, stdout, stderr io.Writer) int {
 	// Waiting only for the interrupt would leave a process that looks healthy
 	// while the server has already withdrawn everything it published.
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt)
+	// SIGTERM is what `peerfold stop client` sends. Without it the stop command
+	// waits out its grace and then kills the process, which drops an upload that
+	// was still in flight and gives the server no chance to answer the goodbye.
+	// Windows has no SIGTERM to deliver; Ctrl-C there takes the same path as
+	// SIGINT does here.
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sig)
 
 	select {
 	case <-sig:
+		// Stop producing changes before draining: a watcher event emitted while
+		// the connection is closing would be written to a socket nobody reads.
+		if watcher != nil {
+			_ = watcher.Close()
+		}
+		if err := c.Shutdown(client.DefaultShutdownGrace); err != nil {
+			fmt.Fprintf(stderr, "client: shutdown: %v\n", err)
+		}
 		fmt.Fprintln(stdout, "disconnected")
 		return 0
 	case <-c.Done():

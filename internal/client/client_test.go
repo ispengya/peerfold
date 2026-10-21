@@ -391,6 +391,38 @@ func TestClientCloseRemovesClientFromServer(t *testing.T) {
 	}
 }
 
+// Shutdown is the signal-handler path: it must wait for the goodbye to be
+// acknowledged and leave the server's state as clean as a Close does.
+func TestClientShutdownWithdrawsBeforeClosing(t *testing.T) {
+	s, addr := startServer(t)
+	docs := docsOf(t)
+	sh, err := client.NewShares([]string{"Documents=" + docs}, nil)
+	if err != nil {
+		t.Fatalf("NewShares: %v", err)
+	}
+	c, err := client.Dial(client.Options{Server: addr, Name: "leaver", Shares: sh})
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	if err := c.UploadTree(); err != nil {
+		t.Fatalf("UploadTree: %v", err)
+	}
+	if _, ok := s.Index().Lookup("leaver", "Documents/a.txt"); !ok {
+		t.Fatal("precondition: the upload did not reach the index")
+	}
+
+	if err := c.Shutdown(2 * time.Second); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	waitFor(t, "the registry to drop the client", func() bool {
+		return len(s.Registry().Live()) == 0
+	})
+	waitFor(t, "the index to drop the client's nodes", func() bool {
+		_, ok := s.Index().Lookup("leaver", "Documents/a.txt")
+		return !ok
+	})
+}
+
 // A duplicate name must be refused by the server, and the refusal must reach
 // the caller rather than looking like a successful connection.
 func TestClientDialReportsDuplicateName(t *testing.T) {

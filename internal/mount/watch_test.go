@@ -188,13 +188,100 @@ func TestDeletedEntryIsNotResurrectedByAListing(t *testing.T) {
 	t.Log("the fake no longer reports the path; the shadow case was not reachable")
 }
 
+// A wire event names an index path ("win"); the mount resolves FUSE paths
+// ("/win"). The conversion has to happen before the path is stored, or the event
+// table answers a question nobody asks and every remote change falls back to the
+// listing cache.
+func TestAnEventPathWithoutALeadingSlashIsResolved(t *testing.T) {
+	m := newTestMount(t)
+
+	m.applyEvent(Batch{Nodes: []node.Node{{Path: "win", Kind: node.KindDir}}})
+
+	n, code := m.lookup("/win")
+	if code != 0 {
+		t.Fatalf("lookup(/win) = %d, want 0: the event was not stored as a FUSE path", code)
+	}
+	if n.Kind != node.KindDir {
+		t.Fatalf("lookup(/win).Kind = %d, want a directory", n.Kind)
+	}
+}
+
+// A pushed change must invalidate the kernel's copy of the path and of the
+// directory that lists it. Publishing only to the mount's own tables leaves the
+// kernel answering from its cache until attr_timeout expires -- which on Windows
+// is the lifetime of the directory handle.
+func TestAnEventNotifiesTheKernelAboutThePathAndItsParent(t *testing.T) {
+	m := newTestMount(t)
+	notified := map[string]bool{}
+	m.mu.Lock()
+	m.invalidatePath = func(p string) bool {
+		notified[p] = true
+		return true
+	}
+	m.mu.Unlock()
+
+	m.applyEvent(Batch{Nodes: []node.Node{{Path: "win/Documents/a.txt", Kind: node.KindFile}}})
+
+	for _, want := range []string{"/win/Documents/a.txt", "/win/Documents"} {
+		if !notified[want] {
+			t.Errorf("the kernel was not told to revalidate %s; notified %v", want, notified)
+		}
+	}
+}
+
+// A tombstone for a client covers that client's whole subtree. Everything the
+// mount remembered below the name has to go, including listings that are not
+// reachable through the tombstone's parent lookup.
+func TestOwnerTombstoneForgetsTheCachedSubtree(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addDir("/win")
+	f.addFile("/win/Documents/a.txt", 4)
+
+	if _, code := m.lookup("/win/Documents/a.txt"); code != 0 {
+		t.Fatalf("lookup(/win/Documents/a.txt) = %d", code)
+	}
+
+	m.mu.Lock()
+	m.events["/win/Documents/a.txt"] = node.Node{Path: "/win/Documents/a.txt", Kind: node.KindFile}
+	m.pendingPaths["/win/new.txt"] = node.KindFile
+	m.handed["/win/Documents/a.txt"] = struct{}{}
+	notified := map[string]bool{}
+	m.invalidatePath = func(p string) bool {
+		notified[p] = true
+		return true
+	}
+	m.mu.Unlock()
+
+	m.applyEvent(Batch{Seq: 1, Nodes: []node.Node{{Path: "win", Kind: node.KindDeleted}}})
+
+	m.mu.Lock()
+	_, eventKept := m.events["/win/Documents/a.txt"]
+	_, pendingKept := m.pendingPaths["/win/new.txt"]
+	_, handedKept := m.handed["/win/Documents/a.txt"]
+	m.mu.Unlock()
+	if eventKept || pendingKept || handedKept {
+		t.Fatalf("the withdrawn subtree still has state: event=%t pending=%t handed=%t",
+			eventKept, pendingKept, handedKept)
+	}
+	if !notified["/win/Documents/a.txt"] || !notified["/win"] || !notified["/"] {
+		t.Errorf("the withdrawal did not invalidate the subtree and root: %v", notified)
+	}
+
+	m.listingMu.Lock()
+	_, listingKept := m.listings["/win/Documents"]
+	m.listingMu.Unlock()
+	if listingKept {
+		t.Error("the withdrawn subtree still has a cached listing")
+	}
+}
+
 // ------------------------------------------------------------------- drops
 
 // An owner tombstone is the server saying that a whole client tree has been
-// withdrawn. It must release the mount point, not mark the connection lost: the
-// server is still reachable, so a reconnect would succeed and leave the mount up
-// with nothing to serve.
-func TestOwnerWithdrawalReleasesTheMount(t *testing.T) {
+// withdrawn. The mount must stay up: the server is still reachable, and a client
+// that reconnects should reappear without the user remounting anything.
+func TestOwnerWithdrawalKeepsTheMountMounted(t *testing.T) {
 	f := newFakeCaller()
 	f.watchForTest()
 	m := New(f, DefaultOptions())
@@ -211,15 +298,22 @@ func TestOwnerWithdrawalReleasesTheMount(t *testing.T) {
 
 	select {
 	case <-released:
-	case <-time.After(5 * time.Second):
-		t.Fatal("an owner tombstone did not release the mount; the mount would " +
-			"stay mounted forever after its owner disappeared")
+		t.Fatal("the last owner's tombstone released the mount; a client that " +
+			"comes back could then never reappear in this window")
+	case <-time.After(300 * time.Millisecond):
 	}
+
+	// The same watch loop must still be listening, so a later join is applied.
+	f.emit(2, node.Node{Path: "owner", Kind: node.KindDir})
+	waitFor(t, 5*time.Second, func() bool {
+		n, ok := m.eventFor("/owner")
+		return ok && n.Kind == node.KindDir
+	}, "the mount did not apply a join after the last owner had left")
 }
 
 // A tombstone for one owner must not take down a mount that is still serving
-// another. The mount is a view of the whole federation, not of one client; only
-// when the last owner's tree is withdrawn is there nothing left to serve.
+// another. The mount is a view of the whole federation, not of one client, and
+// it outlives every individual client in it.
 func TestOwnerWithdrawalKeepsServingOtherOwners(t *testing.T) {
 	f := newFakeCaller()
 	f.addDir("/alice")
@@ -245,13 +339,14 @@ func TestOwnerWithdrawalKeepsServingOtherOwners(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 	}
 
-	// The last owner goes away, and now nothing is left to serve.
+	// The last owner goes away too. The mount stays up with an empty root: the
+	// next client to connect must be able to appear here.
 	f.emit(2, node.Node{Path: "bob", Kind: node.KindDeleted})
 
 	select {
 	case <-released:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the mount did not release after the last owner's tree was withdrawn")
+		t.Fatal("the mount released after the last owner's tree was withdrawn")
+	case <-time.After(300 * time.Millisecond):
 	}
 }
 

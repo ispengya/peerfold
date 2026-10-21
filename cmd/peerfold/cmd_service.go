@@ -79,8 +79,15 @@ func clearPID(component string) error {
 
 // killProcess terminates a process, first gracefully then forcefully.
 //
-// SIGTERM is portable: on Windows Go maps it to TerminateProcess, which is
-// the only graceful-ish stop that OS offers a console process.
+// SIGTERM is deliverable on Unix. Windows has no equivalent: os.Process.Signal
+// only implements Kill there, so a non-Kill signal fails instead of being
+// delivered. That failure is used as the signal that there is no grace to wait
+// for, rather than sleeping out the deadline and then killing anyway.
+//
+// The grace is long enough for a client to finish the request it was serving
+// and wait for the server's goodbye acknowledgement. It is still bounded: a
+// process that ignores the signal is killed rather than allowed to make the
+// stop command hang.
 func killProcess(pid int) error {
 	if !isProcessAlive(pid) {
 		return nil
@@ -89,9 +96,14 @@ func killProcess(pid int) error {
 	if err != nil {
 		return err
 	}
-	// Try graceful first
-	_ = proc.Signal(syscall.SIGTERM)
-	deadline := time.Now().Add(5 * time.Second)
+	// Try graceful first.
+	if err := proc.Signal(syscall.SIGTERM); err != nil {
+		if !isProcessAlive(pid) {
+			return nil
+		}
+		return proc.Kill()
+	}
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if !isProcessAlive(pid) {
 			return nil

@@ -116,9 +116,10 @@ func (m *Mount) supervise(rc Reconnector, giveUp time.Duration) {
 }
 
 // releaseMountPoint asks the host to unmount, through the hook the runner
-// installs. It is the single place any give-up becomes an actual unmount, whether
-// the reason is "the server never came back" or "the server withdrew the owner's
-// tree". A nil hook is tolerated because a Mount built by a test has no host.
+// installs. It is the single place the reconnect supervisor's give-up becomes an
+// actual unmount. An individual owner leaving is deliberately not one of these:
+// the mount outlives its clients and waits for the next one. A nil hook is
+// tolerated because a Mount built by a test has no host.
 func (m *Mount) releaseMountPoint() {
 	m.mu.Lock()
 	hook := m.onGiveUp

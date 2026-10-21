@@ -303,7 +303,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		}
 		unwatch := s.watch(c)
 		defer unwatch()
-		s.serveLoop("", c)
+		s.serveLoop("", c, nil)
 		return
 	}
 
@@ -328,16 +328,25 @@ func (s *Server) handleConn(conn net.Conn) {
 	// owner loss is a tree change just like a file deletion. Without it a live
 	// viewer's watch channel never closes and a mount can stay mounted forever
 	// after its owner disappears.
-	defer func() {
-		logging.Infof("server: client %q disconnected", hb.Name)
-		s.broadcastOwnerGone(hb.Name)
-		s.ix.RemoveClient(hb.Name)
-		s.reg.Unregister(hb.Name)
-		// The router link goes last. A request forwarded to a client that is on
-		// its way out must find it gone and fail, rather than be written into a
-		// connection nobody is reading.
-		s.router.detach(hb.Name)
-	}()
+	//
+	// Once, because a graceful goodbye runs it before acknowledging the goodbye
+	// and the deferred call runs it again on the way out. Doing it twice would
+	// broadcast a second tombstone and make a fast reconnect race a cleanup it
+	// had already waited for.
+	var cleanupOnce sync.Once
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			logging.Infof("server: client %q disconnected", hb.Name)
+			s.broadcastOwnerGone(hb.Name)
+			s.ix.RemoveClient(hb.Name)
+			s.reg.Unregister(hb.Name)
+			// The router link goes last. A request forwarded to a client that
+			// is on its way out must find it gone and fail, rather than be
+			// written into a connection nobody is reading.
+			s.router.detach(hb.Name)
+		})
+	}
+	defer cleanup()
 
 	// Record where this supplier connected from and when, for status on any
 	// machine. Like the mount registry it is filled before the hello is
@@ -358,7 +367,20 @@ func (s *Server) handleConn(conn net.Conn) {
 	// everything else".
 	s.router.attach(hb.Name, c)
 	logging.Infof("server: client %q connected", hb.Name)
-	s.serveLoop(hb.Name, c)
+	// A mount that is already up has no way to learn about a new client by
+	// asking: nothing it is listing has changed, so it would keep the listing it
+	// already has. The join is a tree change like any other, and broadcasting it
+	// is what makes a client that comes online after the mount appear in it.
+	//
+	// It is sent after the router is attached so a mount that reacts by opening
+	// a path can actually have the request forwarded. The tree itself is still
+	// uploading at this point; anything under the name is served from whatever
+	// has been indexed so far, which is the same state an ordinary List sees.
+	s.broadcastOwnerJoined(hb.Name)
+	// cleanup is handed to the loop so a graceful goodbye can withdraw the tree
+	// *before* acknowledging it: a client that restarts immediately must not race
+	// a name that is still registered.
+	s.serveLoop(hb.Name, c, cleanup)
 }
 
 // replyHello answers a hello with the server's ruling on the aggregate role.
@@ -377,7 +399,12 @@ func (s *Server) replyHello(c *proto.Conn, id uint64, name string, aggregate boo
 //
 // name is the registered client this connection owns index entries for, or ""
 // for a viewer, which owns none.
-func (s *Server) serveLoop(name string, c *proto.Conn) {
+//
+// onBye, when non-nil, runs before a goodbye is acknowledged. It is how a client
+// can be unregistered while it can still be told that it was: a caller that
+// reconnects immediately then finds the name free. Viewers pass nil, because
+// their teardown has nothing a reconnect could race.
+func (s *Server) serveLoop(name string, c *proto.Conn, onBye func()) {
 	for {
 		// RecvAny, not Recv: a client's update is a frame this loop has to act
 		// on, and the skipping that suits a viewer would discard it here.
@@ -391,6 +418,19 @@ func (s *Server) serveLoop(name string, c *proto.Conn) {
 				// what just failed.
 				_ = c.Send(proto.Envelope{Err: err.Error()})
 			}
+			return
+		}
+
+		// A peer that is leaving on purpose says so rather than just closing.
+		// The answer matters: it is what lets a stopping client wait until the
+		// server has processed the withdrawal before exiting. Returning from
+		// this loop runs the same cleanup a dropped connection would, so there
+		// is one teardown path rather than two.
+		if env.Kind == proto.KindBye {
+			if onBye != nil {
+				onBye()
+			}
+			_ = c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindByeOK})
 			return
 		}
 
@@ -431,6 +471,16 @@ func (s *Server) serveLoop(name string, c *proto.Conn) {
 			}
 			if err := c.Send(proto.Envelope{ID: env.ID, Kind: env.Kind}); err != nil {
 				return
+			}
+			// The tree is now complete, and the join event that announced the
+			// client went out while batches were still arriving. Sending it again
+			// here is the "the directory you may have listed is full now" signal:
+			// a mount that cached the half-uploaded tree drops it and lists again.
+			//
+			// Nothing is sent for a viewer: name is empty, and a viewer owns no
+			// tree for this to describe.
+			if name != "" {
+				s.broadcastOwnerReady(name)
 			}
 			continue
 		}
@@ -756,6 +806,53 @@ func (s *Server) broadcastOwnerGone(name string) {
 
 func marshalOwnerGone(name string) proto.Envelope {
 	body, err := json.Marshal(proto.EventBody{Nodes: []proto.NodeJSON{{Path: name, Kind: uint8(node.KindDeleted)}}})
+	if err != nil {
+		return proto.Envelope{}
+	}
+	return proto.Envelope{Kind: proto.KindEvent, Body: body}
+}
+
+// broadcastOwnerJoined tells every watcher that a client's namespace has
+// appeared.
+//
+// The top level is synthesised from the registry rather than indexed, so there
+// is no server-side index change to piggyback on: a watcher cannot discover a
+// new name by re-reading a tree it already has. This event is that discovery,
+// and it carries the same shape a file creation does -- a directory node named
+// after the client.
+func (s *Server) broadcastOwnerJoined(name string) {
+	if name == "" {
+		return
+	}
+	s.broadcast(marshalOwnerPresent(name))
+}
+
+// broadcastOwnerReady repeats the join after the tree upload has finished.
+//
+// The join goes out when the client registers, which is before its batches have
+// been indexed: that is deliberate, because "connected" is the fact the top
+// level reports. But a mount that listed the name in that window has a cached
+// directory that is empty or partial. Repeating the same node now invalidates
+// it, so the next listing shows the whole tree.
+func (s *Server) broadcastOwnerReady(name string) {
+	if name == "" {
+		return
+	}
+	s.broadcast(marshalOwnerPresent(name))
+}
+
+// marshalOwnerPresent is the event that makes a client's root entry visible.
+//
+// The mode is the conventional directory mode for the same reason the mount
+// synthesises its own root: no owner has an index entry for the client name, so
+// there is no real mode to report, and a zero mode makes some clients treat the
+// entry as unreadable.
+func marshalOwnerPresent(name string) proto.Envelope {
+	body, err := json.Marshal(proto.EventBody{Nodes: []proto.NodeJSON{{
+		Path: name,
+		Kind: uint8(node.KindDir),
+		Mode: 0o755,
+	}}})
 	if err != nil {
 		return proto.Envelope{}
 	}

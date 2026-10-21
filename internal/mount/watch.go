@@ -2,7 +2,6 @@ package mount
 
 import (
 	"log"
-	"path"
 	"strings"
 
 	"github.com/ispengya/peerfold/internal/node"
@@ -116,25 +115,23 @@ func (m *Mount) watchLoop(done chan struct{}, exited chan struct{}) {
 			default:
 			}
 			if m.applyEvent(b) {
+				// An owner's tree is gone. Whether another remains changes what is
+				// served, not whether the mount is still a mount: the federation
+				// belongs to the server, and clients come and go within its
+				// lifetime. Releasing the mount point here would mean a client that
+				// reconnects a moment later could never reappear in this window.
+				//
+				// The withdrawn subtree is already shadowed by its tombstone, and
+				// the kernel has been told to revalidate it, so an empty root is
+				// what a caller sees until the next owner joins.
 				if m.anyOwnerRemains() {
-					// One owner's tree is gone, but another owner remains. The
-					// server is still reachable and still has something to serve, so
-					// the mount stays up and keeps watching. The withdrawn subtree is
-					// already shadowed by the tombstone in the event table, and the
-					// kernel's entry timeout revalidates the rest on its own.
 					log.Printf("mount: an owner's tree was withdrawn; serving the " +
 						"remaining owners")
-					continue
+				} else {
+					log.Printf("mount: the last owner's tree was withdrawn; the mount " +
+						"stays up and waits for an owner to connect")
 				}
-				// The last owner's tree is gone. A reconnect would succeed against
-				// the still-live server and leave the mount up with nothing to serve,
-				// so the response is to release the mount point rather than retry. It
-				// is deliberately not setDisconnected, which is the signal the
-				// reconnect supervisor polls for.
-				log.Printf("mount: the last owner's tree was withdrawn; the mount " +
-					"point is being released")
-				m.releaseMountPoint()
-				return
+				continue
 			}
 		}
 	}
@@ -148,7 +145,6 @@ func (m *Mount) watchLoop(done chan struct{}, exited chan struct{}) {
 // suspect.
 func (m *Mount) applyEvent(b Batch) bool {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	// Seq == 0 means the sender does not number its events, which is not a gap.
 	//
@@ -156,6 +152,7 @@ func (m *Mount) applyEvent(b Batch) bool {
 	// just attached has no idea what the previous sequence was, and inventing a
 	// gap for the low order bits of a reconnect's counter would mark every fresh
 	// mount stale.
+	gap := false
 	if b.Seq != 0 {
 		if m.lastSeq != 0 && b.Seq != m.lastSeq+1 {
 			// A gap means the transport dropped events, and nothing else in the
@@ -164,6 +161,7 @@ func (m *Mount) applyEvent(b Batch) bool {
 			log.Printf("mount: the event sequence jumped from %d to %d, so "+
 				"events were lost and the tree cannot be trusted", m.lastSeq, b.Seq)
 			m.isStale = true
+			gap = true
 			// A lost batch may have changed any directory. The per-path
 			// invalidation below cannot name what was missed, so every cached
 			// listing is suspect until it is fetched again.
@@ -173,33 +171,115 @@ func (m *Mount) applyEvent(b Batch) bool {
 	}
 
 	withdrawn := false
-	for _, n := range b.Nodes {
+	// notify collects what the kernel has to forget. The hook is called after the
+	// lock is released: Notify crosses into the FUSE/WinFsp host, and holding the
+	// mount's lock across it would block every other operation behind a kernel
+	// call.
+	notify := make(map[string]struct{}, len(b.Nodes)*2)
+	for _, raw := range b.Nodes {
+		n := raw
+		// The wire speaks index paths; this package speaks FUSE paths. See
+		// fusePath.
+		n.Path = fusePath(n.Path)
+
 		// The path and its parent both changed as far as listings are
 		// concerned: membership, attributes, or (for a directory) children.
-		m.invalidateListings(n.Path)
+		if n.Kind == node.KindDeleted {
+			// A tombstone on a directory covers its whole subtree. Descendant
+			// entries from before the deletion would otherwise answer a lookup
+			// for a path that no longer exists.
+			m.forgetSubtreeLocked(n.Path, notify)
+			m.invalidateListingSubtree(n.Path)
+		} else {
+			m.invalidateListings(n.Path)
+		}
 		delete(m.pendingPaths, n.Path)
 		delete(m.pendingContent, n.Path)
+		m.addNotifyLocked(notify, n.Path)
 		if n.Kind == node.KindDeleted {
 			// The tombstone is kept rather than the entry being deleted: see the
 			// comment on Mount.events. Deleting it would make the deletion
 			// indistinguishable from a path that was never mentioned, and the
 			// next listing would bring it back.
 			m.events[n.Path] = node.Node{Path: n.Path, Kind: node.KindDeleted}
-			if n.Path != "" && !strings.Contains(n.Path, "/") {
+			if isRootChild(n.Path) {
 				withdrawn = true
 			}
 			continue
 		}
 		m.events[n.Path] = n
 	}
+	hook := m.invalidatePath
+	m.mu.Unlock()
+
+	if gap {
+		// The gap case has no list of paths to work from: every path the kernel
+		// may be caching is suspect, and the named paths in this batch are only
+		// the ones that happened to survive.
+		m.invalidateAll()
+		return withdrawn
+	}
+	if hook != nil {
+		for p := range notify {
+			hook(p)
+		}
+	}
 	return withdrawn
+}
+
+// addNotifyLocked records the kernel entries a change to p can have made stale.
+//
+// The parent is included because a listing there reports p's name and size, and
+// p itself because its attributes changed or it appeared. Both are deduplicated
+// by the map, and none of them are called until the mount's lock is released.
+func (m *Mount) addNotifyLocked(set map[string]struct{}, p string) {
+	if p == "" {
+		return
+	}
+	set[p] = struct{}{}
+	if parent, _, err := SplitParent(p); err == nil {
+		set[parent] = struct{}{}
+	}
+}
+
+// forgetSubtreeLocked drops everything this mount remembers about p and its
+// descendants, and adds each path the kernel was told about to notify.
+//
+// The caller holds m.mu. The tombstone for p itself is written by applyEvent
+// afterwards; everything below it is simply gone, because a path under a deleted
+// directory has no meaning to keep.
+func (m *Mount) forgetSubtreeLocked(p string, notify map[string]struct{}) {
+	within := func(k string) bool {
+		return p == "/" || k == p || strings.HasPrefix(k, p+"/")
+	}
+	for k := range m.events {
+		if within(k) {
+			delete(m.events, k)
+		}
+	}
+	for k := range m.pendingPaths {
+		if within(k) {
+			delete(m.pendingPaths, k)
+		}
+	}
+	for k := range m.pendingContent {
+		if within(k) {
+			delete(m.pendingContent, k)
+		}
+	}
+	for k := range m.handed {
+		if within(k) {
+			notify[k] = struct{}{}
+			delete(m.handed, k)
+		}
+	}
 }
 
 // anyOwnerRemains reports whether the federation still has a live owner to
 // serve. It lists the root and discards any name this mount has already been told
 // is gone, so the answer is right even while the server is still removing the
-// withdrawn owner from its own index. It is how the watch loop decides, when one
-// owner's tree is withdrawn, whether that owner was the last.
+// withdrawn owner from its own index. The watch loop uses it only to say what
+// state the mount is in; a mount with no owners stays mounted either way.
 //
 // A list that fails is treated as "owners remain": a transient wire error is not
 // evidence the tree is empty, and if the server really is gone the watch channel
@@ -212,8 +292,9 @@ func (m *Mount) anyOwnerRemains() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, c := range children {
-		name := path.Base(c.Path)
-		if ev, ok := m.events[name]; ok && ev.Kind == node.KindDeleted {
+		// Event paths are FUSE paths now, while this listing came straight from
+		// the caller. fusePath is what lets the two be compared at all.
+		if ev, ok := m.events[fusePath(c.Path)]; ok && ev.Kind == node.KindDeleted {
 			continue
 		}
 		return true

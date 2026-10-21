@@ -50,6 +50,14 @@ func (m *Mount) listDir(dir string) (children []node.Node, cached bool, err erro
 		log.Printf("mount: list %s took=%s failed: %v", dir, took, err)
 		return nil, false, err
 	}
+	// The wire's paths are index paths ("win/Documents"), while everything in
+	// this package keys on FUSE paths ("/win/Documents"). The adapter could do
+	// this, but doing it here makes every Caller obey the same convention: the
+	// event table, pending table and handed-out table are all keyed by the
+	// result, so a relative path in any one of them is a path that never matches.
+	for i := range children {
+		children[i].Path = fusePath(children[i].Path)
+	}
 	log.Printf("mount: list %s entries=%d took=%s cached=false", dir, len(children), took)
 
 	m.listingMu.Lock()
@@ -92,6 +100,85 @@ func (m *Mount) invalidateListings(path string) {
 		delete(m.listings, parent)
 	}
 	m.listingMu.Unlock()
+}
+
+// invalidateListingSubtree drops every cached listing at or below path, and the
+// parent that names it.
+//
+// A tombstone for a directory says the whole subtree is gone, and an entry for a
+// directory that is still there can still be stale after its children changed.
+// invalidateListings only knows about the one path, so it would leave a cached
+// /win/Documents answering a lookup after /win itself was withdrawn.
+func (m *Mount) invalidateListingSubtree(path string) {
+	if path == "" {
+		return
+	}
+	m.listingMu.Lock()
+	delete(m.listings, path)
+	if path == "/" {
+		m.listings = map[string]dirCacheEntry{}
+		m.listingMu.Unlock()
+		return
+	}
+	if parent, _, err := SplitParent(path); err == nil {
+		delete(m.listings, parent)
+	}
+	prefix := path + "/"
+	for p := range m.listings {
+		if strings.HasPrefix(p, prefix) {
+			delete(m.listings, p)
+		}
+	}
+	m.listingMu.Unlock()
+}
+
+// fusePath puts a path returned by the caller into the FUSE form this package
+// uses everywhere else.
+//
+// The viewer speaks index paths: no leading slash, and a client name as the
+// first component. The core speaks FUSE paths: absolute, and with "/" as the
+// root. Treating one as the other is silent rather than loud -- an event for
+// "win/x" simply never matches a lookup for "/win/x" -- so the conversion is
+// done at the one place results enter the core rather than trusted to the
+// adapter.
+func fusePath(p string) string {
+	if p == "" {
+		return "/"
+	}
+	if strings.HasPrefix(p, "/") {
+		return p
+	}
+	return "/" + p
+}
+
+// isRootChild reports whether p names a client at the mount root.
+//
+// With the leading slash now present, a plain Contains(p, "/") would be true for
+// every absolute path. The question is whether there is a second component.
+func isRootChild(p string) bool {
+	p = strings.TrimPrefix(p, "/")
+	return p != "" && !strings.Contains(p, "/")
+}
+
+// deletedAncestor reports whether a tombstone on an ancestor shadows p.
+//
+// A tombstone is kept for the deleted directory, not copied onto every path
+// below it. A cached listing under that directory can still answer a lookup, and
+// a path whose parent is known to be gone must not be brought back by it.
+func (m *Mount) deletedAncestor(p string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for p != "" && p != "/" {
+		parent, _, err := SplitParent(p)
+		if err != nil {
+			return false
+		}
+		if ev, ok := m.events[parent]; ok && ev.Kind == node.KindDeleted {
+			return true
+		}
+		p = parent
+	}
+	return false
 }
 
 // clearListings forgets every cached listing. A reconnect replaces the whole
@@ -242,6 +329,11 @@ func (m *Mount) lookup(p string) (node.Node, int) {
 			return node.Node{}, -ELOOP
 		}
 		return n, 0
+	}
+	if m.deletedAncestor(cleaned) {
+		// The directory that would contain this path is known to be gone. A
+		// cached listing under it must not resurrect the name.
+		return node.Node{}, -ENOENT
 	}
 	if n, ok := m.pendingNode(cleaned); ok {
 		// This name was created by this mount and the owning client has not
