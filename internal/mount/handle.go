@@ -80,6 +80,12 @@ type openFile struct {
 	// dirtyVersion is the handle's version as of the last successful flush. The
 	// handle is clean exactly when version == dirtyVersion.
 	dirtyVersion uint64
+
+	// lastChunk is the last read unit this handle asked for, or -1 before the
+	// first read. It is the whole of the sequential-access detector: a read
+	// that continues at the next unit is what makes prefetching the units after
+	// it a bet worth taking, while a random jump is not.
+	lastChunk int64
 }
 
 // markDirty records that the handle's content changed.
@@ -130,7 +136,11 @@ func (m *Mount) newHandleLocked(path string, kind node.Kind) uint64 {
 		kind:       kind,
 		writeLimit: m.opts.WriteLimit,
 		writes:     map[int64][]byte{},
+		lastChunk:  -1,
 	}
+	// Binding the handle to its path is what lets the cache survive close: the
+	// chunks belong to the file, not to this open.
+	m.cache.bind(fh, path)
 	return fh
 }
 
@@ -149,10 +159,28 @@ func (m *Mount) handle(fh uint64) (*openFile, bool) {
 // the documented order, and the Locked form avoids re-entering it.
 func (m *Mount) closeHandle(fh uint64) {
 	delete(m.files, fh)
-	m.cache.dropOpenLocked(fh)
+	// The handle goes; its file's cached chunks stay. A later open of the same
+	// path reuses them, and invalidation is driven by events and local writes
+	// rather than by this close.
+	m.cache.unbind(fh)
 }
 
-// flush uploads one handle's whole buffer and marks it clean.
+// flush uploads one handle's whole buffer without requiring stable storage.
+//
+// It is what Flush and Release use: the bytes have reached the owner, and the
+// owner's atomic rename means a reader sees the old file or the whole new one.
+// A caller that asked for durability goes through flushDurable instead.
+func (m *Mount) flush(fh uint64) int {
+	return m.flushWithDurability(fh, false)
+}
+
+// flushDurable is flush with the owner required to fsync the file and its
+// directory before publishing the name.
+func (m *Mount) flushDurable(fh uint64) int {
+	return m.flushWithDurability(fh, true)
+}
+
+// flushWithDurability uploads one handle's whole buffer and marks it clean.
 //
 // It is idempotent, because Fsync, Flush and Release can all arrive for one
 // handle and three whole-file uploads of a 40 MB file is a real cost.
@@ -177,7 +205,7 @@ func (m *Mount) closeHandle(fh uint64) {
 // An unknown handle is a success, not an error. cgofuse can deliver Fsync or
 // Flush for a handle the kernel has already released, and refusing would turn a
 // harmless race into an input/output error on a save.
-func (m *Mount) flush(fh uint64) int {
+func (m *Mount) flushWithDurability(fh uint64, durable bool) int {
 	m.mu.Lock()
 	h, ok := m.files[fh]
 	if !ok {
@@ -213,13 +241,17 @@ func (m *Mount) flush(fh uint64) int {
 	m.mu.Unlock()
 
 	started := time.Now()
-	err := c.Put(path, bytes.NewReader(body))
+	err := c.Put(path, bytes.NewReader(body), durable)
 	took := time.Since(started)
 	if err != nil {
 		log.Printf("mount: flush %s bytes=%d took=%s failed: %v", path, len(body), took, err)
 		return errnoFor(err)
 	}
 	log.Printf("mount: flush %s bytes=%d took=%s", path, len(body), took)
+	// The name now holds these bytes. Any chunk cached for it describes the
+	// file as it was, including chunks another handle fetched before this
+	// flush, so the whole path is invalidated rather than just this handle.
+	m.cache.invalidate(path)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()

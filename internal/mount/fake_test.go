@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ispengya/peerfold/internal/node"
 )
@@ -60,6 +61,9 @@ type fakeCaller struct {
 	// express because offset 0 is reserved: the mount resolves a path before it
 	// reads, so a failure at offset 0 would land in resolution.
 	readErrFirst bool
+	// readDelay slows every ranged read down, so a test can hold several reads
+	// of one chunk in the window before the first fill completes.
+	readDelay time.Duration
 
 	// putErr, when set, makes every Put fail after being recorded. A failed
 	// upload must leave the handle dirty, and the only way to tell a flush that
@@ -68,6 +72,8 @@ type fakeCaller struct {
 	// puts records the body of every successful Put, so a test can assert how
 	// many whole-file uploads a sequence caused and what each carried.
 	puts [][]byte
+	// putDurability records the durability flag of every Put attempt, in order.
+	putDurability []bool
 
 	// onPut, when set, runs inside Put after the body has been read and before
 	// the content is stored. It is the hook a test uses to land a write while an
@@ -161,6 +167,13 @@ func (f *fakeCaller) setReadFailure(off int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.readErrAt = off
+}
+
+// setReadDelay makes every ranged read take d longer.
+func (f *fakeCaller) setReadDelay(d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.readDelay = d
 }
 
 // setFirstReadFailure makes the next read of any offset fail, once.
@@ -311,7 +324,11 @@ func (f *fakeCaller) Read(path string, off int64, n int) ([]byte, error) {
 	// test that sets it cannot race the read that observes it. It is not cleared
 	// on use: the same chunk fails every time, which is what a broken link does.
 	failWith := f.readErrSentinel(off)
+	delay := f.readDelay
 	f.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
 	if failWith != nil {
 		return nil, failWith
 	}
@@ -335,7 +352,7 @@ func (f *fakeCaller) Read(path string, off int64, n int) ([]byte, error) {
 	return append([]byte(nil), rest...), nil
 }
 
-func (f *fakeCaller) Put(path string, r io.Reader) error {
+func (f *fakeCaller) Put(path string, r io.Reader, durable bool) error {
 	body, err := io.ReadAll(r)
 	if err != nil {
 		return err
@@ -343,6 +360,7 @@ func (f *fakeCaller) Put(path string, r io.Reader) error {
 
 	f.mu.Lock()
 	f.calls = append(f.calls, "Put "+path)
+	f.putDurability = append(f.putDurability, durable)
 	// The failure is captured and the lock released before the hook runs: a test
 	// that lands a write from inside the hook has to be able to take the mount's
 	// lock, and holding this one across the hook would deadlock against it.
@@ -366,12 +384,32 @@ func (f *fakeCaller) Put(path string, r io.Reader) error {
 	return nil
 }
 
+// putDurabilityLog returns the durability flag of each Put attempt, in order.
+func (f *fakeCaller) putDurabilityLog() []bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]bool(nil), f.putDurability...)
+}
+
 // setPutFailure makes every subsequent Put fail. See putErr for why the call is
 // still logged.
 func (f *fakeCaller) setPutFailure(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.putErr = err
+}
+
+// readCount is how many ranged reads reached the caller.
+func (f *fakeCaller) readCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, "Read ") {
+			n++
+		}
+	}
+	return n
 }
 
 // putCount is how many Put calls reached the caller, successful or not.

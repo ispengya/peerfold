@@ -54,8 +54,11 @@ type Caller interface {
 	// file", which is viewer.Viewer's convention and is what the core passes.
 	// A read at or past the end returns no bytes and no error.
 	Read(path string, off int64, n int) ([]byte, error)
-	// Put writes a whole file. It replaces the target atomically.
-	Put(path string, r io.Reader) error
+	// Put writes a whole file. It replaces the target atomically. durable asks
+	// the owner to flush the file and its directory to stable storage before
+	// publishing the name; an ordinary close does not need that, while Fsync
+	// does.
+	Put(path string, r io.Reader, durable bool) error
 	// Mkdir creates one directory. It does not create parents.
 	Mkdir(path string) error
 	// Remove deletes one file or one empty directory.
@@ -127,16 +130,28 @@ type Mount struct {
 	files map[uint64]*openFile
 	// cache holds read chunks under the two D3 caps.
 	cache *chunkCache
-	// fetchMu serialises cache-miss fills. The viewer connection carries one
-	// request at a time, so this costs no network concurrency; its purpose is
-	// the re-check after waiting. Concurrent FUSE reads of the same range all
-	// miss before the first fill completes, and without this each one goes to
-	// the wire for the same bytes.
-	fetchMu sync.Mutex
+	// inflight collapses concurrent fills of one chunk. The old global fetchMu
+	// did that by serialising every miss in the mount; keying the in-flight
+	// table by (path, generation, chunk) keeps the duplicate suppression while
+	// letting different chunks and different files use the connection pool at
+	// the same time.
+	inflightMu sync.Mutex
+	inflight   map[chunkKey]*chunkFlight
+	// prefetchTokens bounds the background fill goroutines. A prefetch that
+	// cannot take a token is skipped rather than queued: the data path always
+	// has priority over speculative work.
+	prefetchTokens chan struct{}
+	// latencyMu guards the moving average of a cache-miss fill. It is what the
+	// adaptive read unit is derived from: a high-latency link wants fewer,
+	// larger round trips, while a local one wants smaller units so a small read
+	// does not wait for a large one.
+	latencyMu      sync.Mutex
+	latency        time.Duration
+	latencySamples int
 	// loadMu serialises content loads for a handle's first write. Two writes
 	// arriving together on one clean handle must not both fetch the whole file;
 	// the second waits, re-checks loaded, and then writes into the loaded
-	// buffer. It is separate from fetchMu because a load is a whole-file
+	// buffer. It is separate from inflight because a load is a whole-file
 	// sequence of reads, not a chunk fill.
 	loadMu sync.Mutex
 	// listingMu guards listings, the directory cache.
@@ -206,8 +221,13 @@ type Mount struct {
 	// guarded by a sync.Once. A Once would be wrong here: a reconnect has to be
 	// able to start a *second* loop, on the new caller's channel, and a Once by
 	// definition never runs again. Idempotence comes from the nil check instead.
-	watchDone   chan struct{}
-	watchExited chan struct{}
+	watchDone     chan struct{}
+	watchExited   chan struct{}
+	watchStopping bool
+	// beforeApply, when set, runs at the start of applyEvent, outside the lock.
+	// It exists so a test can hold the watch loop at a known point and queue
+	// batches behind it; production leaves it nil.
+	beforeApply func()
 
 	// onGiveUp is called when the supervisor stops retrying, to unmount. It is
 	// nil until the host adapter sets it, which is why every call is guarded.
@@ -233,11 +253,19 @@ type Mount struct {
 // New builds the operation core over a caller, which is the layer that actually
 // reaches the owner.
 func New(caller Caller, opts Options) *Mount {
+	// Speculative fills get half the data path at most; the next real read
+	// should never wait behind work nobody asked for.
+	prefetch := readConcurrency(opts) / 2
+	if prefetch < 1 {
+		prefetch = 1
+	}
 	return &Mount{
 		caller:          caller,
 		opts:            opts,
 		files:           map[uint64]*openFile{},
 		cache:           newChunkCache(opts.BufferLimit, opts.BufferTotal),
+		inflight:        map[chunkKey]*chunkFlight{},
+		prefetchTokens:  make(chan struct{}, prefetch),
 		events:          map[string]node.Node{},
 		listings:        map[string]dirCacheEntry{},
 		listingInflight: map[string]*listingCall{},
@@ -251,10 +279,11 @@ func New(caller Caller, opts Options) *Mount {
 // arguments because the runner fills it from flags, the tests fill it from
 // constants, and both need every field to have a defined default.
 type Options struct {
-	// BufferLimit is the read cache for a single open file, and BufferTotal is
-	// the read cache for all open files together. The two are the D3 pair and
-	// they bound different things: one alone is not a bound on the process,
-	// because N handles each respecting a per-handle cap hold N times it.
+	// BufferLimit is the read cache for a single file, and BufferTotal is the
+	// read cache for every file together. The two are the D3 pair and they
+	// bound different things: one alone is not a bound on the process, because
+	// N files each respecting a per-file cap hold N times it. Chunks are keyed
+	// by path, so the same cap covers every handle open on one file.
 	BufferLimit int
 	BufferTotal int
 	// WriteLimit is how many bytes of accumulated writing one open may hold.
@@ -267,6 +296,10 @@ type Options struct {
 	// truncated; the disk-spooled write path that removes the ceiling is a
 	// later change.
 	WriteLimit int
+	// ReadConcurrency is how many extra viewer connections a mount may open for
+	// reads and writes. One connection carries one request at a time, so this
+	// is the width of the data path. Zero means the package default.
+	ReadConcurrency int
 	// ChunkSize is how many bytes one ranged read asks the owner for. It is
 	// the knob that trades first-byte latency against sequential throughput on
 	// a high-RTT link; zero means the package default.
@@ -329,9 +362,10 @@ type Options struct {
 //
 // Each number is a decision rather than a placeholder:
 //
-// 64 MiB per open and 256 MiB across all opens: large enough that a sequential
+// 64 MiB per file and 256 MiB across all files: large enough that a sequential
 // reader of a big file is not re-fetching, small enough that the process cannot
-// be made to exhaust memory by an ordinary workload.
+// be made to exhaust memory by an ordinary workload. The chunks outlive a close,
+// so the same numbers also cover a build reopening the same files.
 //
 // 16 MiB of accumulated writes per open: this version targets files up to
 // 10 MB, and the extra headroom covers the untouched content a partial edit
@@ -355,6 +389,7 @@ func DefaultOptions() Options {
 		BufferLimit:     64 << 20,
 		BufferTotal:     256 << 20,
 		WriteLimit:      16 << 20,
+		ReadConcurrency: 4,
 		ChunkSize:       chunkSize,
 		AttrTimeout:     5 * time.Second,
 		EntryTimeout:    5 * time.Second,
@@ -367,13 +402,70 @@ func DefaultOptions() Options {
 	}
 }
 
-// readChunk is the ranged-read unit: the configured size, or the package
-// default for a Mount built without one.
-func (m *Mount) readChunk() int {
-	if m.opts.ChunkSize > 0 {
-		return m.opts.ChunkSize
+// readConcurrency is the data-path width: the configured number of extra
+// connections, or the package default for a Mount built without one.
+func (m *Mount) readConcurrency() int { return readConcurrency(m.opts) }
+
+func readConcurrency(opts Options) int {
+	if opts.ReadConcurrency > 0 {
+		return opts.ReadConcurrency
 	}
-	return chunkSize
+	return 4
+}
+
+// readChunk is the ranged-read unit: the configured size, adapted within the
+// protocol's range to the latency the mount is actually seeing.
+func (m *Mount) readChunk() int {
+	base := m.opts.ChunkSize
+	if base <= 0 {
+		base = chunkSize
+	}
+	if base > MaxChunkSize {
+		base = MaxChunkSize
+	}
+
+	// The average is only trusted once a few fills have been observed: adapting
+	// on the first slow read would double the unit for a single hiccup.
+	m.latencyMu.Lock()
+	latency, samples := m.latency, m.latencySamples
+	m.latencyMu.Unlock()
+	if samples < 3 {
+		return base
+	}
+	switch {
+	case latency >= 15*time.Millisecond:
+		// One round trip dominates: halve the number of them.
+		base *= 2
+		if base > MaxChunkSize {
+			base = MaxChunkSize
+		}
+	case latency <= 2*time.Millisecond:
+		// The link is local; a smaller unit gets a small read its first byte
+		// sooner and wastes less on every file tail.
+		if base > 256<<10 {
+			base /= 2
+		}
+	}
+	return base
+}
+
+// noteChunkLatency folds one fill's duration into the moving average readChunk
+// uses. The weight is one fifth, which is slow enough that one slow packet does
+// not resize every following read and fast enough to settle within a few units.
+func (m *Mount) noteChunkLatency(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	m.latencyMu.Lock()
+	defer m.latencyMu.Unlock()
+	if m.latencySamples == 0 {
+		m.latency = d
+	} else {
+		m.latency = (m.latency*4 + d) / 5
+	}
+	if m.latencySamples < 8 {
+		m.latencySamples++
+	}
 }
 
 // call returns the current caller, under the lock.

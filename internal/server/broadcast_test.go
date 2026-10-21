@@ -514,3 +514,45 @@ func TestARealTimeoutTerminatesTheSendsItBounds(t *testing.T) {
 			"boundaries are unknown, so it must be refused")
 	}
 }
+
+// A viewer that asks not to watch must not be added to the fan-out. The extra
+// connections a mount opens for parallel reads have no consumer for events:
+// registering them would make the server marshal and queue updates nobody reads.
+func TestAHelloThatAsksNotToWatchIsNotRegistered(t *testing.T) {
+	s := New("127.0.0.1:0")
+	t.Cleanup(func() { _ = s.Close() })
+	go func() { _ = s.Serve() }()
+
+	c, err := net.Dial("tcp", s.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	pc := proto.NewConn(c)
+
+	no := false
+	body, err := json.Marshal(proto.HelloBody{Role: proto.RoleViewer, Watch: &no})
+	if err != nil {
+		t.Fatalf("Marshal hello: %v", err)
+	}
+	if err := pc.Send(proto.Envelope{ID: 1, Kind: proto.KindHello, Body: body}); err != nil {
+		t.Fatalf("Send hello: %v", err)
+	}
+	if _, err := pc.Recv(); err != nil {
+		t.Fatalf("Recv hello reply: %v", err)
+	}
+
+	// The registration branch runs just after the reply, so watch the table for
+	// a moment: a test that returned on the first zero would not notice a
+	// registration that happened one scheduling step later.
+	deadline := time.Now().Add(50 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		n := len(s.watchers)
+		s.mu.Unlock()
+		if n != 0 {
+			t.Fatalf("a non-watching viewer was registered as a watcher")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -30,11 +31,13 @@ func cmdClient(args []string, stdout, stderr io.Writer) int {
 	var (
 		server    = fs.String("server", "", "server address to dial (host:port)")
 		shares    = shareList{}
+		excludes  = pathList{}
 		name      = fs.String("name", "", "client name (default: this host's name)")
 		aggregate = fs.Bool("aggregate", false, "ask to be the aggregating client")
 		cfgPath   = fs.String("config", "", "config file (default: the per-user config path)")
 	)
 	fs.Var(&shares, "share", "share a directory as NAME=PATH (repeatable)")
+	fs.Var(&excludes, "exclude", "do not scan or watch a path inside a share (repeatable)")
 	fs.Usage = func() {
 		fmt.Fprint(stderr, clientUsage)
 		fs.PrintDefaults()
@@ -93,6 +96,20 @@ func cmdClient(args []string, stdout, stderr io.Writer) int {
 	for _, s := range shares {
 		cfg.Shares[s.Name] = s.Path
 	}
+	// Exclude paths are stored absolute: the config outlives the directory the
+	// command happened to run in, and a relative entry would silently point
+	// somewhere else after a restart from another working directory.
+	for _, e := range excludes {
+		abs, err := filepath.Abs(e)
+		if err != nil {
+			fmt.Fprintf(stderr, "client: resolve exclude %q: %v\n", e, err)
+			return 1
+		}
+		abs = filepath.Clean(abs)
+		if !containsPath(cfg.Exclude, abs) {
+			cfg.Exclude = append(cfg.Exclude, abs)
+		}
+	}
 
 	clientName := cfg.ClientName
 	if clientName == "" {
@@ -121,7 +138,7 @@ func cmdClient(args []string, stdout, stderr io.Writer) int {
 	// mistake in the command that was just typed, and writing it to the config would
 	// make it permanent: the merge below is add-only, so every later run would fail
 	// on an entry the user cannot see how to remove.
-	sh, err := client.NewShares(shareArgs(cfg.Shares), nil)
+	sh, err := client.NewShares(shareArgs(cfg.Shares), cfg.Exclude)
 	if err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return 1
@@ -255,6 +272,30 @@ func (s *shareList) Set(v string) error {
 	}
 	*s = append(*s, shareArg{Name: name, Path: path})
 	return nil
+}
+
+// pathList collects repeated --exclude flags. Paths may contain commas and
+// spaces, so one flag carries one path rather than a comma-separated list.
+type pathList []string
+
+func (p *pathList) String() string { return strings.Join(*p, ",") }
+
+func (p *pathList) Set(v string) error {
+	if v == "" {
+		return fmt.Errorf("exclude needs a path")
+	}
+	*p = append(*p, v)
+	return nil
+}
+
+// containsPath reports whether paths already holds exactly p.
+func containsPath(paths []string, p string) bool {
+	for _, e := range paths {
+		if e == p {
+			return true
+		}
+	}
+	return false
 }
 
 // shareArgs renders a config's shares as the NAME=PATH form NewShares takes,

@@ -346,6 +346,42 @@ func TestFlushUploadsTheWholeFileIncludingUntouchedBytes(t *testing.T) {
 	}
 }
 
+// TestFsyncAsksForDurabilityAndFlushDoesNot pins the split: an ordinary close
+// publishes the file without forcing stable storage, while an explicit fsync
+// asks the owner for it. Getting this backwards either loses the fsync promise
+// or puts two barriers back in front of every file a build closes.
+func TestFsyncAsksForDurabilityAndFlushDoesNot(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addFile("/a.txt", 5)
+	f.setContent("/a.txt", []byte("hello"))
+
+	fh, _ := m.Open("/a.txt", OReadWrite)
+	if n := m.Write("/a.txt", []byte("HELLO"), 0, fh); n != 5 {
+		t.Fatalf("Write = %d", n)
+	}
+	if code := m.Flush("/a.txt", fh); code != 0 {
+		t.Fatalf("Flush = %d", code)
+	}
+	if n := m.Write("/a.txt", []byte("HELLO"), 0, fh); n != 5 {
+		t.Fatalf("second Write = %d", n)
+	}
+	if code := m.Fsync("/a.txt", false, fh); code != 0 {
+		t.Fatalf("Fsync = %d", code)
+	}
+
+	got := f.putDurabilityLog()
+	want := []bool{false, true}
+	if len(got) != len(want) {
+		t.Fatalf("Put durability log = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("Put %d durable = %v, want %v (log %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
 func TestFlushIsIdempotent(t *testing.T) {
 	m := newTestMount(t)
 	f := fakeOf(t, m)

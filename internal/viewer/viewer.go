@@ -57,9 +57,12 @@ type Event struct {
 }
 
 type Viewer struct {
-	conn net.Conn
-	pc   *proto.Conn
-	next uint64
+	// server is the address this viewer dialled, kept so a pool can open
+	// further read-only connections to the same server.
+	server string
+	conn   net.Conn
+	pc     *proto.Conn
+	next   uint64
 
 	// mu guards the fields below. It is taken around the fields and never across a
 	// read, because a reader that held it while waiting would stop the very
@@ -143,14 +146,14 @@ type Client struct {
 // replies to the hello with its name and aggregate ruling, and a viewer is not
 // registered, so it can observe but cannot publish.
 func Dial(serverAddr string) (*Viewer, error) {
-	return dial(serverAddr, "", "", dialTimeout)
+	return dial(serverAddr, "", "", dialTimeout, true)
 }
 
 // DialMount connects as a viewer that also tells the server where it is
 // mounted. That declaration is what makes the mount visible to other machines:
 // the server records it, and their `peerfold status` asks for the list.
 func DialMount(serverAddr, name, mountPoint string) (*Viewer, error) {
-	return dial(serverAddr, name, mountPoint, dialTimeout)
+	return dial(serverAddr, name, mountPoint, dialTimeout, true)
 }
 
 // DialTimeout is Dial with a caller-chosen bound on the dial and handshake.
@@ -158,30 +161,48 @@ func DialMount(serverAddr, name, mountPoint string) (*Viewer, error) {
 // `peerfold status` uses it: a server that is down should cost status a short
 // wait, not the ten seconds a deliberate dial is allowed.
 func DialTimeout(serverAddr string, timeout time.Duration) (*Viewer, error) {
-	return dial(serverAddr, "", "", timeout)
+	return dial(serverAddr, "", "", timeout, true)
 }
 
 // dial is the shared body of the constructors above.
-func dial(serverAddr, name, mountPoint string, timeout time.Duration) (*Viewer, error) {
+func dial(serverAddr, name, mountPoint string, timeout time.Duration, watch bool) (*Viewer, error) {
 	conn, err := net.DialTimeout("tcp", serverAddr, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("viewer: dial %s: %w", serverAddr, err)
 	}
-	v := &Viewer{conn: conn, pc: proto.NewConn(conn)}
-	if err := v.handshake(timeout, name, mountPoint); err != nil {
+	v := &Viewer{server: serverAddr, conn: conn, pc: proto.NewConn(conn)}
+	if err := v.handshake(timeout, name, mountPoint, watch); err != nil {
 		conn.Close()
 		return nil, err
 	}
 	return v, nil
 }
 
+// NewReadViewer opens another viewer connection to the same server, for work
+// that can run alongside this one.
+//
+// It does not register for pushed updates: the mount has exactly one watcher,
+// and a second stream of the same events would be delivered to a connection
+// that has no consumer for them. It also does not declare a mount point, so it
+// does not appear as a second mount in status.
+func (v *Viewer) NewReadViewer() (*Viewer, error) {
+	if v.server == "" {
+		return nil, errors.New("viewer: this connection was not opened by Dial, so it has no address to dial")
+	}
+	return dial(v.server, "", "", dialTimeout, false)
+}
+
 // handshake sends the hello and requires a hello_ok back.
-func (v *Viewer) handshake(timeout time.Duration, name, mountPoint string) error {
-	body, err := json.Marshal(proto.HelloBody{
+func (v *Viewer) handshake(timeout time.Duration, name, mountPoint string, watch bool) error {
+	hb := proto.HelloBody{
 		Role:       proto.RoleViewer,
 		Name:       name,
 		MountPoint: mountPoint,
-	})
+	}
+	if !watch {
+		hb.Watch = new(bool) // false: see HelloBody.Watching
+	}
+	body, err := json.Marshal(hb)
 	if err != nil {
 		return fmt.Errorf("viewer: encode hello: %w", err)
 	}
@@ -498,7 +519,21 @@ func (v *Viewer) Cat(path string) ([]byte, error) {
 // file far larger than memory is still one call. Nothing is buffered here: the
 // reader is drained straight into frames.
 func (v *Viewer) Put(path string, r io.Reader) error {
-	return v.put(path, r, proto.WriteModePut)
+	return v.put(path, r, proto.WriteModePut, proto.WriteDurabilityDurable)
+}
+
+// PutWithDurability is Put with a say in whether the owner syncs the file and
+// its directory before publishing the name.
+//
+// An ordinary close does not need that; an explicit fsync does. Keeping the
+// choice here rather than defaulting to the expensive answer is what lets a
+// build save thousands of small files without paying two stable-storage flushes
+// per file on the owner.
+func (v *Viewer) PutWithDurability(path string, r io.Reader, durable bool) error {
+	if durable {
+		return v.put(path, r, proto.WriteModePut, proto.WriteDurabilityDurable)
+	}
+	return v.put(path, r, proto.WriteModePut, proto.WriteDurabilityRelaxed)
 }
 
 // PutExclusive writes path only if nothing is already there, and refuses if
@@ -511,23 +546,23 @@ func (v *Viewer) Put(path string, r io.Reader) error {
 // and the write would not be one step, so a file created between them would be
 // overwritten anyway.
 func (v *Viewer) PutExclusive(path string, r io.Reader) error {
-	return v.put(path, r, proto.WriteModeCreate)
+	return v.put(path, r, proto.WriteModeCreate, proto.WriteDurabilityDurable)
 }
 
 // put takes the connection first and then sends the write, so the reader is
 // already out of the way when the answer starts arriving.
-func (v *Viewer) put(path string, r io.Reader, mode string) error {
-	return v.stream(func() error { return v.putBody(path, r, mode) })
+func (v *Viewer) put(path string, r io.Reader, mode, durability string) error {
+	return v.stream(func() error { return v.putBody(path, r, mode, durability) })
 }
 
 // putBody sends a whole-file write-back in the given mode, with the connection
 // in hand.
-func (v *Viewer) putBody(path string, r io.Reader, mode string) error {
+func (v *Viewer) putBody(path string, r io.Reader, mode, durability string) error {
 	client, rest, err := splitWritePath("write", path)
 	if err != nil {
 		return err
 	}
-	body, err := json.Marshal(proto.WriteBody{Client: client, Path: rest, Mode: mode})
+	body, err := json.Marshal(proto.WriteBody{Client: client, Path: rest, Mode: mode, Durability: durability})
 	if err != nil {
 		return fmt.Errorf("viewer: encode write: %w", err)
 	}

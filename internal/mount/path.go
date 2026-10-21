@@ -190,32 +190,25 @@ func (m *Mount) invalidateListings(path string) {
 	m.listingMu.Unlock()
 }
 
-// invalidateListingBatch applies a whole event batch's invalidation under one
-// lock hold.
+// applyListingEvents folds one event batch into the directory cache.
 //
-// changed lists paths whose own entry or parent membership changed. subtrees
-// lists deleted directories, each of which covers everything beneath it. One
-// scan of the cached listings with an ancestor walk replaces a per-node lock
-// acquisition and, for tombstones, a per-node scan of every cached directory.
-func (m *Mount) invalidateListingBatch(changed, subtrees []string) {
+// It patches the cached parent listing instead of discarding it. A build that
+// touches one file in a twenty-thousand-entry directory used to throw that
+// directory away and refetch and decode it on the next read; now the entry is
+// replaced in place, which is O(1) per changed name and leaves every untouched
+// entry serving lookups.
+//
+// Deletions are different: a tombstone for a directory makes its whole cached
+// subtree meaningless, so that subtree is dropped. The kernel is still told to
+// revalidate the paths separately; this is only the mount's own listing cache.
+func (m *Mount) applyListingEvents(changed []node.Node, subtrees []string) {
 	if len(changed) == 0 && len(subtrees) == 0 {
 		return
 	}
+	ttl := m.listingTTL()
+
 	m.listingMu.Lock()
 	defer m.listingMu.Unlock()
-
-	for _, p := range changed {
-		if p == "" {
-			continue
-		}
-		delete(m.listings, p)
-		if parent, _, err := SplitParent(p); err == nil {
-			delete(m.listings, parent)
-		}
-	}
-	if len(subtrees) == 0 {
-		return
-	}
 
 	deleted := make(map[string]struct{}, len(subtrees))
 	for _, p := range subtrees {
@@ -225,27 +218,72 @@ func (m *Mount) invalidateListingBatch(changed, subtrees []string) {
 		m.listings = map[string]dirCacheEntry{}
 		return
 	}
-	for key := range m.listings {
-		p := key
-		for {
-			if _, ok := deleted[p]; ok {
-				delete(m.listings, key)
-				break
-			}
-			if p == "" || p == "/" {
-				break
-			}
-			i := strings.LastIndexByte(p, '/')
-			if i < 0 {
-				break
-			}
-			p = p[:i]
+
+	for _, p := range subtrees {
+		m.dropListingSubtreeLocked(p)
+		m.removeListingChildLocked(p)
+	}
+	for _, n := range changed {
+		if n.Path == "" || n.Path == "/" {
+			continue
+		}
+		parent, base, err := SplitParent(n.Path)
+		if err != nil {
+			continue
+		}
+		e, ok := m.listings[parent]
+		if !ok || time.Since(e.fetched) >= ttl {
+			// Nothing fresh to patch. An expired entry keeps its age, so the next
+			// lookup still refetches the whole directory rather than trusting
+			// everything else in a stale list.
+			continue
+		}
+		m.upsertListingChildLocked(&e, base, n)
+		e.fetched = time.Now()
+		m.listings[parent] = e
+	}
+}
+
+// upsertListingChildLocked replaces or appends one entry in a cached listing.
+func (m *Mount) upsertListingChildLocked(e *dirCacheEntry, base string, n node.Node) {
+	e.byName[base] = n
+	for i := range e.children {
+		if e.children[i].Path == n.Path {
+			e.children[i] = n
+			return
 		}
 	}
-	// The parent of a removed name lists that name, so it is stale too.
-	for p := range deleted {
-		if parent, _, err := SplitParent(p); err == nil {
-			delete(m.listings, parent)
+	e.children = append(e.children, n)
+}
+
+// removeListingChildLocked removes one name from its parent's cached listing.
+func (m *Mount) removeListingChildLocked(p string) {
+	parent, base, err := SplitParent(p)
+	if err != nil {
+		return
+	}
+	e, ok := m.listings[parent]
+	if !ok {
+		return
+	}
+	delete(e.byName, base)
+	kept := e.children[:0]
+	for _, c := range e.children {
+		if c.Path != p {
+			kept = append(kept, c)
+		}
+	}
+	e.children = kept
+	e.fetched = time.Now()
+	m.listings[parent] = e
+}
+
+// dropListingSubtreeLocked forgets the cached listing of path and everything
+// beneath it.
+func (m *Mount) dropListingSubtreeLocked(path string) {
+	for key := range m.listings {
+		if key == path || strings.HasPrefix(key, path+"/") || path == "/" {
+			delete(m.listings, key)
 		}
 	}
 }

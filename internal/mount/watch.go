@@ -31,6 +31,7 @@ func (m *Mount) startWatch() {
 	exited := make(chan struct{})
 	m.watchDone = done
 	m.watchExited = exited
+	m.watchStopping = false
 	m.mu.Unlock()
 	go m.watchLoop(done, exited)
 }
@@ -54,6 +55,11 @@ func (m *Mount) stopWatch() {
 	exited := m.watchExited
 	m.watchDone = nil
 	m.watchExited = nil
+	// Set before done is closed. A loop that has already received a batch
+	// checks this under the same lock before merging it, so a batch queued
+	// before the stop cannot be applied while the reconnect is swapping the
+	// caller -- not merely after stopWatch returns.
+	m.watchStopping = true
 	m.mu.Unlock()
 	if done == nil {
 		return
@@ -146,6 +152,28 @@ func (m *Mount) watchLoop(done chan struct{}, exited chan struct{}) {
 func (m *Mount) applyEvent(b Batch) bool {
 	m.mu.Lock()
 
+	// A batch that arrives after the watch was stopped is dropped. The loop's
+	// own done check happens before application, so this is the second half:
+	// once stop has begun, no batch may move the tree, even one the loop had
+	// already received.
+	if m.watchStopping {
+		m.mu.Unlock()
+		return false
+	}
+
+	// The hook is nil in production, so the common path keeps the lock. When a
+	// test holds the loop here, the lock is released around it because the
+	// hook blocks while a test drives stopWatch.
+	if hook := m.beforeApply; hook != nil {
+		m.mu.Unlock()
+		hook()
+		m.mu.Lock()
+		if m.watchStopping {
+			m.mu.Unlock()
+			return false
+		}
+	}
+
 	// Seq == 0 means the sender does not number its events, which is not a gap.
 	//
 	// The first numbered batch is adopted rather than compared: a mount that has
@@ -179,7 +207,7 @@ func (m *Mount) applyEvent(b Batch) bool {
 	// Invalidation is collected and applied once, after the loop. Doing it per
 	// node took the listing lock once per path, and a tombstone scanned every
 	// cached listing; a batch from a build can carry hundreds of nodes.
-	var changed []string
+	var changed []node.Node
 	var removedSubtrees []string
 	for _, raw := range b.Nodes {
 		n := raw
@@ -206,7 +234,7 @@ func (m *Mount) applyEvent(b Batch) bool {
 			m.forgetSubtreeLocked(n.Path, notify)
 			removedSubtrees = append(removedSubtrees, n.Path)
 		} else {
-			changed = append(changed, n.Path)
+			changed = append(changed, n)
 		}
 		delete(m.pendingPaths, n.Path)
 		delete(m.pendingContent, n.Path)
@@ -227,9 +255,18 @@ func (m *Mount) applyEvent(b Batch) bool {
 	hook := m.invalidatePath
 	m.mu.Unlock()
 
-	m.invalidateListingBatch(changed, removedSubtrees)
+	m.applyListingEvents(changed, removedSubtrees)
+	for _, n := range changed {
+		m.cache.invalidate(n.Path)
+	}
+	for _, p := range removedSubtrees {
+		m.cache.invalidateTree(p)
+	}
 
 	if gap {
+		// A lost batch may have changed any file, and the named paths are only
+		// the ones that happened to arrive. No cached byte is trustworthy.
+		m.cache.clear()
 		// The gap case has no list of paths to work from: every path the kernel
 		// may be caching is suspect, and the named paths in this batch are only
 		// the ones that happened to survive.

@@ -123,6 +123,55 @@ func TestClientUnsetFlagsKeepTheConfig(t *testing.T) {
 	}
 }
 
+// TestClientRecordsExcludes pins that --exclude is persisted as an absolute
+// path: a relative entry would point somewhere else the next time the client
+// starts from a different directory, and an exclusion that quietly moves is
+// worse than none at all.
+func TestClientRecordsExcludes(t *testing.T) {
+	root := t.TempDir()
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	excluded := filepath.Join(root, "node_modules")
+
+	var out, errOut bytes.Buffer
+	code := runWithEmptyStdin([]string{
+		"client",
+		"--server", "127.0.0.1:1",
+		"--share", "Project=" + root,
+		"--exclude", excluded,
+		"--config", cfgPath,
+		"--name", "probe",
+	}, &out, &errOut)
+	if code == 0 {
+		t.Fatalf("runWithEmptyStdin(client to a dead port) = 0, want non-zero")
+	}
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Exclude) != 1 || cfg.Exclude[0] != excluded {
+		t.Errorf("Exclude = %v, want [%q]", cfg.Exclude, excluded)
+	}
+
+	// A later run that adds a second exclusion must keep the first.
+	second := filepath.Join(root, ".git")
+	if code := runWithEmptyStdin([]string{
+		"client",
+		"--share", "Project=" + root,
+		"--exclude", second,
+		"--config", cfgPath,
+	}, &out, &errOut); code == 0 {
+		t.Fatalf("second run = 0, want non-zero")
+	}
+	cfg, err = config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load after second run: %v", err)
+	}
+	if len(cfg.Exclude) != 2 {
+		t.Errorf("Exclude = %v, want both entries", cfg.Exclude)
+	}
+}
+
 func TestClientRejectsMalformedShare(t *testing.T) {
 	var out, errOut bytes.Buffer
 	if code := runWithEmptyStdin([]string{"client", "--share", "no-equals-sign", "--server", "127.0.0.1:1"}, &out, &errOut); code == 0 {

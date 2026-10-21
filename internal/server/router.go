@@ -71,10 +71,14 @@ type settled struct {
 
 // answerContent is the content half of an answer that carries it.
 type answerContent struct {
-	// body is the content with the peer's end marker stripped. It is nil for an
-	// empty answer, which is a zero-byte file as much as it is a failed read
-	// whose reason is in the control frame.
+	// body is one chunk of the content with the peer's end marker stripped. A
+	// read answer is delivered as a stream of these as they arrive, rather than
+	// being collected first: the requester can start writing the bytes to its
+	// own connection while the owner is still sending.
 	body []byte
+	// err, when set on the final item, says the content ended early or the
+	// owner's closing frame reported a failure. The channel is closed after it.
+	err error
 }
 
 // Router returns the request router for this server.
@@ -200,14 +204,51 @@ func (r *Router) complete(name string, env proto.Envelope, onEvent func(proto.En
 	delete(link.pending, env.ID)
 	r.mu.Unlock()
 
-	// The content is read here, on this goroutine, before anything is handed
-	// over. An answer that claims content has to be read off even when nobody
-	// wants it, or the next control frame would be parsed out of its middle.
-	//
-	// Every answer is read this way, whatever its kind: a data stream terminated
-	// by an end marker is the shape of an answer from a client, and the
-	// alternative — reading frames until something looks like a control frame —
-	// would make the frame count depend on the bytes inside a file.
+	if streaming {
+		// Wake the waiter with the head before the content has arrived. The
+		// requester writes that head on immediately, so its peer sees the start
+		// of the answer one content transfer sooner; the chunks follow through
+		// the channel as the owner produces them.
+		f.ch <- settled{env: env}
+
+		var streamErr error
+		for {
+			chunk, done, err := link.conn.RecvDataEvent(env.ID, handle)
+			if err != nil {
+				streamErr = err
+				break
+			}
+			if done {
+				break
+			}
+			if len(chunk) == 0 {
+				continue
+			}
+			f.content <- answerContent{body: chunk}
+		}
+		// The owner's closing frame is consumed here whatever happened to the
+		// content: frames are one sequence, so a part left unread becomes the
+		// next control frame on this connection.
+		tail, err := link.conn.RecvEvent(handle)
+		if err != nil {
+			if streamErr == nil {
+				streamErr = err
+			}
+		} else if tail.Err != "" && env.Err == "" {
+			streamErr = fmt.Errorf("%s", tail.Err)
+		}
+		if streamErr != nil && env.Err == "" {
+			f.content <- answerContent{err: streamErr}
+		}
+		close(f.content)
+		return true
+	}
+
+	// Anything that is not a read answer carries no content of its own: its
+	// stream is empty and is read off before the waiter is woken, so a write's
+	// answer is complete when it is handed over. An answer that claims content
+	// has to be read off even when nobody wants it, or the next control frame
+	// would be parsed out of its middle.
 	var body []byte
 	readErr := pumpStream(link.conn, env.ID, &body, handle)
 	if readErr != nil {
@@ -220,26 +261,14 @@ func (r *Router) complete(name string, env proto.Envelope, onEvent func(proto.En
 	// The owner's closing frame is read and discarded: the requester's own closing
 	// frame is written by the requester, from what is handed over here, so the
 	// contents of the owner's cannot reach anyone. What reading it does is keep
-	// the connection at a frame boundary — a part of an answer left unread becomes
-	// the next control frame, and the following request is then parsed out of this
-	// answer's middle.
+	// the connection at a frame boundary.
 	//
 	// RecvEvent, not Recv: this is the other place an update can land, and Recv
-	// would skip it into nothing. What is read here is the closing frame either
-	// way — the difference is only what happens to an event that arrives first.
+	// would skip it into nothing.
 	if _, err := link.conn.RecvEvent(handle); err != nil {
-		// The connection ended inside the answer. The answer is already complete
-		// and is handed over as such; there is nothing left to read next, so the
-		// serve loop will see the end of the connection on its own.
 		_ = err
 	}
-	// The control frame wakes the waiter only now, when the whole answer is in
-	// hand, so the waiter can put the head on the wire and then the content
-	// knowing nothing else is arriving behind it.
 	f.ch <- settled{env: env}
-	if streaming {
-		f.content <- answerContent{body: body}
-	}
 	return true
 }
 
@@ -351,7 +380,10 @@ func (r *Router) Send(ctx context.Context, client string, env proto.Envelope) (p
 		// the owner — so the answer's own stream is empty and read off in
 		// complete instead.
 		f.streaming = true
-		content = make(chan answerContent, 1)
+		// A read asks for at most one protocol frame's worth in practice, but
+		// the buffer means the owner's serve loop does not stop between chunks
+		// just because the requester's writer is a moment slow.
+		content = make(chan answerContent, 8)
 		f.content = content
 	}
 	link.pending[id] = f

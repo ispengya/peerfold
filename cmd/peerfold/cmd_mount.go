@@ -161,7 +161,8 @@ func runMount(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "mount: %v\n", err)
 		return 1
 	}
-	defer v.Close()
+	caller := mount.NewPooledViewerCaller(v, opts.ReadConcurrency)
+	defer caller.Close()
 
 	// The mount runs in the foreground with no other handle on it, so it
 	// records its pid and what it dialled before going into the FUSE loop.
@@ -189,12 +190,12 @@ func runMount(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return nil, err
 		}
-		return mount.NewViewerCaller(fresh), nil
+		return mount.NewPooledViewerCaller(fresh, opts.ReadConcurrency), nil
 	}
 
 	r := &mount.Runner{
 		Mount:     mountPoint,
-		Caller:    mount.NewViewerCaller(v),
+		Caller:    caller,
 		Opts:      opts,
 		Reconnect: reconnect,
 	}

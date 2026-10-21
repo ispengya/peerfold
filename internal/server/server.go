@@ -312,8 +312,10 @@ func (s *Server) handleConn(conn net.Conn) {
 		if err := s.replyHello(c, env.ID, hb.Name, false); err != nil {
 			return
 		}
-		unwatch := s.watch(c)
-		defer unwatch()
+		if hb.Watching() {
+			unwatch := s.watch(c)
+			defer unwatch()
+		}
 		s.serveLoop("", c, nil)
 		return
 	}
@@ -1062,7 +1064,6 @@ func (s *Server) replyRead(c *proto.Conn, env proto.Envelope) error {
 	case b.Off < 0:
 		fail = errors.New("bad read request: offset must not be negative")
 	default:
-		logging.Infof("server: read %s/%s off=%d n=%d", b.Client, b.Path, b.Off, b.N)
 		// The owner is asked over its connection, and this handler runs on the
 		// server's connection to the requester — not on the owner's serve loop —
 		// so the owner's loop is free to answer.
@@ -1078,10 +1079,11 @@ func (s *Server) replyRead(c *proto.Conn, env proto.Envelope) error {
 			fail = errors.New("the owner answered a read without announcing any content")
 		case reply.Err != "":
 			fail = errors.New(reply.Err)
-			// The owner's content is still on the way and is empty, so it is read
-			// off here rather than left on the wire. The router reads a whole
-			// answer before it hands it over, so this is already in the channel.
-			<-stream
+			// The owner's content is still on the way (empty for a failure),
+			// and the router is streaming it. Drain it here so the owner's
+			// serve loop is not left blocked on an unconsumed channel.
+			for range stream {
+			}
 		}
 	}
 	if fail != nil {
@@ -1098,27 +1100,68 @@ func (s *Server) replyRead(c *proto.Conn, env proto.Envelope) error {
 		return c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindReadOK})
 	}
 
-	// The content is already in hand — the router reads a whole answer before it
-	// hands it over, so the owner's connection is never read by two goroutines at
-	// once — and the reading failure, if there was one, is attached to the frame
-	// that is about to be sent.
-	content := <-stream
-	logging.Infof("server: read %s/%s off=%d n=%d bytes=%d took=%s",
-		b.Client, b.Path, b.Off, b.N, len(content.body), time.Since(started))
+	// The head is written before the content arrives. The router hands the
+	// head over as soon as the owner announces the answer, and the chunks then
+	// follow the channel the owner's serve loop is filling. That ordering is
+	// what removes the wait for a whole unit before the reader sees anything.
 	if err := c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindReadOK, Err: reply.Err}); err != nil {
+		// The requester cannot receive the head. The owner's stream still has
+		// to be consumed, or its serve loop blocks on the content channel.
+		go func() {
+			for range stream {
+			}
+		}()
 		return err
 	}
-	if len(content.body) > 0 {
-		// SendBody ends the stream with the marker itself.
-		if err := c.SendBody(env.ID, content.body); err != nil {
-			return err
+
+	var streamErr error
+	bytesSent := 0
+	sendFailed := false
+	for content := range stream {
+		if content.err != nil {
+			streamErr = content.err
+			continue
 		}
-		return c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindReadOK})
+		if len(content.body) == 0 {
+			continue
+		}
+		bytesSent += len(content.body)
+		if sendFailed {
+			// Keep draining after a write failure: the owner's serve loop is
+			// still producing, and abandoning the channel would block it.
+			continue
+		}
+		if err := c.SendData(env.ID, content.body); err != nil {
+			sendFailed = true
+			streamErr = err
+		}
 	}
-	if err := c.SendData(env.ID, nil); err != nil {
+	if !sendFailed {
+		// The end marker is separate from the chunks: each SendData is one
+		// chunk, and only a zero-byte SendData closes the stream.
+		if err := c.SendData(env.ID, nil); err != nil {
+			sendFailed = true
+			streamErr = err
+		}
+	}
+	tailErr := ""
+	if reply.Err == "" && streamErr != nil {
+		// The head already went out without an error, so a content failure has
+		// to travel in the closing frame. A viewer that only checked the head
+		// would accept a truncated file as a whole one.
+		tailErr = streamErr.Error()
+	}
+	if err := c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindReadOK, Err: tailErr}); err != nil {
 		return err
 	}
-	return c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindReadOK})
+	if took := time.Since(started); took > 100*time.Millisecond {
+		logging.Infof("server: read %s/%s off=%d n=%d bytes=%d took=%s",
+			b.Client, b.Path, b.Off, b.N, bytesSent, took)
+	}
+	if sendFailed {
+		return streamErr
+	}
+	return nil
 }
 
 // replyWrite forwards one write request to the client that owns the path and

@@ -189,6 +189,10 @@ func NewHost(caller Caller, opts Options) (*fuse.FileSystemHost, *Mount) {
 // translated rather than reinterpreted.
 type viewerCaller struct {
 	v *viewer.Viewer
+	// pool carries reads and writes over extra viewer connections. It is nil
+	// for a caller built on a single connection, which is what the tests and
+	// the small command-line viewers use.
+	pool *viewer.ConnPool
 
 	// watchOnce makes the translation start exactly once, so a second call to
 	// Watch returns the same channel instead of a second consumer racing the
@@ -197,23 +201,71 @@ type viewerCaller struct {
 	batches   chan Batch
 }
 
+// CloseableCaller is a Caller that owns the connections behind it.
+type CloseableCaller interface {
+	Caller
+	Close() error
+}
+
 // NewViewerCaller wraps a viewer so the mount can be built over a real
 // connection.
 func NewViewerCaller(v *viewer.Viewer) Caller { return &viewerCaller{v: v} }
 
-func (c *viewerCaller) List(path string) ([]node.Node, error) { return c.v.List(toIndexPath(path)) }
+// NewPooledViewerCaller wraps a viewer and opens up to readers extra
+// connections for reads and writes. The primary stays the only watcher, so one
+// update is not delivered to a connection nobody is listening on.
+func NewPooledViewerCaller(v *viewer.Viewer, readers int) CloseableCaller {
+	return &viewerCaller{v: v, pool: viewer.NewConnPool(v, readers)}
+}
+
+// Close releases the pool and the primary connection. It is safe to call after
+// a reconnect replaced this caller: the mount closes the caller it swapped out.
+func (c *viewerCaller) Close() error {
+	if c.pool != nil {
+		_ = c.pool.Close()
+	}
+	return c.v.Close()
+}
+
+func (c *viewerCaller) List(path string) ([]node.Node, error) {
+	if c.pool != nil {
+		return c.pool.List(toIndexPath(path))
+	}
+	return c.v.List(toIndexPath(path))
+}
 
 func (c *viewerCaller) Read(path string, off int64, n int) ([]byte, error) {
+	if c.pool != nil {
+		return c.pool.Read(toIndexPath(path), off, n)
+	}
 	return c.v.Read(toIndexPath(path), off, n)
 }
 
-func (c *viewerCaller) Put(path string, r io.Reader) error { return c.v.Put(toIndexPath(path), r) }
+func (c *viewerCaller) Put(path string, r io.Reader, durable bool) error {
+	if c.pool != nil {
+		return c.pool.Put(toIndexPath(path), r, durable)
+	}
+	return c.v.PutWithDurability(toIndexPath(path), r, durable)
+}
 
-func (c *viewerCaller) Mkdir(path string) error { return c.v.Mkdir(toIndexPath(path)) }
+func (c *viewerCaller) Mkdir(path string) error {
+	if c.pool != nil {
+		return c.pool.Mkdir(toIndexPath(path))
+	}
+	return c.v.Mkdir(toIndexPath(path))
+}
 
-func (c *viewerCaller) Remove(path string) error { return c.v.Remove(toIndexPath(path)) }
+func (c *viewerCaller) Remove(path string) error {
+	if c.pool != nil {
+		return c.pool.Remove(toIndexPath(path))
+	}
+	return c.v.Remove(toIndexPath(path))
+}
 
 func (c *viewerCaller) Rename(oldPath, newPath string) error {
+	if c.pool != nil {
+		return c.pool.Rename(toIndexPath(oldPath), toIndexPath(newPath))
+	}
 	return c.v.Rename(toIndexPath(oldPath), toIndexPath(newPath))
 }
 

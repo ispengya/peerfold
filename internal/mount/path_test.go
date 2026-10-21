@@ -694,3 +694,41 @@ func TestSplitParentNonRoot(t *testing.T) {
 		}
 	}
 }
+
+// An event patches the cached parent listing instead of throwing it away. A
+// large directory must not cost a whole List transfer because one file in it
+// changed.
+func TestAnEventPatchesTheCachedParentListing(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addFile("/d/a.txt", 1)
+	f.addFile("/d/b.txt", 1)
+	f.addFile("/d/c.txt", 1)
+
+	for _, p := range []string{"/d/a.txt", "/d/b.txt", "/d/c.txt"} {
+		if _, code := m.lookup(p); code != 0 {
+			t.Fatalf("lookup(%s) = %d", p, code)
+		}
+	}
+	before := f.countCalls("List /d")
+
+	m.applyEvent(Batch{Nodes: []node.Node{{Path: "d/a.txt", Kind: node.KindFile, Size: 9}}})
+	n, code := m.lookup("/d/a.txt")
+	if code != 0 || n.Size != 9 {
+		t.Fatalf("lookup after the update = %+v, %d; want size 9", n, code)
+	}
+	if got := f.countCalls("List /d"); got != before {
+		t.Errorf("the update refetched the directory: %d Lists, want %d", got, before)
+	}
+
+	m.applyEvent(Batch{Nodes: []node.Node{{Path: "d/b.txt", Kind: node.KindDeleted}}})
+	if _, code := m.lookup("/d/b.txt"); code != -ENOENT {
+		t.Errorf("lookup of the deleted path = %d, want -ENOENT", code)
+	}
+	if _, code := m.lookup("/d/c.txt"); code != 0 {
+		t.Errorf("an untouched sibling became missing: %d", code)
+	}
+	if got := f.countCalls("List /d"); got != before {
+		t.Errorf("the deletion refetched the directory: %d Lists, want %d", got, before)
+	}
+}

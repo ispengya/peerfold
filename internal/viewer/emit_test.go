@@ -174,7 +174,11 @@ func TestEmitAndCloseCannotMeetOnAClosedChannel(t *testing.T) {
 	// The other end is never read; closing this end is all the test needs.
 	conn, peer := net.Pipe()
 	defer peer.Close()
-	v := &Viewer{conn: conn, events: make(chan Event, 1<<20)}
+	// The channel is captured before Close can nil the Viewer's field. Ranging
+	// over v.events directly would make the test itself race with that write,
+	// which is a report about the test, not about emit.
+	events := make(chan Event, 1<<20)
+	v := &Viewer{conn: conn, events: events}
 
 	// The channel is oversized on purpose so that every publish reaches the send
 	// rather than being absorbed by the default arm; with the send taken every
@@ -182,7 +186,7 @@ func TestEmitAndCloseCannotMeetOnAClosedChannel(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for range v.events {
+		for range events {
 		}
 	}()
 

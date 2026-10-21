@@ -19,6 +19,13 @@ type Config struct {
 	Shares     map[string]string `json:"shares"`
 	Aggregate  bool              `json:"aggregate"`
 
+	// Exclude lists absolute paths whose subtrees are neither scanned nor
+	// watched. It is how a share that contains build output (node_modules,
+	// .git, dist) avoids paying to index tens of thousands of files nobody
+	// asked to see. Paths are matched by prefix, so excluding a directory
+	// excludes everything under it.
+	Exclude []string `json:"exclude"`
+
 	// MountPoint is where `peerfold mount` mounts when --mount is not given.
 	// Empty means "the platform's default", which is resolved at mount time
 	// rather than stored: the default is under the user's home directory, and

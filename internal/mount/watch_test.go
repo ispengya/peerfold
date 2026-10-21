@@ -2,6 +2,7 @@ package mount
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -557,50 +558,78 @@ func TestStartWatchIsIdempotent(t *testing.T) {
 // stopWatch must stop the loop. Without it, a reconnect would accumulate
 // goroutines that all apply events to the same mount.
 //
-// The contract is about batches that were already queued, not about batches
-// emitted afterwards. The interesting case -- and the one that was wrong -- is a
-// loop that has already received a batch, or is about to, when the stop arrives:
-// its select then has two ready cases, and Go picks one at random. The first
-// event is used as a barrier, to prove the loop is running and parked;
-// the rest are queued immediately before the stop, while the test's own goroutine
-// is still running and the loop has had no chance to schedule. So the stop
-// happens with a non-empty channel, which is exactly the situation the re-check in
-// watchLoop exists for.
+// The interesting case -- and the one that was wrong -- is a loop that has
+// already received a batch when the stop arrives: its select then has two ready
+// cases, and Go picks one at random. The test holds the loop inside applyEvent
+// with the beforeApply hook, so the batch really is in hand, then queues more
+// behind it and starts the stop before letting it continue. Without the stop
+// check inside applyEvent, all of those batches would be merged.
 //
-// Emitting after stopWatch returns would not reach that case at all: the channel
-// is empty at the moment done closes, so the loop has only one ready case and
-// leaves either way. That version of this test passed against a mutant with the
-// re-check deleted, which is why the events are queued up front.
+// The hook is what makes this deterministic. Emitting and then calling
+// stopWatch and hoping the loop has not scheduled was a race that a multi-core
+// runner wins in the wrong direction: the loop can consume every batch before
+// the test reaches stopWatch, which is legal but not the case under test.
 func TestStopWatchStopsApplyingEvents(t *testing.T) {
 	m := newTestMount(t)
 	f := fakeOf(t, m)
 	f.watchForTest()
 	m.startWatch()
 
-	// Barrier: prove the loop is up and consuming, so the stop below is not
-	// racing the goroutine's own startup.
+	// Barrier: prove the loop is up and consuming, so the hook below is
+	// installed while the loop is parked rather than during startup.
 	f.emit(1000, node.Node{Path: "/barrier.txt", Kind: node.KindFile, Size: 1})
 	waitFor(t, 2*time.Second, func() bool {
 		_, code := m.lookup("/barrier.txt")
 		return code == 0
 	}, "the loop did not start consuming")
 
-	// Queue these without yielding, then stop. They are the batches the loop must
-	// not apply.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	m.mu.Lock()
+	m.beforeApply = func() {
+		once.Do(func() { close(entered) })
+		<-release
+	}
+	m.mu.Unlock()
+
+	// The first late batch is received by the loop and held at the hook.
+	f.emit(1, node.Node{Path: "/late-1.txt", Kind: node.KindFile, Size: 1})
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the watch loop did not reach applyEvent")
+	}
+
+	// Queue the rest behind it, then begin the stop before releasing the loop.
 	const late = 8
-	for i := 1; i <= late; i++ {
+	for i := 2; i <= late; i++ {
 		f.emit(uint64(i), node.Node{
 			Path: fmt.Sprintf("/late-%d.txt", i),
 			Kind: node.KindFile,
 			Size: 1,
 		})
 	}
-	m.stopWatch()
+	stopped := make(chan struct{})
+	go func() {
+		m.stopWatch()
+		close(stopped)
+	}()
+	waitFor(t, 2*time.Second, func() bool {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return m.watchStopping
+	}, "stopWatch did not begin")
 
-	time.Sleep(50 * time.Millisecond)
+	close(release)
+	<-stopped
+	m.mu.Lock()
+	m.beforeApply = nil
+	m.mu.Unlock()
+
 	for i := 1; i <= late; i++ {
 		if _, code := m.lookup(fmt.Sprintf("/late-%d.txt", i)); code == 0 {
-			t.Errorf("event %d was applied after stopWatch", i)
+			t.Errorf("event %d was applied after stopWatch began", i)
 		}
 	}
 }

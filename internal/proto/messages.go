@@ -95,6 +95,19 @@ type HelloBody struct {
 	// viewer a command like `peerfold ls` opens, and an ordinary viewer leaves
 	// it empty. Older servers ignore it, which is why it is omitempty.
 	MountPoint string `json:"mount_point,omitempty"`
+
+	// Watch asks to be registered for pushed updates. It is nil for every
+	// existing peer, which means true: a viewer has always watched. Only a
+	// connection opened purely to carry parallel reads sets it to false, so the
+	// server does not build and send event batches to a peer that never reads
+	// them.
+	Watch *bool `json:"watch,omitempty"`
+}
+
+// Watching reports whether the hello asked to receive pushed updates. The
+// absent field means yes, so an older viewer keeps working unchanged.
+func (h HelloBody) Watching() bool {
+	return h.Watch == nil || *h.Watch
 }
 
 // HelloOKBody answers a hello. Aggregate reports the server's ruling: a second
@@ -168,7 +181,19 @@ type WriteBody struct {
 	Client string `json:"client"`
 	Path   string `json:"path"`
 	Mode   string `json:"mode"`
+	// Durability says whether the owner must flush the bytes to stable storage
+	// before publishing the name. The zero value means "durable", which keeps
+	// the promise an older viewer relied on; a newer viewer sends "relaxed" for
+	// an ordinary close and "durable" only when the caller asked for fsync.
+	// An owner that does not know the field ignores it and keeps syncing.
+	Durability string `json:"durability,omitempty"`
 }
+
+// Write durability values. Empty means the legacy behaviour, which is durable.
+const (
+	WriteDurabilityDurable = "durable"
+	WriteDurabilityRelaxed = "relaxed"
+)
 
 // MkdirBody asks the owning client to create a directory.
 type MkdirBody struct {

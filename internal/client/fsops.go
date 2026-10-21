@@ -144,7 +144,8 @@ const tempSuffix = ".peerfold.tmp"
 // not interchangeable:
 //
 //  1. write the whole reader to the temporary file,
-//  2. Sync — after this the bytes are on the medium, not merely in a buffer,
+//  2. Sync when the caller asked for durability — after this the bytes are on
+//     the medium, not merely in a buffer,
 //  3. close it,
 //  4. rename it onto the target.
 //
@@ -152,6 +153,11 @@ const tempSuffix = ".peerfold.tmp"
 // the old file or the whole new one. That is what makes "a successful return
 // means the file is saved" true, and what keeps a failure from truncating the
 // file that was already there: up to step 4 the target has not been touched.
+//
+// Without durability the bytes may still be in the page cache when the rename
+// lands; a crash can then leave the new name pointing at a file whose content is
+// incomplete. That is the trade an ordinary close makes, and an explicit fsync
+// is what buys it back.
 //
 // A partial file at the real path would be worse than no write at all, because
 // every later reader would take it for the whole file.
@@ -162,7 +168,7 @@ func (f *FS) WriteAll(share, rel string, r io.Reader) (int64, error) {
 		n = written
 		return err
 	}
-	return n, f.replaceAtomically(share, rel, sink, nil)
+	return n, f.replaceAtomically(share, rel, sink, nil, true)
 }
 
 // replaceAtomically writes the file at rel by whatever sink does, through a
@@ -182,7 +188,7 @@ func (f *FS) WriteAll(share, rel string, r io.Reader) (int64, error) {
 // and asked afterwards would have already published a truncated file — and would
 // then have to delete it, which is not the same operation at all: deleting can
 // fail, and what it deletes may be something else by then.
-func (f *FS) replaceAtomically(share, rel string, sink func(io.Writer) error, verify func() error) error {
+func (f *FS) replaceAtomically(share, rel string, sink func(io.Writer) error, verify func() error, durable bool) error {
 	full, err := f.LocalPath(share, rel)
 	if err != nil {
 		return err
@@ -208,12 +214,17 @@ func (f *FS) replaceAtomically(share, rel string, sink func(io.Writer) error, ve
 			return fmt.Errorf("client: writing %q: %w", rel, err)
 		}
 	}
-	// Sync before the rename: a rename that lands while the bytes are still in
-	// a buffer would report success for a file that is not yet on the medium.
-	if err := fh.Sync(); err != nil {
-		_ = fh.Close()
-		_ = os.Remove(tmp)
-		return fmt.Errorf("client: syncing %q: %w", rel, err)
+	// Sync before the rename when durability was asked for: a rename that lands
+	// while the bytes are still in a buffer would report a save that a power
+	// loss can turn into a truncated file. An ordinary close does not ask for
+	// it, and skipping two barriers per file is what makes a build of thousands
+	// of small files bearable on Windows.
+	if durable {
+		if err := fh.Sync(); err != nil {
+			_ = fh.Close()
+			_ = os.Remove(tmp)
+			return fmt.Errorf("client: syncing %q: %w", rel, err)
+		}
 	}
 	if err := fh.Close(); err != nil {
 		_ = os.Remove(tmp)
@@ -223,7 +234,9 @@ func (f *FS) replaceAtomically(share, rel string, sink func(io.Writer) error, ve
 		_ = os.Remove(tmp)
 		return fmt.Errorf("client: replacing %q: %w", rel, err)
 	}
-	f.syncDir(filepath.Dir(full))
+	if durable {
+		f.syncDir(filepath.Dir(full))
+	}
 	return nil
 }
 
@@ -270,8 +283,9 @@ func (f *FS) Create(share, rel string) error {
 //
 // The name is taken exclusively first, so an existing file is refused before a
 // single byte is written. If the write then fails the half-made file is removed:
-// leaving it would present a truncated file as a complete one.
-func (f *FS) CreateFrom(share, rel string, sink func(io.Writer) error) error {
+// leaving it would present a truncated file as a complete one. durable asks for
+// the same stable-storage flush WriteAll's replaceAtomically does.
+func (f *FS) CreateFrom(share, rel string, sink func(io.Writer) error, durable bool) error {
 	full, err := f.LocalPath(share, rel)
 	if err != nil {
 		return err
@@ -285,10 +299,12 @@ func (f *FS) CreateFrom(share, rel string, sink func(io.Writer) error) error {
 		_ = os.Remove(full)
 		return fmt.Errorf("client: creating %q: %w", rel, err)
 	}
-	if err := fh.Sync(); err != nil {
-		_ = fh.Close()
-		_ = os.Remove(full)
-		return fmt.Errorf("client: syncing %q: %w", rel, err)
+	if durable {
+		if err := fh.Sync(); err != nil {
+			_ = fh.Close()
+			_ = os.Remove(full)
+			return fmt.Errorf("client: syncing %q: %w", rel, err)
+		}
 	}
 	if err := fh.Close(); err != nil {
 		_ = os.Remove(full)

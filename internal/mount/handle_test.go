@@ -287,10 +287,10 @@ func TestWriteLimitIsCapturedAtOpenTime(t *testing.T) {
 	}
 }
 
-// closeHandle must release the handle's cached chunks as well as its table
-// entry, or a long session opening and closing files would keep paying for
-// chunks nothing can read any more.
-func TestCloseHandleReleasesItsCache(t *testing.T) {
+// A close must release the handle but keep the file's chunks: a build that
+// reopens the same package file should not pay for it again. The global LRU is
+// what bounds the memory; the close is not the place to evict.
+func TestCloseHandleKeepsItsFileCached(t *testing.T) {
 	m := newTestMount(t)
 	fh := m.newHandleForTest("/f", node.KindFile)
 	m.cache.put(fh, 0, []byte("cached"))
@@ -300,8 +300,13 @@ func TestCloseHandleReleasesItsCache(t *testing.T) {
 
 	m.closeHandle(fh)
 
-	if got := m.cache.total(); got != 0 {
-		t.Errorf("cache total = %d after closing the only handle, want 0", got)
+	if got := m.cache.total(); got != len("cached") {
+		t.Errorf("cache total = %d after closing the only handle, want the chunk kept", got)
+	}
+	again := m.newHandleForTest("/f", node.KindFile)
+	got, ok := m.cache.get(again, 0)
+	if !ok || string(got) != "cached" {
+		t.Errorf("a new handle on the same path = %q, %v; want the cached chunk", got, ok)
 	}
 }
 

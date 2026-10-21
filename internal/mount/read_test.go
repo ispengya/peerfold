@@ -1,8 +1,11 @@
 package mount
 
 import (
+	"bytes"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/ispengya/peerfold/internal/node"
 )
@@ -662,5 +665,136 @@ func TestOpenRecordsTheKind(t *testing.T) {
 	dir, _ := m.handle(dh)
 	if dir.kind != node.KindDir {
 		t.Errorf("the directory handle records kind %v, want KindDir", dir.kind)
+	}
+}
+
+// Concurrent misses of one unit must produce one wire read, not one per caller.
+// The old global fill lock achieved that by serialising every file; the point
+// of keyed in-flight fills is to keep the collapse without the queue.
+func TestConcurrentReadsOfOneChunkFillOnce(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	body := bytes.Repeat([]byte("a"), chunkSize)
+	f.addContent("/a.bin", body)
+	f.setReadDelay(30 * time.Millisecond)
+
+	fh, code := m.Open("/a.bin", OReadOnly)
+	if code != 0 {
+		t.Fatalf("Open = %d", code)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, 64)
+			if n := m.Read("/a.bin", buf, 0, fh); n != len(buf) {
+				t.Errorf("Read = %d, want %d", n, len(buf))
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := f.readCount(); got != 1 {
+		t.Errorf("wire reads = %d, want 1: concurrent readers of one chunk did not share the fill", got)
+	}
+}
+
+// A chunk belongs to the file, not to the open. Closing and reopening the same
+// file must reuse it.
+func TestAClosedAndReopenedFileReusesItsChunks(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addContent("/a.txt", []byte("hello"))
+
+	fh, _ := m.Open("/a.txt", OReadOnly)
+	buf := make([]byte, 5)
+	if n := m.Read("/a.txt", buf, 0, fh); n != 5 {
+		t.Fatalf("first Read = %d", n)
+	}
+	if code := m.Release("/a.txt", fh); code != 0 {
+		t.Fatalf("Release = %d", code)
+	}
+	first := f.readCount()
+
+	fh2, _ := m.Open("/a.txt", OReadOnly)
+	if n := m.Read("/a.txt", buf, 0, fh2); n != 5 {
+		t.Fatalf("second Read = %d", n)
+	}
+	if got := f.readCount(); got != first {
+		t.Errorf("wire reads = %d after reopening, want still %d", got, first)
+	}
+}
+
+// An event that changes a file must invalidate its cached chunks, including
+// those fetched through a handle that is still open.
+func TestAnEventInvalidatesCachedChunksForOpenHandles(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addContent("/a.txt", []byte("old"))
+
+	fh, _ := m.Open("/a.txt", OReadOnly)
+	buf := make([]byte, 3)
+	if n := m.Read("/a.txt", buf, 0, fh); n != 3 || string(buf) != "old" {
+		t.Fatalf("first Read = %q (%d)", buf[:n], n)
+	}
+
+	f.setContent("/a.txt", []byte("new"))
+	m.applyEvent(Batch{Nodes: []node.Node{{Path: "/a.txt", Kind: node.KindFile, Size: 3}}})
+
+	if n := m.Read("/a.txt", buf, 0, fh); n != 3 || string(buf) != "new" {
+		t.Errorf("after the event = %q (%d), want %q", buf[:n], n, "new")
+	}
+}
+
+// A sequential miss starts filling the units after it.
+func TestASequentialMissPrefetchesAhead(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addContent("/big.bin", bytes.Repeat([]byte("x"), chunkSize*4))
+
+	fh, _ := m.Open("/big.bin", OReadOnly)
+	buf := make([]byte, 8)
+	if n := m.Read("/big.bin", buf, 0, fh); n != 8 {
+		t.Fatalf("first Read = %d", n)
+	}
+	if n := m.Read("/big.bin", buf, chunkSize, fh); n != 8 {
+		t.Fatalf("second Read = %d", n)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := m.cache.getAt(fh, chunkSize, 2); ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the unit after a sequential read was never prefetched")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// The read unit adapts to the measured fill latency: high latency wants fewer,
+// larger round trips, a local link wants smaller units. It must stay inside the
+// protocol's ceiling.
+func TestReadUnitAdaptsToMeasuredLatency(t *testing.T) {
+	m := newTestMount(t)
+	if got := m.readChunk(); got != chunkSize {
+		t.Fatalf("cold read unit = %d, want the configured %d", got, chunkSize)
+	}
+
+	for i := 0; i < 4; i++ {
+		m.noteChunkLatency(20 * time.Millisecond)
+	}
+	if got := m.readChunk(); got != MaxChunkSize {
+		t.Errorf("read unit at 20 ms = %d, want %d", got, MaxChunkSize)
+	}
+
+	for i := 0; i < 40; i++ {
+		m.noteChunkLatency(time.Millisecond)
+	}
+	if got := m.readChunk(); got != 256<<10 {
+		t.Errorf("read unit on a local link = %d, want %d", got, 256<<10)
 	}
 }

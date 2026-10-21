@@ -368,3 +368,73 @@ func TestServerReadOwnerLeavingMidAnswerIsNotSilent(t *testing.T) {
 		t.Fatal("the server never answered a read whose owner left mid-answer")
 	}
 }
+
+// The head must reach the requester before the owner's content does. Buffering
+// the whole answer first would still deliver the right bytes, so only a test
+// that holds the content back can tell the two designs apart.
+func TestReadHeadIsForwardedBeforeTheContent(t *testing.T) {
+	_, addr := start(t)
+	owner, _ := hello(t, addr, "win", "client", false)
+	defer owner.Close()
+	oc := proto.NewConn(owner)
+
+	release := make(chan struct{})
+	go func() {
+		env, err := oc.Recv()
+		if err != nil || env.Kind != proto.KindRead {
+			return
+		}
+		head := proto.Envelope{ID: env.ID, Kind: proto.KindReadOK}
+		if err := oc.Send(head); err != nil {
+			return
+		}
+		// The head is on the wire; the content deliberately waits until the
+		// requester has been observed receiving it.
+		<-release
+		_ = oc.SendBody(env.ID, []byte("payload"))
+		_ = oc.Send(head)
+	}()
+
+	viewer, _ := hello(t, addr, "me", "viewer", false)
+	defer viewer.Close()
+	vc := proto.NewConn(viewer)
+
+	body, err := json.Marshal(proto.ReadBody{Client: "win", Path: "Documents/a.txt", Off: 0, N: -1})
+	if err != nil {
+		t.Fatalf("Marshal ReadBody: %v", err)
+	}
+	if err := vc.Send(proto.Envelope{ID: 1, Kind: proto.KindRead, Body: body}); err != nil {
+		t.Fatalf("Send read: %v", err)
+	}
+
+	_ = viewer.SetReadDeadline(time.Now().Add(2 * time.Second))
+	head, err := vc.Recv()
+	if err != nil {
+		close(release)
+		t.Fatalf("the head did not arrive while the content was held: %v", err)
+	}
+	if head.Err != "" {
+		close(release)
+		t.Fatalf("head error = %q", head.Err)
+	}
+	close(release)
+
+	var got []byte
+	for {
+		chunk, done, err := vc.RecvData(1)
+		if err != nil {
+			t.Fatalf("content: %v", err)
+		}
+		if done {
+			break
+		}
+		got = append(got, chunk...)
+	}
+	if string(got) != "payload" {
+		t.Errorf("content = %q, want %q", got, "payload")
+	}
+	if _, err := vc.Recv(); err != nil {
+		t.Fatalf("closing frame: %v", err)
+	}
+	_ = viewer.SetReadDeadline(time.Time{})
+}

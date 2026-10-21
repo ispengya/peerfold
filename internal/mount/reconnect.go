@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"io"
 	"log"
 	"time"
 )
@@ -175,6 +176,7 @@ func (m *Mount) adopt(c Caller) {
 	m.stopWatch()
 
 	m.mu.Lock()
+	old := m.caller
 	m.caller = c
 	m.isDisconnected = false
 	// The new connection has thrown away everything the old one told us. The
@@ -186,7 +188,16 @@ func (m *Mount) adopt(c Caller) {
 	m.lastSeq = 0
 	m.mu.Unlock()
 
+	// The old connection is finished: its watch loop has been stopped, and the
+	// caller has been replaced. Closing it releases the socket, and for a pooled
+	// caller the extra read connections as well; leaving them open would leak a
+	// connection per reconnect on both ends.
+	if closer, ok := old.(io.Closer); ok {
+		_ = closer.Close()
+	}
+
 	m.clearListings()
+	m.cache.clear()
 	m.discardDirtyOnDisconnect()
 	m.invalidateAll()
 	m.startWatch()
@@ -218,7 +229,7 @@ func (m *Mount) discardDirtyOnDisconnect() {
 				buf[i] = 0
 			}
 			delete(m.files, h.fh)
-			m.cache.dropOpenLocked(h.fh)
+			m.cache.unbindLocked(h.fh)
 		}
 	}
 	hook := m.onDiscard

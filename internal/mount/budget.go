@@ -2,6 +2,8 @@ package mount
 
 import (
 	"container/list"
+	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -20,19 +22,31 @@ const chunkSize = 512 << 10
 // entry and delays the first byte of a small read.
 const MaxChunkSize = 1 << 20
 
+// chunkKey identifies one cached chunk by the file it belongs to, the
+// generation of that file's content, and the chunk index.
+//
+// The generation is what makes invalidation cheap and safe. A cache fill can be
+// in flight when an event says the file changed; the fill completes afterwards
+// and must not publish the old bytes under the new state. Bumping the
+// generation makes every in-flight fill for that path unwritable, without
+// waiting for it.
 type chunkKey struct {
-	fh    uint64
+	path  string
+	gen   uint64
+	unit  int
 	chunk int64
 }
 
-// chunkCache holds read chunks for every open file under two limits: a per-open
+// chunkCache holds read chunks for every open file under two limits: a per-file
 // cap so one large file cannot crowd out the others, and a global cap so the
 // process's memory is actually bounded.
 //
-// The first design had only the per-open cap and described it as bounding
-// everything, which is true for one open and false for N. With N opens each
-// respecting 64 MiB, the process holds N x 64 MiB, and the CLI would have had a
-// knob that bounded nothing in the case that matters.
+// Entries are keyed by path rather than by handle. A file that is closed and
+// reopened, or read through two handles at once, reuses the chunks already
+// fetched; that is the difference between a build that reads the same
+// node_modules package once per worker and one that pays a round trip each
+// time. A change to the file invalidates the path, and a reconnect clears the
+// whole cache because events may have been missed.
 //
 // Both limits are enforced by eviction, so a limit is a ceiling that is never
 // exceeded rather than a budget that is refused. The alternative — refusing to
@@ -41,23 +55,32 @@ type chunkKey struct {
 // global cap, which is not cached at all because caching it would evict
 // everything else and still not fit.
 //
-// The eviction order is one LRU list across all handles. Evicting the globally
+// The eviction order is one LRU list across all files. Evicting the globally
 // oldest chunk is what makes the global cap a bound on the process rather than
-// a bound per handle, and it means a handle that is idle loses its chunks to
-// one that is active, which is the behaviour a cache should have.
+// a bound per file, and it means an idle file loses its chunks to an active
+// one, which is the behaviour a cache should have.
 type chunkCache struct {
 	perOpen int
 	global  int
-	// bytes is the cached byte count per handle. A handle with nothing cached
-	// is absent rather than present-and-zero, so the map does not accumulate
-	// entries for every handle that was ever opened.
-	bytes map[uint64]int
+	// bytes is the cached byte count per path. A path with nothing cached is
+	// absent rather than present-and-zero, so the map does not accumulate an
+	// entry for every file that was ever opened.
+	bytes map[string]int
 	items map[chunkKey][]byte
 	// order is the eviction queue, most recently used at the back.
 	order *list.List
 	// index locates a key in order, so a hit can move it to the back without
 	// scanning the list.
 	index map[chunkKey]*list.Element
+	// byPath locates the chunks of one path, so invalidation removes exactly
+	// those entries rather than scanning the whole cache per event.
+	byPath map[string]map[chunkKey]struct{}
+	// fhPath maps an open handle to the path it reads. It is the bridge between
+	// the handle-keyed read path and the path-keyed cache.
+	fhPath map[uint64]string
+	// gen is the current content generation of each path. It is bumped by
+	// invalidation; a chunk stored under an older generation is never read.
+	gen map[string]uint64
 
 	// mu guards everything above.
 	//
@@ -78,11 +101,71 @@ func newChunkCache(perOpen, global int) *chunkCache {
 	return &chunkCache{
 		perOpen: perOpen,
 		global:  global,
-		bytes:   map[uint64]int{},
+		bytes:   map[string]int{},
 		items:   map[chunkKey][]byte{},
 		order:   list.New(),
 		index:   map[chunkKey]*list.Element{},
+		byPath:  map[string]map[chunkKey]struct{}{},
+		fhPath:  map[uint64]string{},
+		gen:     map[string]uint64{},
 	}
+}
+
+// syntheticPath is the cache path used by a test that puts chunks under a bare
+// handle number. It is distinct from every real path, which starts with "/".
+func syntheticPath(fh uint64) string {
+	return "\x00fh/" + strconv.FormatUint(fh, 10)
+}
+
+// bind records which file an open handle reads. The path's generation starts at
+// one the first time it is seen.
+func (c *chunkCache) bind(fh uint64, path string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.bindLocked(fh, path)
+}
+
+func (c *chunkCache) bindLocked(fh uint64, path string) {
+	c.fhPath[fh] = path
+	if _, ok := c.gen[path]; !ok {
+		c.gen[path] = 1
+	}
+}
+
+// unbind forgets a closed handle without discarding the file's chunks. The
+// chunks stay available to the next open of the same path.
+func (c *chunkCache) unbind(fh uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.unbindLocked(fh)
+}
+
+func (c *chunkCache) unbindLocked(fh uint64) { delete(c.fhPath, fh) }
+
+// generation returns the current content generation for a handle's path, or 0
+// when the handle is not bound. A fill remembers this value and stores its
+// bytes with putAt, so a change during the fill cannot be overwritten.
+func (c *chunkCache) generation(fh uint64) uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	path, ok := c.fhPath[fh]
+	if !ok {
+		return 0
+	}
+	return c.gen[path]
+}
+
+// key returns the cache key a handle's chunk would use right now. It is how a
+// fill captures the generation it is about to read, and how prefetch names the
+// chunk it is filling.
+func (c *chunkCache) key(fh uint64, unit int, chunk int64) (chunkKey, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	path, ok := c.fhPath[fh]
+	if !ok {
+		return chunkKey{}, false
+	}
+	return chunkKey{path: path, gen: c.gen[path], unit: unit, chunk: chunk}, true
 }
 
 // get returns a cached chunk and marks it recently used.
@@ -94,9 +177,20 @@ func newChunkCache(perOpen, global int) *chunkCache {
 // released before the caller touches those bytes, which is sound precisely
 // because no one ever mutates them.
 func (c *chunkCache) get(fh uint64, chunk int64) ([]byte, bool) {
+	return c.getAt(fh, 0, chunk)
+}
+
+// getAt is get for a specific read unit. The unit is part of the key because a
+// chunk index means a different byte range at a different unit; sharing the key
+// across units would return the wrong bytes, not merely a stale cache hit.
+func (c *chunkCache) getAt(fh uint64, unit int, chunk int64) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	k := chunkKey{fh, chunk}
+	path, ok := c.fhPath[fh]
+	if !ok {
+		return nil, false
+	}
+	k := chunkKey{path: path, gen: c.gen[path], unit: unit, chunk: chunk}
 	data, ok := c.items[k]
 	if !ok {
 		return nil, false
@@ -107,36 +201,64 @@ func (c *chunkCache) get(fh uint64, chunk int64) ([]byte, bool) {
 	return data, true
 }
 
-// put caches one chunk. The data is stored as given and must not be modified
-// afterwards by the caller; the read path allocates each chunk for this purpose.
+// put caches one chunk at the path's current generation. It is the convenience
+// form used by tests and by callers that were not in flight across a change.
+func (c *chunkCache) put(fh uint64, chunk int64, data []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	path, ok := c.fhPath[fh]
+	if !ok {
+		path = syntheticPath(fh)
+		c.bindLocked(fh, path)
+	}
+	c.putLocked(chunkKey{path: path, gen: c.gen[path], chunk: chunk}, data)
+}
+
+// putAt caches a chunk that was fetched at generation gen. A fill that raced an
+// invalidation is discarded: its bytes describe the file as it was, and the
+// next read must go back to the owner.
+func (c *chunkCache) putAt(fh uint64, gen uint64, unit int, chunk int64, data []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	path, ok := c.fhPath[fh]
+	if !ok || gen == 0 || c.gen[path] != gen {
+		return
+	}
+	c.putLocked(chunkKey{path: path, gen: gen, unit: unit, chunk: chunk}, data)
+}
+
+// putLocked stores one chunk. The data is stored as given and must not be
+// modified afterwards by the caller; the read path allocates each chunk for
+// this purpose.
 //
 // A put for a key already present is ignored rather than replacing the stored
 // bytes. A chunk's content is immutable, so a second put for the same key is the
 // same bytes, and replacing would throw away the position the existing entry has
 // in the eviction order.
-func (c *chunkCache) put(fh uint64, chunk int64, data []byte) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (c *chunkCache) putLocked(k chunkKey, data []byte) {
 	if len(data) > c.global {
 		// Larger than the entire budget: caching it would evict everything
 		// else and still not fit, so serve it and forget it.
 		return
 	}
-	k := chunkKey{fh, chunk}
 	if _, ok := c.items[k]; ok {
 		return
 	}
 	c.items[k] = data
 	c.index[k] = c.order.PushBack(k)
-	c.bytes[fh] += len(data)
-	c.evictOpen(fh)
+	c.bytes[k.path] += len(data)
+	if c.byPath[k.path] == nil {
+		c.byPath[k.path] = map[chunkKey]struct{}{}
+	}
+	c.byPath[k.path][k] = struct{}{}
+	c.evictOpen(k.path)
 	c.evictGlobal()
 }
 
-// evictOpen trims one handle down to the per-open cap, oldest first.
-func (c *chunkCache) evictOpen(fh uint64) {
-	for c.bytes[fh] > c.perOpen {
-		el := c.oldestOf(fh)
+// evictOpen trims one path down to the per-file cap, oldest first.
+func (c *chunkCache) evictOpen(path string) {
+	for c.bytes[path] > c.perOpen {
+		el := c.oldestOf(path)
 		if el == nil {
 			return
 		}
@@ -144,7 +266,7 @@ func (c *chunkCache) evictOpen(fh uint64) {
 	}
 }
 
-// evictGlobal trims the whole cache to the global cap, evicting across handles
+// evictGlobal trims the whole cache to the global cap, evicting across files
 // oldest-first. This is what keeps N concurrent opens bounded.
 func (c *chunkCache) evictGlobal() {
 	// totalLocked, not total: this runs with mu held, and the exported wrapper
@@ -158,16 +280,14 @@ func (c *chunkCache) evictGlobal() {
 	}
 }
 
-// oldestOf finds the least recently used element belonging to one handle.
+// oldestOf finds the least recently used element belonging to one path.
 //
 // This scans the whole order list, which is O(number of cached chunks) rather
-// than O(1). It is acceptable because it only runs while a handle is over its
-// cap, and the per-open cap bounds how many of that handle's chunks are in the
-// list. If the per-open cap ever grows to hold many chunks, this is the function
-// to replace with a per-handle list.
-func (c *chunkCache) oldestOf(fh uint64) *list.Element {
+// than O(1). It is acceptable because it only runs while a path is over its
+// cap, and the cap bounds how many of that path's chunks are in the list.
+func (c *chunkCache) oldestOf(path string) *list.Element {
 	for el := c.order.Front(); el != nil; el = el.Next() {
-		if el.Value.(chunkKey).fh == fh {
+		if el.Value.(chunkKey).path == path {
 			return el
 		}
 	}
@@ -179,38 +299,107 @@ func (c *chunkCache) removeElement(el *list.Element) {
 	data := c.items[k]
 	delete(c.items, k)
 	delete(c.index, k)
-	c.bytes[k.fh] -= len(data)
-	if c.bytes[k.fh] <= 0 {
-		delete(c.bytes, k.fh)
+	c.bytes[k.path] -= len(data)
+	if c.bytes[k.path] <= 0 {
+		delete(c.bytes, k.path)
+	}
+	if set := c.byPath[k.path]; set != nil {
+		delete(set, k)
+		if len(set) == 0 {
+			delete(c.byPath, k.path)
+		}
 	}
 	c.order.Remove(el)
 }
 
-// dropOpen releases every chunk belonging to one handle. It is called when a
-// file is released, so that an idle file's cache does not occupy the budget
-// that the global cap is supposed to be protecting.
+// invalidate discards every cached chunk for one path and starts a new
+// generation, so a fill already in flight cannot repopulate it.
+func (c *chunkCache) invalidate(path string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.gen[path]++
+	c.dropPathLocked(path)
+}
+
+// invalidateTree discards path and everything beneath it, for a tombstone.
+func (c *chunkCache) invalidateTree(path string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	under := func(p string) bool {
+		return p == path || path == "/" || strings.HasPrefix(p, path+"/")
+	}
+	for p := range c.byPath {
+		if under(p) {
+			c.gen[p]++
+			c.dropPathLocked(p)
+		}
+	}
+	// A bound path with nothing cached still needs its generation bumped: a
+	// fill for it may be in flight, and a handle reading it may be open.
+	for _, p := range c.fhPath {
+		if under(p) {
+			c.gen[p]++
+		}
+	}
+	c.gen[path]++
+}
+
+// clear discards every cached byte. It is what a reconnect uses: events were
+// missed while the connection was down, so no cached byte can be assumed
+// current.
+//
+// Open handles stay bound. Their file's cache was cleared, not their identity,
+// and a handle that forgot its path would start caching under a synthetic key
+// that no later read ever consults.
+func (c *chunkCache) clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.bytes = map[string]int{}
+	c.items = map[chunkKey][]byte{}
+	c.order = list.New()
+	c.index = map[chunkKey]*list.Element{}
+	c.byPath = map[string]map[chunkKey]struct{}{}
+	for p := range c.gen {
+		c.gen[p]++
+	}
+	for _, p := range c.fhPath {
+		if _, ok := c.gen[p]; !ok {
+			c.gen[p] = 1
+		}
+	}
+}
+
+// dropPathLocked removes every chunk of one path.
+func (c *chunkCache) dropPathLocked(path string) {
+	for k := range c.byPath[path] {
+		if el, ok := c.index[k]; ok {
+			c.removeElement(el)
+		}
+	}
+	delete(c.byPath, path)
+	delete(c.bytes, path)
+}
+
+// dropOpen releases every chunk belonging to one handle's path and forgets the
+// handle. It is kept for tests and for the reconnect path that has to throw a
+// handle away; an ordinary close uses unbind so the file's chunks survive.
 func (c *chunkCache) dropOpen(fh uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.dropOpenLocked(fh)
 }
 
-// dropOpenLocked is dropOpen without the lock. It exists so that a caller that
-// already holds the Mount's lock can release a handle's memory while acquiring
-// only one lock at a time, which is what keeps the lock order from ever being a
-// question. See the comment on Mount.mu.
+// dropOpenLocked is dropOpen without the lock.
 func (c *chunkCache) dropOpenLocked(fh uint64) {
-	for el := c.order.Front(); el != nil; {
-		next := el.Next()
-		if el.Value.(chunkKey).fh == fh {
-			c.removeElement(el)
-		}
-		el = next
+	path, ok := c.fhPath[fh]
+	if !ok {
+		return
 	}
-	delete(c.bytes, fh)
+	c.dropPathLocked(path)
+	delete(c.fhPath, fh)
 }
 
-// total is the cached bytes across every handle, which is the number the global
+// total is the cached bytes across every file, which is the number the global
 // cap bounds.
 func (c *chunkCache) total() int {
 	c.mu.Lock()
@@ -226,10 +415,10 @@ func (c *chunkCache) totalLocked() int {
 	return n
 }
 
-// openTotal is the cached bytes for one handle, which is the number the
-// per-open cap bounds.
+// openTotal is the cached bytes for one handle's file, which is the number the
+// per-file cap bounds. Two handles on the same path report the same total.
 func (c *chunkCache) openTotal(fh uint64) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.bytes[fh]
+	return c.bytes[c.fhPath[fh]]
 }

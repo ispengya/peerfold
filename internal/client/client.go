@@ -510,7 +510,6 @@ func (c *Client) satisfyRead(env proto.Envelope) error {
 		// routing mistake, and answering it would read the wrong machine's disk.
 		reason = fmt.Errorf("read request is addressed to %q, not %q", req.Client, c.name)
 	} else {
-		logging.Infof("client: read %s off=%d n=%d", req.Path, req.Off, req.N)
 		// req.Client is this client's own name, which is how the server routes
 		// the request; the share is the first component of the path, because
 		// everything after the client name belongs to this client's namespace.
@@ -524,8 +523,13 @@ func (c *Client) satisfyRead(env proto.Envelope) error {
 		}
 	}
 
-	logging.Infof("client: read %s off=%d n=%d bytes=%d took=%s err=%v",
-		req.Path, req.Off, req.N, len(data), time.Since(started), reason)
+	// One line for a slow or failed read, none for the ordinary ones. A build
+	// walks thousands of units; logging each of them is a synchronous write
+	// that costs more than the read it describes.
+	if took := time.Since(started); took > 100*time.Millisecond || reason != nil {
+		logging.Infof("client: read %s off=%d n=%d bytes=%d took=%s err=%v",
+			req.Path, req.Off, req.N, len(data), took, reason)
+	}
 
 	head := proto.Envelope{ID: env.ID, Kind: proto.KindReadOK}
 	if reason != nil {
@@ -719,6 +723,10 @@ func (c *Client) servePut(env proto.Envelope) error {
 	// One drain, here, for every failure that did not consume the stream, rather
 	// than one on each early return where it is easy to forget. Consumption is
 	// recorded by whether the operation is known to have read the stream at all.
+	// An absent field is an older viewer, whose close meant "saved durably".
+	// Only the explicit "relaxed" value is allowed to skip the barriers, so an
+	// unknown future value is treated as durable rather than weaker.
+	durable := req.Durability != proto.WriteDurabilityRelaxed
 	var outErr error
 	switch req.Mode {
 	case proto.WriteModeCreate:
@@ -726,7 +734,7 @@ func (c *Client) servePut(env proto.Envelope) error {
 		// stops part-way leaves a file behind that this end has to remove. The
 		// name was free when it was taken, which is the part that cannot be
 		// undone.
-		if err := c.fs.CreateFrom(share, rel, sink); err != nil {
+		if err := c.fs.CreateFrom(share, rel, sink, durable); err != nil {
 			outErr = err
 		} else if streamErr != nil {
 			c.fs.removeIfPresent(share, rel)
@@ -735,7 +743,7 @@ func (c *Client) servePut(env proto.Envelope) error {
 			return nil
 		}
 	case proto.WriteModePut, "":
-		if err := c.fs.replaceAtomically(share, rel, sink, ended); err != nil {
+		if err := c.fs.replaceAtomically(share, rel, sink, ended, durable); err != nil {
 			outErr = err
 		} else {
 			return nil

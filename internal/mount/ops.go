@@ -560,42 +560,39 @@ func (m *Mount) Read(path string, buf []byte, off int64, fh uint64) int {
 		chunkIdx := pos / int64(unit)
 		chunkOff := chunkIdx * int64(unit)
 
-		chunk, ok := m.cache.get(fh, chunkIdx)
+		// The access is recorded before the lookup: a sequential run that
+		// happens to be served from the cache still tells the prefetcher what
+		// comes next.
+		sequential := m.noteChunkAccess(fh, chunkIdx)
+
+		chunk, ok := m.cache.getAt(fh, unit, chunkIdx)
 		if !ok {
-			m.fetchMu.Lock()
-			// Re-check with the fill lock held: another goroutine may have
-			// filled this chunk while this one was waiting, and the first
-			// check happened outside that window.
-			chunk, ok = m.cache.get(fh, chunkIdx)
-			if !ok {
-				started := time.Now()
-				data, err := m.call().Read(t.path, chunkOff, unit)
-				took := time.Since(started)
-				if err != nil {
-					m.fetchMu.Unlock()
-					log.Printf("mount: read %s off=%d n=%d took=%s failed: %v",
-						t.path, chunkOff, unit, took, err)
-					// A partial read is returned rather than discarded. Throwing
-					// away the bytes already in the buffer would make a large file
-					// unreadable over a flaky link, because the retry starts from
-					// scratch and hits the same failure.
-					if total > 0 {
-						return total
-					}
-					return errnoFor(err)
+			started := time.Now()
+			data, err := m.fetchChunk(fh, t.path, chunkIdx, unit)
+			took := time.Since(started)
+			if err != nil {
+				log.Printf("mount: read %s off=%d n=%d took=%s failed: %v",
+					t.path, chunkOff, unit, took, err)
+				// A partial read is returned rather than discarded. Throwing
+				// away the bytes already in the buffer would make a large file
+				// unreadable over a flaky link, because the retry starts from
+				// scratch and hits the same failure.
+				if total > 0 {
+					return total
 				}
+				return errnoFor(err)
+			}
+			// Slow fills are worth a line; the common one is not. A build reads
+			// thousands of units, and logging each of them cost more than the
+			// cache lookup it accompanied.
+			if took > 100*time.Millisecond {
 				log.Printf("mount: read %s off=%d n=%d bytes=%d took=%s",
 					t.path, chunkOff, unit, len(data), took)
-				// The count asked for is always the unit, so the slice is already
-				// bounded; trimming is belt and braces so the cache can never hold
-				// a chunk larger than the unit the caps are expressed in.
-				if len(data) > unit {
-					data = data[:unit]
-				}
-				chunk = data
-				m.cache.put(fh, chunkIdx, chunk)
 			}
-			m.fetchMu.Unlock()
+			chunk = data
+			if sequential {
+				m.startPrefetch(fh, t.path, chunkIdx+1, unit)
+			}
 		}
 		if len(chunk) == 0 {
 			break // end of file
@@ -1248,7 +1245,11 @@ func (m *Mount) Truncate(path string, size int64, fh uint64) int {
 // flush: the mount cannot write content without also writing metadata, so
 // treating datasync as "content may wait" would be a lie.
 func (m *Mount) Fsync(path string, datasync bool, fh uint64) int {
-	return m.flush(fh)
+	// This is the one flush whose result is a durability promise, so it is the
+	// one that pays for the owner's fsync. Flush and Release deliberately do
+	// not: a build that closes thousands of files should not force thousands of
+	// stable-storage barriers.
+	return m.flushDurable(fh)
 }
 
 // Flush uploads the handle's accumulated writes.
@@ -1454,6 +1455,7 @@ func (m *Mount) Unlink(path string) int {
 	// lookup and Readdir from bringing it back.
 	m.events[cleaned] = node.Node{Path: cleaned, Kind: node.KindDeleted}
 	m.mu.Unlock()
+	m.cache.invalidate(cleaned)
 	m.invalidateListings(cleaned)
 	return 0
 }
@@ -1493,6 +1495,7 @@ func (m *Mount) Rmdir(path string) int {
 		delete(m.pendingContent, cleaned)
 		m.events[cleaned] = node.Node{Path: cleaned, Kind: node.KindDeleted}
 		m.mu.Unlock()
+		m.cache.invalidate(cleaned)
 		m.invalidateListings(cleaned)
 		return 0
 	}
@@ -1516,6 +1519,7 @@ func (m *Mount) Rmdir(path string) int {
 	m.mu.Lock()
 	m.events[cleaned] = node.Node{Path: cleaned, Kind: node.KindDeleted}
 	m.mu.Unlock()
+	m.cache.invalidateTree(cleaned)
 	m.invalidateListings(cleaned)
 	return 0
 }
@@ -1620,7 +1624,7 @@ func (m *Mount) Rename(oldPath, newPath string) int {
 		switch h.path {
 		case oldClean:
 			h.path = newClean
-			m.cache.dropOpenLocked(h.fh)
+			m.cache.bind(h.fh, newClean)
 		case newClean:
 			h.path = newClean
 			h.writes = map[int64][]byte{}
@@ -1629,9 +1633,13 @@ func (m *Mount) Rename(oldPath, newPath string) int {
 			h.loaded = true
 			h.dirtyVersion = h.version
 			h.dirty = false
-			m.cache.dropOpenLocked(h.fh)
+			m.cache.bind(h.fh, newClean)
 		}
 	}
+	// The bytes under the old name now live under the new one, and the new name
+	// may have replaced a different file. Both paths' cached chunks are stale.
+	m.cache.invalidate(oldClean)
+	m.cache.invalidate(newClean)
 	// The source's name now lives at the destination. A destination this mount
 	// created keeps its own entry only if it was the one being replaced; a
 	// rename onto a free name leaves the destination pending, and dropping it
