@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ispengya/peerfold/internal/index"
@@ -81,6 +82,15 @@ type Server struct {
 	// separately from watchers because it has to survive individual failures,
 	// and it is cleared both on a successful send and when a watcher leaves.
 	watchFails map[*proto.Conn]int
+	// watchQueues is the ordered outbound path for each registered watcher.
+	//
+	// Broadcast used to start one goroutine per watcher per update, and those
+	// goroutines could reach the connection in any order: two index updates
+	// reported one after the other could arrive with the second first, leaving
+	// a mount that applied both describing the older state. A queue per
+	// watcher keeps the order the updates were produced in while still letting
+	// broadcast return without waiting for a slow peer.
+	watchQueues map[*proto.Conn]*watchQueue
 	// viewers is every connected mount, keyed by its connection. A mount is a
 	// viewer that declared a mount point in its hello; plain viewers (ls, cat,
 	// the status query itself) are not recorded, because they are transient
@@ -122,6 +132,7 @@ func New(listen string) *Server {
 		conns:            make(map[net.Conn]struct{}),
 		watchers:         make(map[*proto.Conn]struct{}),
 		watchFails:       make(map[*proto.Conn]int),
+		watchQueues:      make(map[*proto.Conn]*watchQueue),
 		viewers:          make(map[*proto.Conn]proto.ViewerInfo),
 		clientInfos:      make(map[*proto.Conn]proto.ClientInfo),
 		router:           &Router{clients: make(map[string]*clientLink)},
@@ -632,11 +643,10 @@ func (s *Server) applyEvent(name string, env proto.Envelope) {
 		return
 	}
 
-	paths := make([]string, 0, len(nodes))
-	for _, n := range nodes {
-		paths = append(paths, n.Path)
-	}
-	logging.Infof("server: event from %q: %d node(s): %v", name, len(nodes), paths)
+	// One line per batch: a coalesced build batch can name hundreds of paths,
+	// and printing them all would make the diagnostic log the largest thing
+	// this path produces.
+	logging.Infof("server: event from %q: %d node(s)", name, len(nodes))
 
 	// A deletion is not a node with a kind; it is an instruction to drop the
 	// path and everything under it. It is turned into the index's own removal
@@ -731,16 +741,40 @@ func fromNodeJSON(in []proto.NodeJSON) []node.Node {
 // goroutine also means a genuinely wedged watcher cannot push the rest of the
 // fan-out past its own deadline, because it never shares their turn.
 func (s *Server) broadcast(env proto.Envelope) {
+	type target struct {
+		conn *proto.Conn
+		q    *watchQueue
+	}
 	s.mu.Lock()
-	targets := make([]*proto.Conn, 0, len(s.watchers))
+	targets := make([]target, 0, len(s.watchers))
 	for c := range s.watchers {
-		targets = append(targets, c)
+		targets = append(targets, target{conn: c, q: s.watchQueues[c]})
 	}
 	s.mu.Unlock()
 
 	logging.Infof("server: broadcast to %d watcher(s)", len(targets))
 
-	for _, c := range targets {
+	for _, t := range targets {
+		if t.q != nil {
+			// The queue preserves the order updates were produced in. A full
+			// queue means this watcher has stopped reading; dropping the batch
+			// is visible to it as a sequence gap, which is exactly the signal
+			// it already knows how to handle.
+			if !t.q.enqueue(env) {
+				// Sample the report: a queue that stays full would otherwise
+				// write one line per update while the watcher is stuck.
+				if n := t.q.dropped.Add(1); n == 1 || n%256 == 0 {
+					logging.Errorf("server: a watcher's outbound queue is full; "+
+						"dropped %d update batch(es) so far (the mount will see a "+
+						"sequence gap)", n)
+				}
+			}
+			continue
+		}
+		// A watcher registered without a queue exists only in tests that place
+		// one directly in the map. Keep the original per-attempt goroutine for
+		// that case so the retirement policy remains directly observable.
+		c := t.conn
 		s.fanout.Add(1)
 		go func(c *proto.Conn) {
 			// The deferred Done runs last, after the state change below has been
@@ -859,17 +893,108 @@ func marshalOwnerPresent(name string) proto.Envelope {
 	return proto.Envelope{Kind: proto.KindEvent, Body: body}
 }
 
+// watchQueue is one watcher's ordered outbound path.
+//
+// The queue is bounded so a watcher that stops reading cannot make the server
+// hold updates for it for ever. A full queue drops the update rather than
+// blocking the client that reported the change; the dropped batch leaves a hole
+// in the mount's sequence numbers, and the mount already treats a hole as
+// "cached state is suspect" and refreshes.
+type watchQueue struct {
+	conn *proto.Conn
+	ch   chan proto.Envelope
+	done chan struct{}
+	once sync.Once
+	// dropped counts updates a full queue refused. It is sampled when logging:
+	// a watcher that has stopped reading would otherwise produce one error line
+	// per broadcast, which turns one peer's problem into a log flood.
+	dropped atomic.Int64
+}
+
+func newWatchQueue(c *proto.Conn) *watchQueue {
+	return &watchQueue{
+		conn: c,
+		ch:   make(chan proto.Envelope, 1024),
+		done: make(chan struct{}),
+	}
+}
+
+// enqueue offers one update without waiting. It reports whether the queue took
+// it.
+func (q *watchQueue) enqueue(env proto.Envelope) bool {
+	select {
+	case <-q.done:
+		return false
+	default:
+	}
+	select {
+	case q.ch <- env:
+		return true
+	default:
+		return false
+	}
+}
+
+// stop releases the queue's goroutine. It is idempotent.
+func (q *watchQueue) stop() {
+	q.once.Do(func() { close(q.done) })
+}
+
+// run delivers queued updates in order, keeping the same consecutive-failure
+// retirement policy the fan-out goroutines used.
+func (q *watchQueue) run(s *Server) {
+	for {
+		select {
+		case <-q.done:
+			return
+		case env := <-q.ch:
+			sent := q.conn.SendWithin(env, s.broadcastTimeout) == nil
+
+			s.mu.Lock()
+			if sent {
+				delete(s.watchFails, q.conn)
+				s.mu.Unlock()
+				continue
+			}
+			s.watchFails[q.conn]++
+			retire := s.watchFails[q.conn] >= watchFailThreshold
+			if retire {
+				logging.Errorf("server: dropping watcher after %d consecutive send "+
+					"timeouts; it keeps its connection but will receive no further "+
+					"updates", s.watchFails[q.conn])
+				delete(s.watchFails, q.conn)
+				delete(s.watchers, q.conn)
+				delete(s.watchQueues, q.conn)
+			}
+			s.mu.Unlock()
+			if retire {
+				q.stop()
+				return
+			}
+		}
+	}
+}
+
 // watch starts recording a viewer connection as a watcher, and returns the
 // function that stops.
+//
+// The queue is installed in the same lock hold as the watcher entry, so a
+// broadcast never sees a watcher it cannot enqueue to.
 func (s *Server) watch(c *proto.Conn) (unwatch func()) {
+	q := newWatchQueue(c)
 	s.mu.Lock()
 	s.watchers[c] = struct{}{}
+	s.watchQueues[c] = q
 	s.mu.Unlock()
+	go q.run(s)
+
 	return func() {
 		s.mu.Lock()
 		delete(s.watchers, c)
 		delete(s.watchFails, c)
+		delete(s.watchQueues, c)
 		s.mu.Unlock()
+		q.stop()
 	}
 }
 

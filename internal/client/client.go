@@ -236,18 +236,52 @@ func (c *Client) onBatchCount(n int) {
 	}
 }
 
+// uploadWindow is how many tree batches may be in flight before the uploader
+// waits for an acknowledgement.
+//
+// The upload used to be one batch out, one acknowledgement in. On a 50 ms link
+// a hundred-thousand-file tree is two hundred batches and therefore two hundred
+// round trips of nothing but waiting; the server applies each batch in
+// microseconds. Keeping a handful in flight hides that latency while the
+// server's acknowledgement remains the backpressure signal, so a fast uploader
+// cannot outrun a server that is still indexing.
+const uploadWindow = 4
+
 // UploadTree sends the whole shared tree as a sequence of batches, ending with a
 // tree_done that is marked as the end of the upload.
 //
 // It waits for the tree_done acknowledgement, so returning nil means the server
-// has the tree rather than merely that it was written to a socket.
+// has the tree rather than merely that it was written to a socket. Because the
+// connection is a single ordered stream, that acknowledgement also proves every
+// batch before it was applied: the server reads and indexes batches in order
+// before it reads the tree_done.
 func (c *Client) UploadTree() error {
 	batch := c.batchSize()
 	pending := make([]node.Node, 0, batch)
 	sent := 0
 
+	// ackBase is the acknowledgement count when the upload started. The window
+	// is measured against acks received for this upload rather than against the
+	// client's lifetime total, which may already include earlier traffic.
+	ackBase := c.ackCount()
+	batchesSent := 0
+
 	encode := func() ([]byte, error) {
 		return json.Marshal(proto.TreeBatchBody{Nodes: toNodeJSON(pending)})
+	}
+
+	sendBatch := func(b []byte) error {
+		for batchesSent-(c.ackCount()-ackBase) >= uploadWindow {
+			acked := c.ackCount()
+			if err := c.waitForAck(acked); err != nil {
+				return err
+			}
+		}
+		if _, err := c.send(proto.KindTreeBatch, b, false); err != nil {
+			return err
+		}
+		batchesSent++
+		return nil
 	}
 
 	flush := func() error {
@@ -258,7 +292,7 @@ func (c *Client) UploadTree() error {
 		if err != nil {
 			return fmt.Errorf("client: encode tree batch: %w", err)
 		}
-		if err := c.sendOne(proto.KindTreeBatch, b); err != nil {
+		if err := sendBatch(b); err != nil {
 			return err
 		}
 		sent += len(pending)
@@ -324,19 +358,6 @@ func (c *Client) UploadTree() error {
 		return err
 	}
 	return nil
-}
-
-// sendOne writes one message and waits for its own acknowledgement.
-//
-// The server answers a batch with an empty envelope, which carries no ID and so
-// cannot be correlated. Waiting for the next one is what keeps a fast client
-// from filling the socket buffers and wedging both ends.
-func (c *Client) sendOne(kind string, body []byte) error {
-	before := c.ackCount()
-	if _, err := c.send(kind, body, false); err != nil {
-		return err
-	}
-	return c.waitForAck(before)
 }
 
 // toNodeJSON converts index nodes to their wire form.

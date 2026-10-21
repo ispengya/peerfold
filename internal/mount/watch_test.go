@@ -635,3 +635,23 @@ func TestASequenceGapThroughTheLoop(t *testing.T) {
 		t.Error("the batch carrying the gap was discarded")
 	}
 }
+
+// A stale create for a path under a directory this mount already knows is gone
+// must not resurrect it. Batches can separate the directory's tombstone from a
+// child event that was produced before the deletion, and applying the child
+// would leave a name visible under a directory that no longer exists.
+func TestAChildEventUnderATombstonedDirectoryIsIgnored(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addFile("/win/Documents/x.txt", 2)
+
+	m.applyEvent(Batch{Nodes: []node.Node{{Path: "/win", Kind: node.KindDeleted}}})
+	m.applyEvent(Batch{Nodes: []node.Node{{Path: "/win/Documents/x.txt", Kind: node.KindFile, Size: 2}}})
+
+	if _, code := m.lookup("/win/Documents/x.txt"); code != -ENOENT {
+		t.Fatalf("lookup of a child under a deleted directory = %d, want ENOENT", code)
+	}
+	if _, ok := m.eventFor("/win/Documents/x.txt"); ok {
+		t.Fatal("the stale child event was added to the event table")
+	}
+}

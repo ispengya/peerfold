@@ -387,6 +387,36 @@ func TestApplyAfterFullRemovalRecreatesClient(t *testing.T) {
 	}
 }
 
+// TestChildrenIndexFollowsSubtreeRemoval pins that the incremental child sets
+// do not keep answering with a directory that was removed, or with a duplicate
+// after the same path is applied twice.
+func TestChildrenIndexFollowsSubtreeRemoval(t *testing.T) {
+	ix, _ := tree()
+	ix.Remove("win", "Documents/sub")
+
+	got, err := ix.Children("win", "Documents")
+	if err != nil {
+		t.Fatalf("Children(Documents): %v", err)
+	}
+	if len(got) != 1 || got[0].Path != "Documents/a.txt" {
+		t.Fatalf("Children(Documents) after removal = %v, want [Documents/a.txt]", paths(got))
+	}
+	if kids, err := ix.Children("win", "Documents/sub"); err != index.ErrNotFound {
+		t.Fatalf("Children(removed dir) = (%v, %v), want ErrNotFound", paths(kids), err)
+	}
+
+	// Applying an existing path again must update the node, not add a second
+	// child entry; a set makes that structural, and the count pins it.
+	ix.Apply("win", []node.Node{file("Documents/a.txt", 9)})
+	got, err = ix.Children("win", "Documents")
+	if err != nil {
+		t.Fatalf("Children(Documents) after re-apply: %v", err)
+	}
+	if len(got) != 1 || got[0].Size != 9 {
+		t.Fatalf("Children(Documents) after re-apply = %v, want one node of size 9", got)
+	}
+}
+
 func TestConcurrentApplyAndLookup(t *testing.T) {
 	ix := &index.Index{}
 	const n = 1000

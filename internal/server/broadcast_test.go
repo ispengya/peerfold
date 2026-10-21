@@ -150,6 +150,56 @@ func TestOwnerGoneBroadcastCarriesAWatchableTombstone(t *testing.T) {
 	}
 }
 
+// TestAQueuedWatcherReceivesUpdatesInOrder pins that the per-watcher queue
+// preserves the order updates were produced in. The old fan-out started one
+// goroutine per update, and two updates could reach the connection in either
+// order -- so a mount could apply the older state last.
+func TestAQueuedWatcherReceivesUpdatesInOrder(t *testing.T) {
+	s := New("127.0.0.1:0")
+	t.Cleanup(func() { _ = s.Close() })
+
+	local, peer := net.Pipe()
+	t.Cleanup(func() {
+		_ = local.Close()
+		_ = peer.Close()
+	})
+	conn := proto.NewConn(local)
+	unwatch := s.watch(conn)
+	defer unwatch()
+	peerConn := proto.NewConn(peer)
+
+	s.mu.Lock()
+	q := s.watchQueues[conn]
+	s.mu.Unlock()
+	if q == nil {
+		t.Fatal("watch registered no outbound queue")
+	}
+
+	const updates = 32
+	for i := 0; i < updates; i++ {
+		body, err := json.Marshal(i + 1)
+		if err != nil {
+			t.Fatalf("marshal update body: %v", err)
+		}
+		s.broadcast(proto.Envelope{Kind: proto.KindEvent, Body: body})
+	}
+
+	if err := peer.SetReadDeadline(time.Now().Add(fenceWait)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	for i := 0; i < updates; i++ {
+		// RecvAny, not Recv: Recv deliberately passes over pushed updates.
+		env, err := peerConn.RecvAny()
+		if err != nil {
+			t.Fatalf("update %d: %v", i, err)
+		}
+		want, _ := json.Marshal(i + 1)
+		if string(env.Body) != string(want) {
+			t.Fatalf("update %d carried %s, want %d", i, env.Body, i+1)
+		}
+	}
+}
+
 func TestClientDisconnectBroadcastsOwnerRemoval(t *testing.T) {
 	s := New("127.0.0.1:0")
 	t.Cleanup(func() { _ = s.Close() })

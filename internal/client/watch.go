@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 
@@ -46,11 +47,9 @@ func (c *Client) Watch() (io.Closer, error) {
 			return fmt.Errorf("client: encode event: %w", err)
 		}
 		seq++
-		paths := make([]string, 0, len(nodes))
-		for _, n := range nodes {
-			paths = append(paths, n.Path)
-		}
-		logging.Infof("client: push %d node(s): %v", len(nodes), paths)
+		// One line per batch, not per path: a build's batch can carry hundreds
+		// of nodes, and printing every path turns a diagnostic into a flood.
+		logging.Infof("client: push %d node(s) seq=%d", len(nodes), seq-1)
 		// Sent without a waiter, because an index update is not a question and
 		// the server sends nothing back for it. Registering a waiter would leave
 		// one entry in the waiting map for every change, for ever.
@@ -82,11 +81,12 @@ func Watch(sh Shares, emit func(events []node.Node) error) (io.Closer, error) {
 	}
 
 	w := &watch{
-		sh:    sh,
-		emit:  emit,
-		fsw:   inner,
-		done:  make(chan struct{}),
-		roots: make([]watchRoot, 0, len(sh.names)),
+		sh:      sh,
+		emit:    emit,
+		fsw:     inner,
+		done:    make(chan struct{}),
+		pending: map[string]node.Node{},
+		roots:   make([]watchRoot, 0, len(sh.names)),
 	}
 	// The roots are collected longest-first once, at start: a path is mapped
 	// back to the share that contains it by the first root that matches, and
@@ -121,6 +121,23 @@ type watchRoot struct {
 	root string
 }
 
+// eventBatchWindow and maxEventBatch bound how long events are coalesced and
+// how many distinct paths one push may carry.
+//
+// A build that creates twenty thousand files is twenty thousand fsnotify
+// events. Sent one per frame, they cost twenty thousand index updates, twenty
+// thousand broadcasts, and a watcher channel overflow that makes the mount
+// discard every cached listing. Coalescing a short window turns the same work
+// into tens of batches, and deduplicating by path means a file that is created,
+// written and closed is reported once with its final size.
+//
+// The window is short enough that an interactive change is still pushed in a
+// blink, and the count bound keeps one batch far below the wire's frame limit.
+const (
+	eventBatchWindow = 50 * time.Millisecond
+	maxEventBatch    = 512
+)
+
 // watch turns filesystem events into node updates.
 type watch struct {
 	sh   Shares
@@ -132,6 +149,18 @@ type watch struct {
 	// handles is how many directories are being watched, so a test or a
 	// diagnostic can see the recursion actually happened.
 	handles int
+
+	// pending is the latest node per path in the current batch, and order
+	// records every path as it changed. On flush, walking order backwards and
+	// keeping the first occurrence of each path gives one node per path in
+	// last-change order, which is what keeps a delete that follows a create
+	// from being applied before it.
+	//
+	// Both are touched only by the watcher's own goroutine.
+	pending map[string]node.Node
+	order   []string
+	timer   *time.Timer
+	timerC  <-chan time.Time
 
 	roots []watchRoot
 	done  chan struct{}
@@ -195,13 +224,17 @@ func (w *watch) add(dir string) {
 	w.mu.Unlock()
 }
 
-// emitTree reports every entry under dir, one node at a time.
+// addAndEmitTree watches and reports every entry under a directory that has
+// just appeared.
 //
-// It is for a directory that has just appeared, whose own event cannot describe
-// what is already inside it. Excluded subtrees are skipped without being
-// descended into, exactly as the scanner skips them, so the watcher and the
-// scan agree on what the tree contains.
-func (w *watch) emitTree(dir string) {
+// One walk does both jobs. The watcher used to add watches with one recursive
+// walk and then report the contents with a second one, so creating a directory
+// containing a thousand files walked those thousand entries twice — on the
+// event path, while the build that made them was still writing.
+//
+// The directory itself is not reported here: the caller does that with the
+// event's own information.
+func (w *watch) addAndEmitTree(dir string) {
 	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if d != nil && d.IsDir() {
@@ -209,15 +242,20 @@ func (w *watch) emitTree(dir string) {
 			}
 			return nil
 		}
-		if path == dir {
-			// The caller reports the directory itself, with the event's own
-			// information.
-			return nil
-		}
 		if w.sh.Excluded(path) {
+			// An excluded subtree is not descended into, exactly as Scan skips
+			// it, so the watcher and the scan agree on what the tree contains.
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		if d.IsDir() {
+			// The new directory and every directory under it need their own
+			// watch, or events inside them are never delivered.
+			w.add(path)
+		}
+		if path == dir {
 			return nil
 		}
 		rel, ok := w.relPath(path)
@@ -245,7 +283,7 @@ func (w *watch) emitTree(dir string) {
 		if kind == node.KindFile {
 			n.Size = info.Size()
 		}
-		w.send([]node.Node{n})
+		w.enqueue([]node.Node{n})
 		return nil
 	})
 }
@@ -261,6 +299,10 @@ func (w *watch) run() {
 				return
 			}
 			w.handle(ev)
+		case <-w.timerC:
+			// The coalescing window closed. timerC is nil unless a batch is
+			// open, so a quiet watcher parks on the fsnotify channels alone.
+			w.flush()
 		case _, ok := <-w.fsw.Errors:
 			// An overflow or a watch that could not be established arrives here.
 			// It is not fatal to the watcher, and there is nothing this code can
@@ -294,7 +336,7 @@ func (w *watch) handle(ev fsnotify.Event) {
 	// about it can be read: it is gone, and the size and mtime a stat would
 	// return belong to whatever comes next at that name, if anything.
 	if ev.Op&fsnotify.Remove != 0 || ev.Op&fsnotify.Rename != 0 {
-		w.send([]node.Node{{Path: rel, Kind: node.KindDeleted}})
+		w.enqueue([]node.Node{{Path: rel, Kind: node.KindDeleted}})
 		return
 	}
 
@@ -303,7 +345,7 @@ func (w *watch) handle(ev fsnotify.Event) {
 		// The event names something that is already gone, so it is a removal
 		// that arrived through a create. Treat it as one.
 		if os.IsNotExist(err) {
-			w.send([]node.Node{{Path: rel, Kind: node.KindDeleted}})
+			w.enqueue([]node.Node{{Path: rel, Kind: node.KindDeleted}})
 		}
 		return
 	}
@@ -317,7 +359,7 @@ func (w *watch) handle(ev fsnotify.Event) {
 	// disagree about what a given entry is.
 	kind := classify(info.Mode(), info.IsDir())
 	if kind != node.KindFile && kind != node.KindDir {
-		w.send([]node.Node{{
+		w.enqueue([]node.Node{{
 			Path:  rel,
 			Kind:  kind,
 			Mode:  uint32(info.Mode()),
@@ -327,27 +369,20 @@ func (w *watch) handle(ev fsnotify.Event) {
 	}
 	if info.IsDir() {
 		if ev.Op&fsnotify.Create != 0 {
-			// A new directory is watched from now on, or the next file created
-			// inside it is never noticed.
-			w.addTree(ev.Name)
-			// It is also read, and that is not belt-and-braces. Adding a watch
-			// takes effect from the moment it lands, so anything created
-			// between the directory appearing and the watch being registered
-			// produces events nobody was listening for. That window is not
-			// theoretical: creating a directory and filling it is one operation
-			// to the code that does it — `MkdirAll`, an unpacking tool, a copy —
-			// and on Windows the whole thing can land inside the window. The
-			// directory's own events would then be complete and its contents
-			// would be missing for as long as the connection lasts.
+			// Watch the new directory and report what is already inside it.
 			//
-			// Reading the subtree closes the window rather than narrowing it,
+			// Adding a watch takes effect from the moment it lands, so anything
+			// created between the directory appearing and the watch being
+			// registered produces events nobody was listening for. That window
+			// is not theoretical: creating a directory and filling it is one
+			// operation to the code that does it — `MkdirAll`, an unpacking
+			// tool, a copy — and on Windows the whole thing can land inside the
+			// window. Reading the subtree closes it rather than narrowing it,
 			// and the entries it produces are the same nodes the missed events
-			// would have carried. Emitting them twice is harmless: an index
-			// entry is written by path, so the same node applied again is the
-			// same state.
-			w.emitTree(ev.Name)
+			// would have carried.
+			w.addAndEmitTree(ev.Name)
 		}
-		w.send([]node.Node{{Path: rel, Kind: node.KindDir, Mode: uint32(info.Mode())}})
+		w.enqueue([]node.Node{{Path: rel, Kind: node.KindDir, Mode: uint32(info.Mode())}})
 		return
 	}
 	if !info.Mode().IsRegular() {
@@ -358,7 +393,7 @@ func (w *watch) handle(ev fsnotify.Event) {
 		return
 	}
 
-	w.send([]node.Node{{
+	w.enqueue([]node.Node{{
 		Path:  rel,
 		Kind:  node.KindFile,
 		Size:  info.Size(),
@@ -367,25 +402,118 @@ func (w *watch) handle(ev fsnotify.Event) {
 	}})
 }
 
-// send hands a batch to emit, ignoring a failure.
+// enqueue adds nodes to the open batch, starting its window if this is the
+// first one and flushing immediately if the count bound is reached.
 //
-// A failed emit is not retried and is not fatal: the client keeps running, and
-// the connection is still serving reads and writes. What it is not is repaired.
-// There is no periodic rescan in v1 — the index is seeded once by the upload and
-// then only ever moved by these events — so a batch that fails here leaves the
-// server's tree describing the state before that change, and the change stays
-// invisible until something else touches the same path or the client reconnects.
-// The same is true of an fsnotify overflow, where the kernel drops events because
-// the buffer filled.
-//
-// That is a real limitation rather than a safety net, and it is written down in
-// docs/peerfold-cli.md. The fix is a periodic Scan-and-diff, which this version
-// does not have.
-func (w *watch) send(nodes []node.Node) {
+// Only the watcher's goroutine calls this, so the pending map needs no lock.
+// Coalescing by path is not just an optimisation: a create followed by a write
+// and a stat produces several events for one file, and applying them
+// separately made the index and every watcher do that work several times.
+func (w *watch) enqueue(nodes []node.Node) {
 	if len(nodes) == 0 {
 		return
 	}
-	_ = w.emit(nodes)
+	for _, n := range nodes {
+		w.pending[n.Path] = n
+		w.order = append(w.order, n.Path)
+	}
+	if w.timerC == nil {
+		if w.timer == nil {
+			w.timer = time.NewTimer(eventBatchWindow)
+		} else {
+			w.timer.Reset(eventBatchWindow)
+		}
+		w.timerC = w.timer.C
+	}
+	if len(w.pending) >= maxEventBatch {
+		w.flush()
+	}
+}
+
+// flush sends the open batch, in last-change order and with one node per path.
+//
+// Walking order backwards and keeping the first occurrence of each path is what
+// gives "latest state, latest position": a path that was created and then
+// deleted appears once, at the position of the delete, so a watcher applies the
+// operations in an order that ends in the truth.
+func (w *watch) flush() {
+	if w.timer != nil && w.timerC != nil {
+		if !w.timer.Stop() {
+			select {
+			case <-w.timer.C:
+			default:
+			}
+		}
+	}
+	w.timerC = nil
+	if len(w.pending) == 0 {
+		w.order = w.order[:0]
+		return
+	}
+
+	seen := make(map[string]struct{}, len(w.pending))
+	reverse := make([]node.Node, 0, len(w.pending))
+	for i := len(w.order) - 1; i >= 0; i-- {
+		p := w.order[i]
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		reverse = append(reverse, w.pending[p])
+	}
+	nodes := make([]node.Node, len(reverse))
+	for i := range reverse {
+		nodes[len(reverse)-1-i] = reverse[i]
+	}
+	clear(w.pending)
+	w.order = w.order[:0]
+	nodes = dropUnderDeleted(nodes)
+
+	// A failed emit is not retried and is not fatal: the client keeps running,
+	// and the connection is still serving reads and writes. What it is not is
+	// repaired. There is no periodic rescan in v1 — the index is seeded once by
+	// the upload and then only ever moved by these events — so a batch that
+	// fails here leaves the server's tree describing the state before that
+	// change. The same is true of an fsnotify overflow, where the kernel drops
+	// events because the buffer filled. The mount's sequence-gap detection is
+	// what makes a lost send visible instead of silent.
+	if len(nodes) > 0 {
+		_ = w.emit(nodes)
+	}
+}
+
+// dropUnderDeleted removes nodes whose ancestor is deleted in the same batch.
+//
+// A directory deletion takes its whole subtree with it. If a stale create for a
+// child arrives after the directory's tombstone in the same window, applying
+// both would leave the child in the index under a directory that is gone. The
+// tombstone already says everything about the subtree, so the child's node is
+// noise.
+func dropUnderDeleted(nodes []node.Node) []node.Node {
+	byPath := make(map[string]node.Node, len(nodes))
+	for _, n := range nodes {
+		byPath[n.Path] = n
+	}
+	out := nodes[:0]
+	for _, n := range nodes {
+		p := n.Path
+		shadowed := false
+		for {
+			i := strings.LastIndexByte(p, '/')
+			if i < 0 {
+				break
+			}
+			p = p[:i]
+			if anc, ok := byPath[p]; ok && anc.Kind == node.KindDeleted {
+				shadowed = true
+				break
+			}
+		}
+		if !shadowed {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // relPath maps an absolute path back to its "<share>/<rel>" form, and reports

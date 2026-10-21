@@ -28,6 +28,16 @@ var ErrNotFound = errors.New("index: not found")
 type Index struct {
 	mu      sync.RWMutex
 	clients map[string]map[string]node.Node
+	// kids is the listing half of the index: client -> directory -> the full
+	// paths of its direct children. It is maintained alongside clients rather
+	// than derived on demand because Children used to scan every node of a
+	// client to answer one listing. On a 100000-node tree that made each
+	// directory open O(total nodes), and a walk of a node_modules tree did it
+	// once per directory.
+	//
+	// The empty directory path addresses the top level, whose children are the
+	// clients' share roots.
+	kids map[string]map[string]map[string]struct{}
 }
 
 // Apply stores nodes under client, replacing any node already indexed at the
@@ -56,7 +66,57 @@ func (ix *Index) Apply(client string, nodes []node.Node) {
 			m = make(map[string]node.Node)
 			ix.clients[client] = m
 		}
+		if _, exists := m[n.Path]; !exists {
+			ix.addKidLocked(client, parentOf(n.Path), n.Path)
+		}
 		m[n.Path] = n
+	}
+}
+
+// parentOf returns the directory containing p, or "" for a top-level path.
+//
+// The index's paths are share-relative and slash-separated; Index.validPath
+// guarantees no leading or trailing separator, so the last separator is the
+// only one that matters.
+func parentOf(p string) string {
+	if i := strings.LastIndexByte(p, '/'); i >= 0 {
+		return p[:i]
+	}
+	return ""
+}
+
+// addKidLocked records p as a child of dir. The caller holds the write lock.
+func (ix *Index) addKidLocked(client, dir, p string) {
+	if ix.kids == nil {
+		ix.kids = make(map[string]map[string]map[string]struct{})
+	}
+	dirs := ix.kids[client]
+	if dirs == nil {
+		dirs = make(map[string]map[string]struct{})
+		ix.kids[client] = dirs
+	}
+	children := dirs[dir]
+	if children == nil {
+		children = make(map[string]struct{})
+		dirs[dir] = children
+	}
+	children[p] = struct{}{}
+}
+
+// dropKidLocked removes p from dir's child set, deleting empty containers.
+// The caller holds the write lock.
+func (ix *Index) dropKidLocked(client, dir, p string) {
+	dirs := ix.kids[client]
+	if dirs == nil {
+		return
+	}
+	children := dirs[dir]
+	if children == nil {
+		return
+	}
+	delete(children, p)
+	if len(children) == 0 {
+		delete(dirs, dir)
 	}
 }
 
@@ -77,19 +137,34 @@ func (ix *Index) removeLocked(client, path string) {
 	if m == nil {
 		return
 	}
-	delete(m, path)
+	ix.removeOneLocked(client, m, path)
 	prefix := path + "/"
 	for p := range m {
 		if strings.HasPrefix(p, prefix) {
-			delete(m, p)
+			ix.removeOneLocked(client, m, p)
 		}
 	}
+	// The removed directory's own child set goes with it. A later path of the
+	// same name starts with no children, which is what a recreated empty
+	// directory looks like.
+	delete(ix.kids[client], path)
 	// A client with no nodes left is gone as a key too. This keeps the
 	// comment on Clients honest, and stops a client that removed everything
 	// from looking present-but-empty.
 	if len(m) == 0 {
 		delete(ix.clients, client)
+		delete(ix.kids, client)
 	}
+}
+
+// removeOneLocked deletes one node and its entry in its parent's child set.
+// The caller holds the write lock and is responsible for the subtree.
+func (ix *Index) removeOneLocked(client string, m map[string]node.Node, path string) {
+	if _, ok := m[path]; !ok {
+		return
+	}
+	delete(m, path)
+	ix.dropKidLocked(client, parentOf(path), path)
 }
 
 // RemoveClient drops every node belonging to client.
@@ -97,6 +172,7 @@ func (ix *Index) RemoveClient(client string) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	delete(ix.clients, client)
+	delete(ix.kids, client)
 }
 
 // Lookup returns the node indexed at client's path.
@@ -120,10 +196,12 @@ func (ix *Index) Children(client, dir string) ([]node.Node, error) {
 
 	m := ix.clients[client]
 	if dir == "" {
-		// The roots are whatever is indexed at one path component.
-		out := make([]node.Node, 0, len(m))
-		for p, n := range m {
-			if !strings.Contains(p, "/") {
+		// The roots are whatever is indexed at one path component, and the
+		// child set for the empty parent is exactly those.
+		paths := ix.kids[client][""]
+		out := make([]node.Node, 0, len(paths))
+		for p := range paths {
+			if n, ok := m[p]; ok {
 				out = append(out, n)
 			}
 		}
@@ -139,18 +217,12 @@ func (ix *Index) Children(client, dir string) ([]node.Node, error) {
 		return nil, ErrNotDir
 	}
 
-	prefix := dir + "/"
-	out := make([]node.Node, 0, 8)
-	for p, n := range m {
-		rest, found := strings.CutPrefix(p, prefix)
-		if !found {
-			continue
+	paths := ix.kids[client][dir]
+	out := make([]node.Node, 0, len(paths))
+	for p := range paths {
+		if n, ok := m[p]; ok {
+			out = append(out, n)
 		}
-		// Only direct children: a grandchild still has a separator in rest.
-		if strings.Contains(rest, "/") {
-			continue
-		}
-		out = append(out, n)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out, nil

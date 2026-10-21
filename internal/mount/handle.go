@@ -46,6 +46,16 @@ type openFile struct {
 	writeLimit int
 	dirty      bool
 
+	// loaded reports whether writes holds the file's complete content up to
+	// size. It is false for a handle opened on a non-empty file that has not
+	// been read yet: the first write has to load the untouched bytes before it
+	// applies, or content() would materialise the gaps as zeros and publish a
+	// file whose middle was never written.
+	//
+	// A newly created or truncated-to-empty handle is loaded by construction,
+	// because its complete content really is empty.
+	loaded bool
+
 	// writes holds the file's accumulated bytes as disjoint intervals keyed by
 	// start offset. Disjointness is an invariant of splice, which merges each
 	// arriving write into whatever it crosses so that the bytes either side of
@@ -170,15 +180,31 @@ func (m *Mount) closeHandle(fh uint64) {
 func (m *Mount) flush(fh uint64) int {
 	m.mu.Lock()
 	h, ok := m.files[fh]
-	if !ok || h.isClean() {
+	if !ok {
 		m.mu.Unlock()
 		return 0
 	}
+	if h.isClean() {
+		// A clean handle normally has nothing to send. The exception is a file
+		// this mount created but has never uploaded: a zero-byte file is a
+		// file, and the only thing that would carry the create to the owner is
+		// a Put, which a clean handle used to skip. That left `touch` and other
+		// empty-file creations present in the mount forever and absent from
+		// the owner.
+		//
+		// Another dirty handle on the same path means its own flush will carry
+		// the content; sending an empty body first would be a step backwards.
+		if !m.pendingCreateNeedsUploadLocked(h) {
+			m.mu.Unlock()
+			return 0
+		}
+	}
 	if m.isDisconnected {
-		// The clean-handle case returned above, so this only ever refuses a
-		// flush that really had content to send. That keeps the "an unknown or
-		// clean handle is a success" promise intact: Release still frees the
-		// handle, and a mount with nothing outstanding still unmounts cleanly.
+		// Only a flush with something to send reaches here: a clean handle with
+		// no pending create returned above. That keeps the "an unknown or clean
+		// handle is a success" promise intact -- Release still frees the handle,
+		// and a mount with nothing outstanding still unmounts cleanly -- while
+		// an empty file that only exists in this mount is reported as unsaved.
 		m.mu.Unlock()
 		return -EIO
 	}
@@ -213,6 +239,31 @@ func (m *Mount) flush(fh uint64) int {
 	// The file's size and mtime are new, and its parent listing carries them.
 	m.invalidateListings(path)
 	return 0
+}
+
+// pendingCreateNeedsUploadLocked reports whether a clean file handle is the
+// create of a name the owner has not been told about yet.
+//
+// The caller holds Mount.mu. A name is pending exactly while this mount created
+// it and the owning client's watcher has not pushed it back; a body in
+// pendingContent means a previous flush already sent it, so there is nothing
+// left to do.
+func (m *Mount) pendingCreateNeedsUploadLocked(h *openFile) bool {
+	if h.kind != node.KindFile {
+		return false
+	}
+	if kind, ok := m.pendingPaths[h.path]; !ok || kind != node.KindFile {
+		return false
+	}
+	if _, uploaded := m.pendingContent[h.path]; uploaded {
+		return false
+	}
+	for _, other := range m.files {
+		if other.path == h.path && !other.isClean() {
+			return false
+		}
+	}
+	return true
 }
 
 // flushPath uploads every dirty handle whose path is this one.
@@ -451,6 +502,12 @@ func (o *openFile) truncateTo(size int64) int {
 			copy(keep, data)
 			o.writes[off] = keep
 		}
+	}
+	if size == 0 {
+		// An empty file is complete however it got here. Saying so is what
+		// stops the next write from reading the owner's file: there is nothing
+		// left to preserve.
+		o.loaded = true
 	}
 	o.markDirty()
 	return 0

@@ -176,11 +176,26 @@ func (m *Mount) applyEvent(b Batch) bool {
 	// mount's lock across it would block every other operation behind a kernel
 	// call.
 	notify := make(map[string]struct{}, len(b.Nodes)*2)
+	// Invalidation is collected and applied once, after the loop. Doing it per
+	// node took the listing lock once per path, and a tombstone scanned every
+	// cached listing; a batch from a build can carry hundreds of nodes.
+	var changed []string
+	var removedSubtrees []string
 	for _, raw := range b.Nodes {
 		n := raw
 		// The wire speaks index paths; this package speaks FUSE paths. See
 		// fusePath.
 		n.Path = fusePath(n.Path)
+
+		// A create for a path under a directory this mount already knows is
+		// gone is stale. It can happen when a batch boundary or an out-of-order
+		// delivery separates the directory's tombstone from a child event that
+		// was produced before it. Applying it would resurrect the child under a
+		// directory that no longer exists; the directory being recreated later
+		// would re-report its contents.
+		if n.Kind != node.KindDeleted && m.deletedAncestorLocked(n.Path) {
+			continue
+		}
 
 		// The path and its parent both changed as far as listings are
 		// concerned: membership, attributes, or (for a directory) children.
@@ -189,9 +204,9 @@ func (m *Mount) applyEvent(b Batch) bool {
 			// entries from before the deletion would otherwise answer a lookup
 			// for a path that no longer exists.
 			m.forgetSubtreeLocked(n.Path, notify)
-			m.invalidateListingSubtree(n.Path)
+			removedSubtrees = append(removedSubtrees, n.Path)
 		} else {
-			m.invalidateListings(n.Path)
+			changed = append(changed, n.Path)
 		}
 		delete(m.pendingPaths, n.Path)
 		delete(m.pendingContent, n.Path)
@@ -211,6 +226,8 @@ func (m *Mount) applyEvent(b Batch) bool {
 	}
 	hook := m.invalidatePath
 	m.mu.Unlock()
+
+	m.invalidateListingBatch(changed, removedSubtrees)
 
 	if gap {
 		// The gap case has no list of paths to work from: every path the kernel

@@ -9,18 +9,49 @@ import (
 	"github.com/ispengya/peerfold/internal/node"
 )
 
-// dirCacheEntry is one cached directory listing. fetched is when the wire
-// answered, so the entry can expire on the same clock the kernel uses for
-// entry attributes.
+// dirCacheEntry is one cached directory listing.
+//
+// byName is what makes a lookup O(1): lookup resolves a path by asking its
+// parent's listing, and scanning that listing for every Getattr turned a
+// directory of N entries into O(N) work per entry, or O(N^2) for the kernel's
+// walk of the whole directory. fetched is when the wire answered; each entry
+// expires on the listing clock rather than the kernel's attribute clock,
+// because Explorer refreshes attributes far more often than a directory
+// actually changes.
 type dirCacheEntry struct {
 	children []node.Node
+	byName   map[string]node.Node
 	fetched  time.Time
+}
+
+// listingCall is one in-flight List for a directory. Concurrent callers that
+// miss the same cache entry wait on done instead of each sending the whole
+// directory over the wire.
+type listingCall struct {
+	done     chan struct{}
+	children []node.Node
+	err      error
 }
 
 // maxDirCacheEntries bounds how many directories are remembered. The entries
 // themselves are bounded by the tree, but a mount pointed at a huge federation
 // should not accumulate one slice per directory it ever listed.
 const maxDirCacheEntries = 4096
+
+// listingTTL is how long a directory listing may answer lookups.
+//
+// It is independent of EntryTimeout because the two describe different things:
+// the kernel's entry cache is expired by Explorer's refresh loop every few
+// seconds, while the listing itself changes only when a path inside the
+// directory changes -- and events invalidate it immediately when that happens.
+// A short listing TTL therefore bought no freshness and cost one whole-directory
+// transfer every few seconds.
+func (m *Mount) listingTTL() time.Duration {
+	if m.opts.ListingTimeout > 0 {
+		return m.opts.ListingTimeout
+	}
+	return 30 * time.Second
+}
 
 // listDir returns dir's children, reusing a recent listing.
 //
@@ -29,59 +60,116 @@ const maxDirCacheEntries = 4096
 // the kernel walked entry by entry produced one listing per entry. The cached
 // copy is returned, never the one held under the lock, because Readdir sorts
 // the slice it is given and two readers must not share one backing array.
+//
+// A miss is also collapsed: two concurrent Readdirs of the same directory wait
+// for one wire answer rather than sending two. The waiter reports cached=true
+// because it did not pay a round trip of its own.
 func (m *Mount) listDir(dir string) (children []node.Node, cached bool, err error) {
-	ttl := m.opts.EntryTimeout
-	if ttl <= 0 {
-		ttl = 5 * time.Second
-	}
+	ttl := m.listingTTL()
 
 	m.listingMu.Lock()
 	if e, ok := m.listings[dir]; ok && time.Since(e.fetched) < ttl {
 		children = append([]node.Node(nil), e.children...)
 		m.listingMu.Unlock()
+		log.Printf("mount: list %s entries=%d took=0s cached=true", dir, len(children))
 		return children, true, nil
 	}
+	if call, ok := m.listingInflight[dir]; ok {
+		m.listingMu.Unlock()
+		<-call.done
+		if call.err != nil {
+			return nil, false, call.err
+		}
+		return append([]node.Node(nil), call.children...), true, nil
+	}
+	call := &listingCall{done: make(chan struct{})}
+	if m.listingInflight == nil {
+		m.listingInflight = map[string]*listingCall{}
+	}
+	m.listingInflight[dir] = call
 	m.listingMu.Unlock()
 
 	started := time.Now()
-	children, err = m.call().List(dir)
+	fetched, err := m.call().List(dir)
 	took := time.Since(started)
-	if err != nil {
+	if err == nil {
+		// The wire's paths are index paths ("win/Documents"), while everything in
+		// this package keys on FUSE paths ("/win/Documents"). The adapter could do
+		// this, but doing it here makes every Caller obey the same convention: the
+		// event table, pending table and handed-out table are all keyed by the
+		// result, so a relative path in any one of them is a path that never matches.
+		byName := make(map[string]node.Node, len(fetched))
+		for i := range fetched {
+			fetched[i].Path = fusePath(fetched[i].Path)
+			byName[path.Base(fetched[i].Path)] = fetched[i]
+		}
+		fetchedCopy := append([]node.Node(nil), fetched...)
+		call.children = fetchedCopy
+
+		m.listingMu.Lock()
+		if m.listings == nil {
+			m.listings = map[string]dirCacheEntry{}
+		}
+		if len(m.listings) >= maxDirCacheEntries {
+			// Evict the oldest entry. This runs only when the cache is full, so the
+			// scan is off the hot path; it keeps the bound without an LRU list.
+			var oldest string
+			var oldestAt time.Time
+			for p, e := range m.listings {
+				if oldest == "" || e.fetched.Before(oldestAt) {
+					oldest, oldestAt = p, e.fetched
+				}
+			}
+			delete(m.listings, oldest)
+		}
+		m.listings[dir] = dirCacheEntry{
+			children: fetchedCopy,
+			byName:   byName,
+			fetched:  time.Now(),
+		}
+		m.listingMu.Unlock()
+		log.Printf("mount: list %s entries=%d took=%s cached=false", dir, len(fetched), took)
+	} else {
+		call.err = err
 		log.Printf("mount: list %s took=%s failed: %v", dir, took, err)
-		return nil, false, err
 	}
-	// The wire's paths are index paths ("win/Documents"), while everything in
-	// this package keys on FUSE paths ("/win/Documents"). The adapter could do
-	// this, but doing it here makes every Caller obey the same convention: the
-	// event table, pending table and handed-out table are all keyed by the
-	// result, so a relative path in any one of them is a path that never matches.
-	for i := range children {
-		children[i].Path = fusePath(children[i].Path)
-	}
-	log.Printf("mount: list %s entries=%d took=%s cached=false", dir, len(children), took)
 
 	m.listingMu.Lock()
-	if m.listings == nil {
-		m.listings = map[string]dirCacheEntry{}
+	delete(m.listingInflight, dir)
+	close(call.done)
+	m.listingMu.Unlock()
+
+	if err != nil {
+		return nil, false, err
 	}
-	if len(m.listings) >= maxDirCacheEntries {
-		// Evict the oldest entry. This runs only when the cache is full, so the
-		// scan is off the hot path; it keeps the bound without an LRU list.
-		var oldest string
-		var oldestAt time.Time
-		for p, e := range m.listings {
-			if oldest == "" || e.fetched.Before(oldestAt) {
-				oldest, oldestAt = p, e.fetched
-			}
-		}
-		delete(m.listings, oldest)
-	}
-	m.listings[dir] = dirCacheEntry{
-		children: append([]node.Node(nil), children...),
-		fetched:  time.Now(),
+	return append([]node.Node(nil), fetched...), false, nil
+}
+
+// lookupChild resolves one name inside a directory using the cached listing's
+// name map.
+//
+// The first lookup after a miss pays the listing fill and then scans the copy
+// it was given; every later lookup is a map hit. This is what keeps a directory
+// of thousands of entries from being scanned once per entry.
+func (m *Mount) lookupChild(dir, name string) (node.Node, bool, error) {
+	m.listingMu.Lock()
+	if e, ok := m.listings[dir]; ok && time.Since(e.fetched) < m.listingTTL() {
+		n, found := e.byName[name]
+		m.listingMu.Unlock()
+		return n, found, nil
 	}
 	m.listingMu.Unlock()
-	return children, false, nil
+
+	children, _, err := m.listDir(dir)
+	if err != nil {
+		return node.Node{}, false, err
+	}
+	for _, c := range children {
+		if path.Base(c.Path) == name {
+			return c, true, nil
+		}
+	}
+	return node.Node{}, false, nil
 }
 
 // invalidateListings drops the listing for path and for its parent.
@@ -102,34 +190,64 @@ func (m *Mount) invalidateListings(path string) {
 	m.listingMu.Unlock()
 }
 
-// invalidateListingSubtree drops every cached listing at or below path, and the
-// parent that names it.
+// invalidateListingBatch applies a whole event batch's invalidation under one
+// lock hold.
 //
-// A tombstone for a directory says the whole subtree is gone, and an entry for a
-// directory that is still there can still be stale after its children changed.
-// invalidateListings only knows about the one path, so it would leave a cached
-// /win/Documents answering a lookup after /win itself was withdrawn.
-func (m *Mount) invalidateListingSubtree(path string) {
-	if path == "" {
+// changed lists paths whose own entry or parent membership changed. subtrees
+// lists deleted directories, each of which covers everything beneath it. One
+// scan of the cached listings with an ancestor walk replaces a per-node lock
+// acquisition and, for tombstones, a per-node scan of every cached directory.
+func (m *Mount) invalidateListingBatch(changed, subtrees []string) {
+	if len(changed) == 0 && len(subtrees) == 0 {
 		return
 	}
 	m.listingMu.Lock()
-	delete(m.listings, path)
-	if path == "/" {
-		m.listings = map[string]dirCacheEntry{}
-		m.listingMu.Unlock()
-		return
-	}
-	if parent, _, err := SplitParent(path); err == nil {
-		delete(m.listings, parent)
-	}
-	prefix := path + "/"
-	for p := range m.listings {
-		if strings.HasPrefix(p, prefix) {
-			delete(m.listings, p)
+	defer m.listingMu.Unlock()
+
+	for _, p := range changed {
+		if p == "" {
+			continue
+		}
+		delete(m.listings, p)
+		if parent, _, err := SplitParent(p); err == nil {
+			delete(m.listings, parent)
 		}
 	}
-	m.listingMu.Unlock()
+	if len(subtrees) == 0 {
+		return
+	}
+
+	deleted := make(map[string]struct{}, len(subtrees))
+	for _, p := range subtrees {
+		deleted[p] = struct{}{}
+	}
+	if _, all := deleted["/"]; all {
+		m.listings = map[string]dirCacheEntry{}
+		return
+	}
+	for key := range m.listings {
+		p := key
+		for {
+			if _, ok := deleted[p]; ok {
+				delete(m.listings, key)
+				break
+			}
+			if p == "" || p == "/" {
+				break
+			}
+			i := strings.LastIndexByte(p, '/')
+			if i < 0 {
+				break
+			}
+			p = p[:i]
+		}
+	}
+	// The parent of a removed name lists that name, so it is stale too.
+	for p := range deleted {
+		if parent, _, err := SplitParent(p); err == nil {
+			delete(m.listings, parent)
+		}
+	}
 }
 
 // fusePath puts a path returned by the caller into the FUSE form this package
@@ -168,6 +286,12 @@ func isRootChild(p string) bool {
 func (m *Mount) deletedAncestor(p string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.deletedAncestorLocked(p)
+}
+
+// deletedAncestorLocked is deletedAncestor for a caller that already holds
+// Mount.mu.
+func (m *Mount) deletedAncestorLocked(p string) bool {
 	for p != "" && p != "/" {
 		parent, _, err := SplitParent(p)
 		if err != nil {
@@ -367,14 +491,14 @@ func (m *Mount) lookup(p string) (node.Node, int) {
 	if err != nil {
 		return node.Node{}, -EINVAL
 	}
-	children, _, err := m.listDir(parent)
+	child, found, err := m.lookupChild(parent, base)
 	if err != nil {
 		// The parent could not be listed, and that error is the diagnosis, so
 		// it is passed through rather than flattened. See the comment above for
 		// what the layer below does and does not distinguish.
 		return node.Node{}, errnoFor(err)
 	}
-	if child, ok := childNamed(children, base); ok {
+	if found {
 		if child.Kind == node.KindSymlink {
 			// A symlink's stat and its read disagree: the index records the
 			// link itself, while the owner opens the path and the operating

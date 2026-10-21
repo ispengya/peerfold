@@ -193,14 +193,11 @@ func (m *Mount) Readdir(path string, fill func(name string, st *Stat, off int64)
 	if n.Kind != node.KindDir {
 		return -ENOTDIR
 	}
-	started := time.Now()
-	children, cached, err := m.listDir(path)
-	took := time.Since(started)
+	children, _, err := m.listDir(path)
 	if err != nil {
 		return errnoFor(err)
 	}
 	children = m.overlayLocalListing(path, children)
-	log.Printf("mount: list %s entries=%d took=%s cached=%t", path, len(children), took, cached)
 	// Sorted so a listing is stable between reads. The index's own order is the
 	// server's business and may change without the tree changing, which would
 	// make a directory appear to shuffle for no reason the user can see.
@@ -381,6 +378,10 @@ func (m *Mount) Open(path string, mode int) (uint64, int) {
 	// path needs to decide whether the buffer holds the file.
 	h.size = n.Size
 	h.contentSize = n.Size
+	// An empty file's complete content is already in the (empty) buffer. A
+	// non-empty one has to be fetched before its first write, or the bytes the
+	// write does not cover would be published as zeros.
+	h.loaded = n.Size == 0
 	// Anything that is not the read-write open is treated as read-only. O_WRONLY
 	// is a separate flag value in POSIX, so testing for equality with OReadOnly
 	// would classify a write-only open as read-write, and testing for equality
@@ -823,6 +824,12 @@ func (m *Mount) Create(path string, mode uint32, access int) (uint64, int) {
 		// it through the mount before that push arrives, and an ENOENT there
 		// makes the open the caller just performed appear not to exist.
 		m.pendingPaths[cleaned] = node.KindFile
+		// A zero-byte file is a file, so its create still has to reach the
+		// owner even when the caller writes nothing. The handle stays clean --
+		// there is no content to flush -- and flush sends the empty body once
+		// for a pending create that has not been uploaded. The empty buffer is
+		// the complete content, so no read is needed before the first write.
+		h.loaded = true
 	}
 	if lookupCode == 0 {
 		// The file is already there. The index's size is recorded as both the
@@ -830,6 +837,7 @@ func (m *Mount) Create(path string, mode uint32, access int) (uint64, int) {
 		// can tell whether this handle's buffer actually holds the file.
 		h.size = existing.Size
 		h.contentSize = existing.Size
+		h.loaded = existing.Size == 0
 	}
 	if body, ok := m.pendingContent[cleaned]; ok {
 		// A pending name can be reopened before the watcher catches up. Carry
@@ -840,6 +848,7 @@ func (m *Mount) Create(path string, mode uint32, access int) (uint64, int) {
 		h.size = int64(len(body))
 		h.contentSize = int64(len(body))
 		h.dirtyVersion = h.version
+		h.loaded = true
 	}
 	// A tombstone from an earlier delete must not shadow a name the caller is
 	// creating again before the owner's event arrives.
@@ -900,6 +909,39 @@ func (m *Mount) Write(path string, buf []byte, off int64, fh uint64) int {
 		m.mu.Unlock()
 		return -EBADF
 	}
+	// A first write to a handle that has never seen the file's bytes must load
+	// them first. Without this, writing two bytes in the middle of an existing
+	// file uploads those two bytes on a zero-filled buffer of the right length,
+	// silently erasing everything else. The load is outside the lock: it is a
+	// sequence of wire reads, and holding the mount's lock across it would stop
+	// every other operation.
+	//
+	// A write that covers the whole existing file is the exception: there are
+	// no untouched bytes to preserve, so a tool that rewrites a large file in
+	// one go does not have to fetch the copy it is replacing.
+	if !h.loaded && off == 0 && int64(len(buf)) >= h.size {
+		h.loaded = true
+	}
+	if !h.loaded {
+		m.mu.Unlock()
+		if err := m.ensureLoaded(h); err != nil {
+			return errnoFor(err)
+		}
+		m.mu.Lock()
+		h, ok = m.files[fh]
+		if !ok {
+			m.mu.Unlock()
+			return -EBADF
+		}
+		if h.kind == node.KindDir {
+			m.mu.Unlock()
+			return -EISDIR
+		}
+		if h.readOnly {
+			m.mu.Unlock()
+			return -EBADF
+		}
+	}
 	// The handle records a write as a status, where zero means it was taken. The
 	// interface this method implements wants a byte count instead, so the two are
 	// converted here rather than making the handle carry both meanings: a handle
@@ -959,19 +1001,22 @@ func (m *Mount) writeThroughPath(path string, buf []byte, off int64) int {
 		// The buffer now carries the owner's bytes. It is a load, not a
 		// mutation, so the handle stays clean until the caller writes.
 		h.dirtyVersion = h.version
+		h.loaded = true
+	} else if pending {
+		// A pending name with no uploaded body is a file this mount created and
+		// has not flushed. Its complete content is empty.
+		h.loaded = true
 	}
 	m.mu.Unlock()
 	// The owner's bytes are loaded so a partial write does not become the whole
 	// file. A name this mount just created has no owner bytes to load -- the
 	// read would fail -- and the empty buffer it would leave behind is exactly
 	// the truth: the write below is the whole of the file.
-	if !pending {
-		if err := m.loadContent(h); err != nil {
-			m.mu.Lock()
-			m.closeHandle(fh)
-			m.mu.Unlock()
-			return errnoFor(err)
-		}
+	if err := m.ensureLoaded(h); err != nil {
+		m.mu.Lock()
+		m.closeHandle(fh)
+		m.mu.Unlock()
+		return errnoFor(err)
 	}
 
 	m.mu.Lock()
@@ -1015,16 +1060,55 @@ func (m *Mount) loadContent(h *openFile) error {
 	if err != nil && len(body) == 0 {
 		return err
 	}
-	if len(body) == 0 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if h.loaded {
+		// A concurrent load, a truncation, or a rename completed while these
+		// bytes were on the wire. That state is newer than what was read, and
+		// installing this copy would overwrite it.
 		return nil
 	}
-	m.mu.Lock()
-	h.writes[0] = append([]byte(nil), body...)
-	h.size = int64(len(body))
-	m.mu.Unlock()
+	if len(body) > 0 {
+		h.writes[0] = append([]byte(nil), body...)
+		h.size = int64(len(body))
+	}
+	h.loaded = true
 	// Filling the buffer from the owner is not a mutation, so it does not mark
 	// the handle dirty. The write or truncation that follows does.
 	return nil
+}
+
+// ensureLoaded gives a handle the file's complete content before its first
+// mutation, without holding Mount.mu across the wire.
+//
+// It is the guard that makes a partial write safe: content() fills any gap with
+// zeros, so a handle that only holds the bytes just written would publish zeros
+// over everything the write did not cover. A handle whose size is zero needs
+// nothing fetched -- empty is complete -- and is simply marked loaded.
+//
+// loadMu collapses concurrent first writes on one handle into one load. The
+// second caller waits, then finds loaded set and writes into the buffer the
+// first one installed.
+func (m *Mount) ensureLoaded(h *openFile) error {
+	m.mu.Lock()
+	if h.loaded || h.size == 0 {
+		h.loaded = true
+		m.mu.Unlock()
+		return nil
+	}
+	m.mu.Unlock()
+
+	m.loadMu.Lock()
+	defer m.loadMu.Unlock()
+
+	m.mu.Lock()
+	if h.loaded || h.size == 0 {
+		h.loaded = true
+		m.mu.Unlock()
+		return nil
+	}
+	m.mu.Unlock()
+	return m.loadContent(h)
 }
 
 // readPath reads a whole file from the owner, without holding the mount's lock.
@@ -1075,29 +1159,32 @@ func (m *Mount) Truncate(path string, size int64, fh uint64) int {
 	h, ok := m.files[fh]
 	if ok {
 		clean := h.isClean()
+		loaded := h.loaded
 		m.mu.Unlock()
 
-		if clean {
-			// A handle that has never held this file's content is loaded first.
-			// Truncation means "this content, of this length", and cutting a
-			// buffer that never had the file in it would keep the length and lose
-			// the bytes.
+		if clean && size > 0 && !loaded {
+			// Truncating to a non-zero length means "this content, shortened".
+			// Cutting a buffer that never had the file in it would lose the bytes
+			// the new length keeps, so they are fetched first.
 			//
-			// It is loaded unconditionally rather than only when the index claims
-			// a non-zero size. The index is the same source the handle's size came
-			// from, so trusting it here would let one stale "this file is empty"
-			// shorten a non-empty file -- the silent-loss failure. Reading an
-			// empty file costs one round trip and changes nothing.
+			// Truncating to zero is deliberately excluded: there is nothing to
+			// preserve, and fetching a whole file only to discard it is exactly
+			// what opening a large file with O_TRUNC used to do.
 			//
 			// The load happens outside the mount's lock: reading a large file
 			// while holding it would stop every other operation for the length of
 			// the read, including the ones that would notice a dead connection.
-			if err := m.loadContent(h); err != nil {
+			if err := m.ensureLoaded(h); err != nil {
 				return errnoFor(err)
 			}
 		}
 
 		m.mu.Lock()
+		h, ok = m.files[fh]
+		if !ok {
+			m.mu.Unlock()
+			return -EBADF
+		}
 		n := h.truncateTo(size)
 		m.mu.Unlock()
 		return n
@@ -1123,11 +1210,15 @@ func (m *Mount) Truncate(path string, size int64, fh uint64) int {
 	th.contentSize = n.Size
 	m.mu.Unlock()
 
-	if err := m.loadContent(th); err != nil {
-		m.mu.Lock()
-		m.closeHandle(tmp)
-		m.mu.Unlock()
-		return errnoFor(err)
+	// Truncating to zero needs no bytes at all. Anything longer keeps a prefix
+	// of the current content, so it has to be fetched first.
+	if size > 0 {
+		if err := m.ensureLoaded(th); err != nil {
+			m.mu.Lock()
+			m.closeHandle(tmp)
+			m.mu.Unlock()
+			return errnoFor(err)
+		}
 	}
 
 	m.mu.Lock()
@@ -1535,6 +1626,7 @@ func (m *Mount) Rename(oldPath, newPath string) int {
 			h.writes = map[int64][]byte{}
 			h.size = 0
 			h.contentSize = 0
+			h.loaded = true
 			h.dirtyVersion = h.version
 			h.dirty = false
 			m.cache.dropOpenLocked(h.fh)

@@ -322,8 +322,9 @@ func TestWriteThenFlushPutsWholeFile(t *testing.T) {
 }
 
 // A short write over a longer file must upload the whole file, with the bytes
-// past the write preserved from the owner. This is where a whole-file write-back
-// differs from a range write, and getting it wrong truncates the file.
+// outside the write preserved from the owner. This is where a whole-file
+// write-back differs from a range write, and getting it wrong truncates the
+// file.
 func TestFlushUploadsTheWholeFileIncludingUntouchedBytes(t *testing.T) {
 	m := newTestMount(t)
 	f := fakeOf(t, m)
@@ -332,21 +333,16 @@ func TestFlushUploadsTheWholeFileIncludingUntouchedBytes(t *testing.T) {
 
 	fh, _ := m.Open("/a.txt", OReadWrite)
 	// Only the middle three bytes are replaced. The handle's buffer starts
-	// empty, so the whole file must be read into it first for the untouched bytes
-	// to survive -- that is what cgofuse's read-modify-write does, and this test
-	// exists to show what happens without it.
+	// empty, so the first write loads the owner's bytes into it; otherwise the
+	// untouched positions would be published as zeros.
 	if n := m.Write("/a.txt", []byte("ABC"), 3, fh); n != 3 {
 		t.Fatalf("Write = %d", n)
 	}
 	if code := m.Flush("/a.txt", fh); code != 0 {
 		t.Fatalf("Flush = %d", code)
 	}
-	// The handle never read the owner's first three or last four bytes, so the
-	// upload carries zeros there. This is stated as the actual behaviour so that
-	// the host adapter's obligation to read before writing is not a surprise:
-	// see TestHostReadBeforeModifyStrategy in Task 10.
-	if got := string(f.data["/a.txt"]); got != "\x00\x00\x00ABC\x00\x00\x00\x00" {
-		t.Errorf("after flush = %q", got)
+	if got := string(f.data["/a.txt"]); got != "012ABC6789" {
+		t.Errorf("after flush = %q, want %q", got, "012ABC6789")
 	}
 }
 
@@ -957,22 +953,20 @@ func TestReadModifyWriteRoundTrip(t *testing.T) {
 	if w := m.Write("/a.txt", edited, off, fh); w != len(edited) {
 		t.Fatalf("Write = %d", w)
 	}
-	// The read-modify-write works because the read filled the handle's cache and
-	// the write only covers the word, so the rest of the buffer is the original.
-	// Note this relies on the host reading before writing: see the flush body
-	// tests, which show the handle's buffer is its own.
+	// The read-modify-write works whether or not the read filled the handle's
+	// buffer: the first write loads the owner's content before it applies, so
+	// the bytes the write does not cover survive.
 	if code := m.Fsync("/a.txt", false, fh); code != 0 {
 		t.Fatalf("Fsync = %d", code)
 	}
 	if code := m.Release("/a.txt", fh); code != 0 {
 		t.Fatalf("Release = %d", code)
 	}
-	// The write path uploads the handle's buffer, which is only the written
-	// region plus zeros, so the owner does not hold a coherent edit. That is the
-	// design gap the host adapter has to bridge, and it is asserted here rather
-	// than hidden.
-	if got := string(f.data["/a.txt"]); got == strings.Replace(original, "quick", "lazy", 1) {
-		t.Log("the upload happened to be coherent")
+	// A range write replaces exactly the bytes it covers. The trailing "k" of
+	// "quick" is outside the four written bytes and must survive.
+	want := original[:off] + "lazy" + original[off+4:]
+	if got := string(f.data["/a.txt"]); got != want {
+		t.Fatalf("owner content = %q, want %q", got, want)
 	}
 }
 

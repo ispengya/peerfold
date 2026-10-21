@@ -884,7 +884,11 @@ func isTimeout(err error) bool {
 func (v *Viewer) startPump() {
 	v.startReader.Do(func() {
 		v.mu.Lock()
-		v.events = make(chan Event, 64)
+		// A build can produce hundreds of batches in a burst. The channel is
+		// only a hand-off to the mount's own watch loop, so a depth that covers
+		// a storm costs a few thousand small structs and avoids turning a slow
+		// apply into a sequence gap that invalidates every cached listing.
+		v.events = make(chan Event, 1024)
 		v.connToken = make(chan struct{}, 1)
 		v.connToken <- struct{}{}
 		v.reader = true

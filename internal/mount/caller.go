@@ -133,6 +133,12 @@ type Mount struct {
 	// miss before the first fill completes, and without this each one goes to
 	// the wire for the same bytes.
 	fetchMu sync.Mutex
+	// loadMu serialises content loads for a handle's first write. Two writes
+	// arriving together on one clean handle must not both fetch the whole file;
+	// the second waits, re-checks loaded, and then writes into the loaded
+	// buffer. It is separate from fetchMu because a load is a whole-file
+	// sequence of reads, not a chunk fill.
+	loadMu sync.Mutex
 	// listingMu guards listings, the directory cache.
 	//
 	// lookup() resolves a path by listing its parent, so without this every
@@ -141,6 +147,10 @@ type Mount struct {
 	// across a network call.
 	listingMu sync.Mutex
 	listings  map[string]dirCacheEntry
+	// listingInflight holds the directory fetches currently on the wire, so
+	// concurrent misses share one answer instead of each transferring the whole
+	// listing. Guarded by listingMu.
+	listingInflight map[string]*listingCall
 
 	// events is what the watch channel has told this mount, keyed by full path.
 	//
@@ -224,15 +234,16 @@ type Mount struct {
 // reaches the owner.
 func New(caller Caller, opts Options) *Mount {
 	return &Mount{
-		caller:         caller,
-		opts:           opts,
-		files:          map[uint64]*openFile{},
-		cache:          newChunkCache(opts.BufferLimit, opts.BufferTotal),
-		events:         map[string]node.Node{},
-		listings:       map[string]dirCacheEntry{},
-		pendingPaths:   map[string]node.Kind{},
-		pendingContent: map[string][]byte{},
-		handed:         map[string]struct{}{},
+		caller:          caller,
+		opts:            opts,
+		files:           map[uint64]*openFile{},
+		cache:           newChunkCache(opts.BufferLimit, opts.BufferTotal),
+		events:          map[string]node.Node{},
+		listings:        map[string]dirCacheEntry{},
+		listingInflight: map[string]*listingCall{},
+		pendingPaths:    map[string]node.Kind{},
+		pendingContent:  map[string][]byte{},
+		handed:          map[string]struct{}{},
 	}
 }
 
@@ -248,6 +259,13 @@ type Options struct {
 	BufferTotal int
 	// WriteLimit is how many bytes of accumulated writing one open may hold.
 	// Past it a write is refused with ENOSPC rather than truncated.
+	//
+	// The default is 16 MiB, which leaves headroom over the 10 MB files this
+	// version targets: the limit counts bytes held, and a file that is opened
+	// for a partial edit also holds the untouched content loaded before the
+	// write. A larger file is still refused visibly rather than silently
+	// truncated; the disk-spooled write path that removes the ceiling is a
+	// later change.
 	WriteLimit int
 	// ChunkSize is how many bytes one ranged read asks the owner for. It is
 	// the knob that trades first-byte latency against sequential throughput on
@@ -260,6 +278,12 @@ type Options struct {
 	// the wire without hiding a change for long.
 	AttrTimeout  time.Duration
 	EntryTimeout time.Duration
+	// ListingTimeout is how long a directory listing is reused. It is separate
+	// from EntryTimeout on purpose: the kernel's entry cache is expired by
+	// Explorer's refresh loop every few seconds, while the listing behind it
+	// only changes when something in the directory changes. Events invalidate
+	// it immediately, so this bounds staleness only when an event is lost.
+	ListingTimeout time.Duration
 	// RootMode is the permission bits reported for the mount root itself.
 	//
 	// The root is synthesised rather than listed: no client owns it, so there
@@ -309,9 +333,10 @@ type Options struct {
 // reader of a big file is not re-fetching, small enough that the process cannot
 // be made to exhaust memory by an ordinary workload.
 //
-// 8 MiB of accumulated writes per open: a file smaller than this is written
-// back in one Put at release, which is the common case. A larger file is refused
-// with ENOSPC rather than silently truncated, so the failure is visible.
+// 16 MiB of accumulated writes per open: this version targets files up to
+// 10 MB, and the extra headroom covers the untouched content a partial edit
+// loads into the same buffer. A larger file is refused with ENOSPC rather than
+// silently truncated, so the failure is visible.
 //
 // 1 second for both timeouts: long enough that a walk of a directory does not
 // re-ask for every attribute, short enough that a change made elsewhere is seen
@@ -329,10 +354,11 @@ func DefaultOptions() Options {
 	return Options{
 		BufferLimit:     64 << 20,
 		BufferTotal:     256 << 20,
-		WriteLimit:      8 << 20,
+		WriteLimit:      16 << 20,
 		ChunkSize:       chunkSize,
 		AttrTimeout:     5 * time.Second,
 		EntryTimeout:    5 * time.Second,
+		ListingTimeout:  30 * time.Second,
 		RootMode:        0o755,
 		InvalidateTable: 4096,
 		ReconnectMin:    time.Second,

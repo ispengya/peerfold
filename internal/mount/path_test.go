@@ -2,7 +2,9 @@ package mount
 
 import (
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/ispengya/peerfold/internal/node"
 )
@@ -63,6 +65,128 @@ func TestLookupReusesTheDirectoryListing(t *testing.T) {
 	}
 	if got := f.countCalls("List /"); got != afterFirst {
 		t.Fatalf("repeated lookups made %d extra List calls, want 0", got-afterFirst)
+	}
+}
+
+// TestACachedListingAnswersLookupsByName pins the constant-time half of the
+// listing cache: after one fill, resolving a name must not scan the directory.
+func TestACachedListingAnswersLookupsByName(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	for _, name := range []string{"/a.txt", "/b.txt", "/c.txt"} {
+		f.addFile(name, 1)
+	}
+
+	if _, code := m.lookup("/b.txt"); code != 0 {
+		t.Fatalf("lookup(/b.txt) = %d", code)
+	}
+	m.listingMu.Lock()
+	entry, ok := m.listings["/"]
+	m.listingMu.Unlock()
+	if !ok {
+		t.Fatal("the listing was not cached")
+	}
+	if _, ok := entry.byName["b.txt"]; !ok {
+		t.Fatal("the cached listing has no name index")
+	}
+
+	before := f.countCalls("List /")
+	for i := 0; i < 10; i++ {
+		if _, code := m.lookup("/c.txt"); code != 0 {
+			t.Fatalf("repeat lookup(/c.txt) = %d", code)
+		}
+	}
+	if got := f.countCalls("List /"); got != before {
+		t.Fatalf("repeat lookups made %d List call(s), want 0", got-before)
+	}
+}
+
+// TestAListingExpiresOnItsOwnClock pins the separate listing TTL. A change is
+// delivered by an event and invalidates the entry immediately; the TTL is only
+// the backstop for a lost event, so it must not follow the kernel's much shorter
+// attribute timeout.
+func TestAListingExpiresOnItsOwnClock(t *testing.T) {
+	m := newTestMount(t)
+	m.opts.ListingTimeout = 20 * time.Millisecond
+	f := fakeOf(t, m)
+	f.addFile("/a.txt", 1)
+
+	if _, code := m.lookup("/a.txt"); code != 0 {
+		t.Fatalf("lookup = %d", code)
+	}
+	before := f.countCalls("List /")
+	if _, code := m.lookup("/a.txt"); code != 0 {
+		t.Fatalf("cached lookup = %d", code)
+	}
+	if got := f.countCalls("List /"); got != before {
+		t.Fatalf("a lookup inside the TTL made %d List call(s)", got-before)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if _, code := m.lookup("/a.txt"); code != 0 {
+		t.Fatalf("lookup after expiry = %d", code)
+	}
+	if got := f.countCalls("List /"); got <= before {
+		t.Fatal("the listing was not refreshed after its TTL")
+	}
+}
+
+// blockingLister holds every List call until release is closed, and counts how
+// many arrived.
+type blockingLister struct {
+	*fakeCaller
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	lists   int
+}
+
+func (b *blockingLister) List(path string) ([]node.Node, error) {
+	b.mu.Lock()
+	b.lists++
+	b.mu.Unlock()
+	b.once.Do(func() { close(b.started) })
+	<-b.release
+	return b.fakeCaller.List(path)
+}
+
+func (b *blockingLister) listCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.lists
+}
+
+// TestConcurrentListingMissesShareOneTransfer pins the singleflight: two
+// lookups that miss the same directory together must produce one List, not one
+// each. Without it, Explorer's concurrent Readdirs and the kernel's readdirplus
+// both transferred the whole directory.
+func TestConcurrentListingMissesShareOneTransfer(t *testing.T) {
+	f := newFakeCaller()
+	f.addFile("/a.txt", 1)
+	f.addFile("/b.txt", 1)
+	b := &blockingLister{
+		fakeCaller: f,
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	m := New(b, DefaultOptions())
+
+	done := make(chan int, 2)
+	go func() { _, code := m.lookup("/a.txt"); done <- code }()
+	<-b.started
+	go func() { _, code := m.lookup("/b.txt"); done <- code }()
+	time.Sleep(20 * time.Millisecond)
+	if got := b.listCount(); got != 1 {
+		t.Fatalf("%d List calls while the first was in flight, want 1", got)
+	}
+	close(b.release)
+	for i := 0; i < 2; i++ {
+		if code := <-done; code != 0 {
+			t.Fatalf("lookup = %d", code)
+		}
+	}
+	if got := b.listCount(); got != 1 {
+		t.Fatalf("%d List calls in total, want 1", got)
 	}
 }
 
