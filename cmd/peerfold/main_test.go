@@ -192,13 +192,25 @@ func waitForAddress(t *testing.T, out interface{ String() string }) string {
 func TestRunDispatchesEveryKnownCommand(t *testing.T) {
 	_ = []string{} // stubs, if any return
 
+	// Give the commands a home of their own. `ls` with no arguments reads the
+	// per-user server config, so on a machine where the user has configured a
+	// server and left it running, a bare `ls` succeeds -- which is correct
+	// behaviour and makes the "missing input" assertion below depend on the
+	// machine. Isolating HOME (and USERPROFILE, which is what os.UserHomeDir
+	// reads on Windows) pins the dispatch question instead.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
 	// These reach their real implementations, which reject the missing input.
 	//
-	// `mount` is driven through its own missing-server rejection rather than the
-	// plain-args loop here, because with no arguments it would fall back to the
-	// real config path and a real default mount point; the loop below stays for
-	// the commands whose bare form is safely inert.
-	for _, cmd := range []string{"client", "ls", "cat", "put", "mkdir", "rm", "mv"} {
+	// The three long-running or interactive commands -- server, client and
+	// mount -- are pinned separately below. A bare `client` runs the interactive
+	// setup, which on empty stdin accepts the defaults and starts a foreground
+	// client; on a machine whose default 127.0.0.1:7000 is live that joins the
+	// server and never returns. The loop stays for the commands whose bare form
+	// is safely inert.
+	for _, cmd := range []string{"ls", "cat", "put", "mkdir", "rm", "mv"} {
 		var out, errOut bytes.Buffer
 		if code := runWithEmptyStdin([]string{cmd}, &out, &errOut); code == 0 {
 			t.Fatalf("runWithEmptyStdin([%s]) = 0, want non-zero", cmd)
@@ -206,6 +218,17 @@ func TestRunDispatchesEveryKnownCommand(t *testing.T) {
 		if strings.Contains(errOut.String(), "TODO") {
 			t.Fatalf("runWithEmptyStdin([%s]) stderr = %q, want the real implementation rather than the stub notice", cmd, errOut.String())
 		}
+	}
+
+	// `client` is pinned through --help rather than run bare: bare means the
+	// interactive setup, and the flag parser is reached before anything binds or
+	// dials, which is what this test is about.
+	var cOut, cErr bytes.Buffer
+	if code := runWithEmptyStdin([]string{"client", "--help"}, &cOut, &cErr); code != 2 {
+		t.Fatalf("runWithEmptyStdin([client --help]) = %d, want 2 from the flag parser; stderr = %q", code, cErr.String())
+	}
+	if !strings.Contains(cErr.String(), "usage: peerfold client") {
+		t.Errorf("stderr = %q, want the client usage text: the dispatch arm did not reach cmd_client.go", cErr.String())
 	}
 
 	// `server` cannot be driven this way: it is a long-running command, so
