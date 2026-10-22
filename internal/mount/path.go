@@ -4,6 +4,7 @@ import (
 	"log"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ispengya/peerfold/internal/node"
@@ -65,13 +66,26 @@ func (m *Mount) listingTTL() time.Duration {
 // for one wire answer rather than sending two. The waiter reports cached=true
 // because it did not pay a round trip of its own.
 func (m *Mount) listDir(dir string) (children []node.Node, cached bool, err error) {
+	return m.listDirLogged(dir, true)
+}
+
+// listDirLogged is listDir with the logging made optional.
+//
+// Prefetch fills run through here with logging off. They are speculative: a
+// line per warmed subdirectory would turn one Readdir into a burst of "list"
+// entries, and a failure nobody asked for is not worth a log line either. The
+// cache mechanics are identical, including singleflight, so a real lookup that
+// arrives while a prefetch is in flight waits for the same answer.
+func (m *Mount) listDirLogged(dir string, logAccess bool) (children []node.Node, cached bool, err error) {
 	ttl := m.listingTTL()
 
 	m.listingMu.Lock()
 	if e, ok := m.listings[dir]; ok && time.Since(e.fetched) < ttl {
 		children = append([]node.Node(nil), e.children...)
 		m.listingMu.Unlock()
-		log.Printf("mount: list %s entries=%d took=0s cached=true", dir, len(children))
+		if logAccess {
+			log.Printf("mount: list %s entries=%d took=0s cached=true", dir, len(children))
+		}
 		return children, true, nil
 	}
 	if call, ok := m.listingInflight[dir]; ok {
@@ -128,10 +142,14 @@ func (m *Mount) listDir(dir string) (children []node.Node, cached bool, err erro
 			fetched:  time.Now(),
 		}
 		m.listingMu.Unlock()
-		log.Printf("mount: list %s entries=%d took=%s cached=false", dir, len(fetched), took)
+		if logAccess {
+			log.Printf("mount: list %s entries=%d took=%s cached=false", dir, len(fetched), took)
+		}
 	} else {
 		call.err = err
-		log.Printf("mount: list %s took=%s failed: %v", dir, took, err)
+		if logAccess {
+			log.Printf("mount: list %s took=%s failed: %v", dir, took, err)
+		}
 	}
 
 	m.listingMu.Lock()
@@ -276,6 +294,124 @@ func (m *Mount) removeListingChildLocked(p string) {
 	e.children = kept
 	e.fetched = time.Now()
 	m.listings[parent] = e
+}
+
+// forgetListing drops the cached listing for one path, leaving its parent's.
+//
+// It is what a local mkdir needs: any listing cached for the new name itself
+// describes the previous occupant, while the parent listing stays useful -- the
+// pending overlay is what makes the new name visible there.
+func (m *Mount) forgetListing(p string) {
+	m.listingMu.Lock()
+	delete(m.listings, p)
+	m.listingMu.Unlock()
+}
+
+// updateListingChild replaces one file's size and mtime in its parent's cached
+// listing.
+//
+// A local flush used to invalidate the parent outright, which made the next
+// Readdir refetch the whole directory even though one file had changed. Patching
+// keeps every untouched entry serving lookups and leaves the entry's original
+// fetch time alone, so the TTL still ages the listing out on its own clock.
+//
+// A name the cached listing does not know yet is deliberately not inserted here:
+// that means a file this mount created and whose event has not arrived, and the
+// pending overlay in Readdir already supplies it with the uploaded size. An
+// expired entry is left alone for the same reason applyListingEvents leaves it
+// alone: a partial patch must not make a stale directory look fresh.
+func (m *Mount) updateListingChild(p string, size, mtime int64) {
+	parent, base, err := SplitParent(p)
+	if err != nil {
+		return
+	}
+	m.listingMu.Lock()
+	defer m.listingMu.Unlock()
+	e, ok := m.listings[parent]
+	if !ok || time.Since(e.fetched) >= m.listingTTL() {
+		return
+	}
+	n, ok := e.byName[base]
+	if !ok {
+		return
+	}
+	n.Size = size
+	n.Mtime = mtime
+	e.byName[base] = n
+	for i := range e.children {
+		if e.children[i].Path == n.Path {
+			e.children[i] = n
+			break
+		}
+	}
+	m.listings[parent] = e
+}
+
+// prefetchListingChildren warms the listings of the subdirectories a Readdir
+// just returned.
+//
+// A walk of a deep tree is otherwise one serial round trip per level: list the
+// directory, then list each child only when the walker gets there. Fetching the
+// next level while the caller is still consuming this one folds that staircase
+// into roughly one round trip per level of lookahead.
+//
+// The work is bounded twice. At most ListingPrefetch children are warmed per
+// Readdir, at most one batch runs at a time (listingPrefetchBatches), and at
+// most two fills are on the wire at once (listingPrefetchTokens). A Readdir
+// that finds a batch already running skips its own: that batch is warming the
+// same next level, and queueing a second would only put speculative work behind
+// speculative work.
+func (m *Mount) prefetchListingChildren(children []node.Node) {
+	limit := m.opts.ListingPrefetch
+	if limit <= 0 || m.offline() {
+		return
+	}
+	todo := make([]string, 0, limit)
+	for _, c := range children {
+		if c.Kind != node.KindDir || m.listingFresh(c.Path) {
+			continue
+		}
+		todo = append(todo, c.Path)
+		if len(todo) >= limit {
+			break
+		}
+	}
+	if len(todo) == 0 {
+		return
+	}
+	select {
+	case m.listingPrefetchBatches <- struct{}{}:
+	default:
+		return
+	}
+	go func() {
+		defer func() { <-m.listingPrefetchBatches }()
+		var wg sync.WaitGroup
+		for _, dir := range todo {
+			m.listingPrefetchTokens <- struct{}{}
+			wg.Add(1)
+			go func(dir string) {
+				defer wg.Done()
+				defer func() { <-m.listingPrefetchTokens }()
+				if m.offline() {
+					return
+				}
+				// A fill already on the wire is shared rather than duplicated (the
+				// singleflight in listDirLogged), and one already cached is a no-op.
+				m.listDirLogged(dir, false)
+			}(dir)
+		}
+		wg.Wait()
+	}()
+}
+
+// listingFresh reports whether dir's cached listing is still inside its TTL.
+func (m *Mount) listingFresh(dir string) bool {
+	ttl := m.listingTTL()
+	m.listingMu.Lock()
+	defer m.listingMu.Unlock()
+	e, ok := m.listings[dir]
+	return ok && time.Since(e.fetched) < ttl
 }
 
 // dropListingSubtreeLocked forgets the cached listing of path and everything

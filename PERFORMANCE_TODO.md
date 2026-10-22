@@ -36,6 +36,22 @@
 - 读路径日志降噪：只记录慢请求和错误
 - 连接池在 reconnect 换 caller 时关闭旧连接；watch 停止后到达的事件不再应用
 
+### 追加优化（2026-10-22 晚，实测日志驱动）
+
+实测日志暴露了两个具体成本：复制/保存期间每次 Create/Flush 都会把父目录 listing
+整体丢弃，导致 Explorer 每次刷新都重传整目录；深层目录 walk 每层付一次串行 RTT。
+
+- 本地 Create/Mkdir 不再丢弃父目录 listing：新名字由 `pendingPaths` 回答 lookup，
+  由 `overlayLocalListing` 进入 Readdir，owner 事件到达后 upsert 进缓存；
+  只丢弃新路径自身的旧 listing（`forgetListing`）
+- Flush 不再整目录失效：只把父 listing 中该文件的 size/mtime 原地 patch
+  （`updateListingChild`）；缓存里还没有的新文件继续走 pending overlay
+- Readdir 之后后台预取子目录 listing：每批最多 8 个（`ListingPrefetch`），
+  同一时刻只跑一批、最多 2 个填充并发；跳过已新鲜或正在填充的目录，
+  预取失败不记日志。深树 walk 的下一层因此在回调消费当前层时已在路上
+- 回归测试：`TestFlushPatchesTheCachedParentListing`、
+  `TestCreateKeepsTheCachedParentListing`、`TestReaddirWarmsChildListings`
+
 **关于“批量元数据写”**：FUSE 的 mkdir/create/close 是逐个同步调用，构建工具会等待
 每个 close 的结果，因此真正的跨文件 batch-put 只能靠 write-behind（提前返回）或
 协议级多文件请求，而前者会削弱“close 成功即已保存”的承诺。本轮用连接池让并发的
@@ -132,6 +148,10 @@
   不再与 `Close` 写 `v.events` 竞争
 
 当前 `go test ./...` 与关键包的 `-race` 全部通过。
+
+`TestRunDispatchesEveryKnownCommand` 现在把 HOME/USERPROFILE 指到临时目录：裸 `ls`
+会读每用户 server 配置，在已经配置并运行了 server 的机器上会正常返回 0，
+不再是“缺少输入”，测试不应依赖机器状态。
 
 Windows 交叉编译验证命令：
 

@@ -1080,3 +1080,99 @@ func TestFlushedHandleStaysCleanUntilTouched(t *testing.T) {
 		t.Fatal("a write after a flush left the handle clean")
 	}
 }
+
+// TestFlushPatchesTheCachedParentListing pins the cost of a save: the file's
+// entry in the parent listing is updated in place, not thrown away with the
+// whole directory. Dropping it meant every Explorer refresh after a save
+// refetched a directory that had changed in exactly one entry.
+func TestFlushPatchesTheCachedParentListing(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addFile("/a.txt", 5)
+	f.setContent("/a.txt", []byte("hello"))
+
+	if _, _, err := m.listDir("/"); err != nil {
+		t.Fatalf("listDir(/): %v", err)
+	}
+	before := f.countCalls("List /")
+
+	fh, code := m.Open("/a.txt", OReadWrite)
+	if code != 0 {
+		t.Fatalf("Open = %d", code)
+	}
+	if n := m.Write("/a.txt", []byte("HELLO!"), 0, fh); n != 6 {
+		t.Fatalf("Write = %d", n)
+	}
+	if code := m.Flush("/a.txt", fh); code != 0 {
+		t.Fatalf("Flush = %d", code)
+	}
+
+	m.listingMu.Lock()
+	e, ok := m.listings["/"]
+	var entry node.Node
+	if ok {
+		entry, ok = e.byName["a.txt"]
+	}
+	m.listingMu.Unlock()
+	if !ok {
+		t.Fatal("Flush dropped the parent listing or the file's entry from it")
+	}
+	if entry.Size != 6 {
+		t.Errorf("cached size after Flush = %d, want 6", entry.Size)
+	}
+
+	if _, code := m.lookup("/a.txt"); code != 0 {
+		t.Fatalf("lookup after Flush = %d", code)
+	}
+	if got := f.countCalls("List /"); got != before {
+		t.Errorf("lookup after Flush refetched the directory: %d Lists, want %d", got, before)
+	}
+}
+
+// TestCreateKeepsTheCachedParentListing pins the other half: a new name is made
+// visible by the pending overlay, so the directory does not have to be
+// refetched to show it. A copy of a hundred files used to invalidate the
+// destination listing a hundred times.
+func TestCreateKeepsTheCachedParentListing(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addFile("/a.txt", 1)
+
+	if _, _, err := m.listDir("/"); err != nil {
+		t.Fatalf("listDir(/): %v", err)
+	}
+	before := f.countCalls("List /")
+
+	if _, code := m.Create("/new.txt", 0o644, OReadWrite); code != 0 {
+		t.Fatalf("Create = %d", code)
+	}
+	m.listingMu.Lock()
+	_, cached := m.listings["/"]
+	m.listingMu.Unlock()
+	if !cached {
+		t.Fatal("Create dropped the parent listing")
+	}
+
+	var names []string
+	if code := m.Readdir("/", func(name string, _ *Stat, _ int64) bool {
+		names = append(names, name)
+		return true
+	}, 0, 0); code != 0 {
+		t.Fatalf("Readdir(/) = %d", code)
+	}
+	found := false
+	for _, name := range names {
+		if name == "new.txt" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Readdir(/) = %v, want the pending new.txt", names)
+	}
+	if _, code := m.lookup("/new.txt"); code != 0 {
+		t.Errorf("lookup of the pending name = %d, want 0", code)
+	}
+	if got := f.countCalls("List /"); got != before {
+		t.Errorf("Create/Readdir refetched the directory: %d Lists, want %d", got, before)
+	}
+}

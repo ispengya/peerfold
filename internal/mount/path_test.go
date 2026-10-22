@@ -732,3 +732,48 @@ func TestAnEventPatchesTheCachedParentListing(t *testing.T) {
 		t.Errorf("the deletion refetched the directory: %d Lists, want %d", got, before)
 	}
 }
+
+// TestReaddirWarmsChildListings pins the lookahead: after a directory is
+// listed, its subdirectories are filled in the background, so the next level of
+// a walk is answered from the cache instead of paying another serial round trip.
+func TestReaddirWarmsChildListings(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addFile("/d/a/one.txt", 1)
+	f.addFile("/d/b/one.txt", 1)
+	f.addFile("/d/c/one.txt", 1)
+
+	if code := m.Readdir("/d", func(string, *Stat, int64) bool { return true }, 0, 0); code != 0 {
+		t.Fatalf("Readdir(/d) = %d", code)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		done := true
+		for _, dir := range []string{"/d/a", "/d/b", "/d/c"} {
+			if f.countCalls("List "+dir) == 0 {
+				done = false
+			}
+		}
+		if done {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	for _, dir := range []string{"/d/a", "/d/b", "/d/c"} {
+		if got := f.countCalls("List " + dir); got != 1 {
+			t.Fatalf("prefetch listed %s %d times, want 1", dir, got)
+		}
+		if !m.listingFresh(dir) {
+			t.Errorf("%s was listed but its cache entry is not fresh", dir)
+		}
+	}
+
+	before := f.countCalls("List /d/a")
+	if _, code := m.lookup("/d/a/one.txt"); code != 0 {
+		t.Fatalf("lookup in a prefetched directory = %d", code)
+	}
+	if got := f.countCalls("List /d/a"); got != before {
+		t.Errorf("the prefetched directory was fetched again: %d Lists, want %d", got, before)
+	}
+}

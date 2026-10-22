@@ -269,7 +269,11 @@ func (m *Mount) flushWithDurability(fh uint64, durable bool) int {
 		m.pendingContent[path] = append([]byte(nil), body...)
 	}
 	// The file's size and mtime are new, and its parent listing carries them.
-	m.invalidateListings(path)
+	// Patch that one entry rather than dropping the directory: a save must not
+	// cost the next Readdir a whole-directory refetch. A name the listing does
+	// not know yet is left to the pending overlay, which carries the size the
+	// upload just gave it.
+	m.updateListingChild(path, int64(len(body)), time.Now().Unix())
 	return 0
 }
 

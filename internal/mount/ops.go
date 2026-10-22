@@ -197,6 +197,12 @@ func (m *Mount) Readdir(path string, fill func(name string, st *Stat, off int64)
 	if err != nil {
 		return errnoFor(err)
 	}
+	// Start the next level of a walk while the caller is still spinning through
+	// this one. The wire children are passed rather than the overlaid slice: a
+	// pending directory has not reached the owner and cannot be listed yet.
+	if len(children) > 0 {
+		m.prefetchListingChildren(children)
+	}
 	children = m.overlayLocalListing(path, children)
 	// Sorted so a listing is stable between reads. The index's own order is the
 	// server's business and may change without the tree changing, which would
@@ -850,8 +856,13 @@ func (m *Mount) Create(path string, mode uint32, access int) (uint64, int) {
 	// A tombstone from an earlier delete must not shadow a name the caller is
 	// creating again before the owner's event arrives.
 	delete(m.events, cleaned)
-	// A new name (or a changed size) invalidates the directory's listing.
-	m.invalidateListings(cleaned)
+	// The parent listing is deliberately kept. A name this mount creates is
+	// visible through pendingPaths to lookup and through the pending overlay to
+	// Readdir, and the owner's event upserts it into the cached listing when it
+	// arrives. Dropping the parent here would make the first refresh after
+	// every create refetch the whole directory -- which is what a copy of many
+	// files did, one round trip per create.
+	m.forgetListing(cleaned)
 	return fh, 0
 }
 
@@ -1353,7 +1364,9 @@ func (m *Mount) Mkdir(path string, mode uint32) int {
 	if m.invalidatePath != nil {
 		m.invalidatePath(cleaned)
 	}
-	m.invalidateListings(cleaned)
+	// As with Create, the parent listing stays: the pending table is what makes
+	// the new directory visible, and the owner's event patches the listing.
+	m.forgetListing(cleaned)
 	return 0
 }
 

@@ -166,6 +166,13 @@ type Mount struct {
 	// concurrent misses share one answer instead of each transferring the whole
 	// listing. Guarded by listingMu.
 	listingInflight map[string]*listingCall
+	// listingPrefetchTokens bounds speculative listing fills on the wire, and
+	// listingPrefetchBatches bounds how many Readdirs may be warming the next
+	// level at once. Two fills keep the next directory level arriving while the
+	// caller consumes this one; one batch keeps speculative work from queueing
+	// behind more speculative work. A prefetch that finds no batch slot skips.
+	listingPrefetchTokens  chan struct{}
+	listingPrefetchBatches chan struct{}
 
 	// events is what the watch channel has told this mount, keyed by full path.
 	//
@@ -260,18 +267,20 @@ func New(caller Caller, opts Options) *Mount {
 		prefetch = 1
 	}
 	return &Mount{
-		caller:          caller,
-		opts:            opts,
-		files:           map[uint64]*openFile{},
-		cache:           newChunkCache(opts.BufferLimit, opts.BufferTotal),
-		inflight:        map[chunkKey]*chunkFlight{},
-		prefetchTokens:  make(chan struct{}, prefetch),
-		events:          map[string]node.Node{},
-		listings:        map[string]dirCacheEntry{},
-		listingInflight: map[string]*listingCall{},
-		pendingPaths:    map[string]node.Kind{},
-		pendingContent:  map[string][]byte{},
-		handed:          map[string]struct{}{},
+		caller:                 caller,
+		opts:                   opts,
+		files:                  map[uint64]*openFile{},
+		cache:                  newChunkCache(opts.BufferLimit, opts.BufferTotal),
+		inflight:               map[chunkKey]*chunkFlight{},
+		prefetchTokens:         make(chan struct{}, prefetch),
+		events:                 map[string]node.Node{},
+		listings:               map[string]dirCacheEntry{},
+		listingInflight:        map[string]*listingCall{},
+		listingPrefetchTokens:  make(chan struct{}, 2),
+		listingPrefetchBatches: make(chan struct{}, 1),
+		pendingPaths:           map[string]node.Kind{},
+		pendingContent:         map[string][]byte{},
+		handed:                 map[string]struct{}{},
 	}
 }
 
@@ -317,6 +326,11 @@ type Options struct {
 	// only changes when something in the directory changes. Events invalidate
 	// it immediately, so this bounds staleness only when an event is lost.
 	ListingTimeout time.Duration
+	// ListingPrefetch is how many of a directory's subdirectory listings one
+	// Readdir may warm in the background. A deep walk otherwise pays one serial
+	// round trip per level; fetching the next level while the caller consumes
+	// this one hides that. Zero disables the prefetch.
+	ListingPrefetch int
 	// RootMode is the permission bits reported for the mount root itself.
 	//
 	// The root is synthesised rather than listed: no client owns it, so there
@@ -372,6 +386,11 @@ type Options struct {
 // loads into the same buffer. A larger file is refused with ENOSPC rather than
 // silently truncated, so the failure is visible.
 //
+// 8 subdirectory listings warmed per Readdir: enough to cover a typical
+// project's next level, small enough that a refresh cannot turn into a scan of
+// the whole subtree. The fills are speculative, so a Readdir that finds one
+// already running skips its own.
+//
 // 1 second for both timeouts: long enough that a walk of a directory does not
 // re-ask for every attribute, short enough that a change made elsewhere is seen
 // in about a second without this process having to be told.
@@ -394,6 +413,7 @@ func DefaultOptions() Options {
 		AttrTimeout:     5 * time.Second,
 		EntryTimeout:    5 * time.Second,
 		ListingTimeout:  30 * time.Second,
+		ListingPrefetch: 8,
 		RootMode:        0o755,
 		InvalidateTable: 4096,
 		ReconnectMin:    time.Second,
