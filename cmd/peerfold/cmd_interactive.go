@@ -241,7 +241,30 @@ func interactiveClient(input io.Reader, out, errw io.Writer) int {
 			return 1
 		}
 		fmt.Fprintf(out, "\n  [OK] Config saved: %s\n\n", cfgPath)
-	} else if hasCredentials(cfg) && (cfg.Token == "" || cfg.TLSFingerprint == "") {
+	} else if !hasCredentials(cfg) {
+		// A config written before invites existed, or one the user chose to
+		// keep in plaintext mode. Offer the upgrade once per start; an empty
+		// answer preserves the old, explicitly unencrypted behaviour.
+		fmt.Fprintf(out, "  This config has no invite. Paste one to enable TLS, or leave empty for plaintext mode.\n\n")
+		inv, ok, err := promptInvite(in, out, identity.RoleClient)
+		if err != nil {
+			fmt.Fprintf(errw, "  [X] %v\n", err)
+			return 1
+		}
+		if ok {
+			if cfg.ClientName != "" && inv.Name != cfg.ClientName {
+				fmt.Fprintf(errw, "  [X] The invite is for %q, but this config is for %q. Create an invite for %q or start from a fresh config.\n",
+					inv.Name, cfg.ClientName, cfg.ClientName)
+				return 1
+			}
+			applyInvite(&cfg, inv)
+			if err := config.Save(cfgPath, cfg); err != nil {
+				fmt.Fprintf(errw, "  [X] Failed to save config: %v\n", err)
+				return 1
+			}
+			fmt.Fprintf(out, "  [OK] Invite saved to: %s\n\n", cfgPath)
+		}
+	} else if cfg.Token == "" || cfg.TLSFingerprint == "" {
 		// A config from outside the invite flow, or one that was edited by
 		// hand, can be half enrolled. Ask for the invite again rather than
 		// connecting without the protection the user expects.
@@ -253,6 +276,11 @@ func interactiveClient(input io.Reader, out, errw io.Writer) int {
 		}
 		if !ok {
 			fmt.Fprintln(errw, "  [X] An invite is required to repair this config.")
+			return 1
+		}
+		if cfg.ClientName != "" && inv.Name != cfg.ClientName {
+			fmt.Fprintf(errw, "  [X] The invite is for %q, but this config is for %q. Create an invite for %q.\n",
+				inv.Name, cfg.ClientName, cfg.ClientName)
 			return 1
 		}
 		applyInvite(&cfg, inv)

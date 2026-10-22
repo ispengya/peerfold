@@ -104,6 +104,10 @@ P0 不改线格式，修的是“未受信字符串变成名字或磁盘路径�
 - `peerfold invite` 输出一条 `pf://host:port?fp=…&name=…&role=…&token=…`
 - 首次 `peerfold client`/`mount` 粘贴 invite，一次保存地址、指纹、principal
   和 token；之后正常启动不再提问
+- 已存在的旧配置在下次交互启动时会提示粘贴 invite 完成升级；直接回车可以
+  继续显式明文模式（仅适用于 `--insecure` server）
+- 客户端升级时 invite 的名字必须与已有配置的 client name 一致，否则拒绝，
+  避免把凭据保存到另一个名字的配置里
 - 旧 peer 默认被 TLS server 拒绝；`peerfold server --insecure` 是显式明文
   逃生口，此时客户端没有 invite 配置也能连接
 - 后台/自启进程不提问：凭据在交互设置阶段写入配置

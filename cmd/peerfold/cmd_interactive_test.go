@@ -96,7 +96,7 @@ func TestInteractiveClientForegroundStartsWithoutDaemonFlag(t *testing.T) {
 	}
 
 	var out, errOut bytes.Buffer
-	code := interactiveClient(strings.NewReader("1\n"), &out, &errOut)
+	code := interactiveClient(strings.NewReader("\n1\n"), &out, &errOut)
 
 	if strings.Contains(errOut.String(), "flag provided but not defined") {
 		t.Fatalf("foreground client passed --daemon to cmdClient:\n%s", errOut.String())

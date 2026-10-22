@@ -176,3 +176,49 @@ func TestInteractiveMountRepairsAnIncompleteInvite(t *testing.T) {
 		t.Fatalf("repaired config = %+v", cfg)
 	}
 }
+
+// An existing plaintext config is offered an invite on its next interactive
+// start; pasting one upgrades it in place. This is the migration path for
+// machines that were set up before TLS existed.
+func TestInteractiveClientUpgradesAnExistingConfigWithAnInvite(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("HOME", home)
+
+	cfgPath, err := config.ClientPath("alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	share := filepath.Join(home, "docs")
+	if err := os.MkdirAll(share, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.Save(cfgPath, config.Config{
+		Server:     "127.0.0.1:1",
+		ClientName: "alice",
+		Shares:     map[string]string{"docs": share},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	inv := identity.Invite{
+		Address:     "127.0.0.1:1",
+		Fingerprint: strings.Repeat("d", 64),
+		Name:        "alice",
+		Role:        identity.RoleClient,
+		Token:       "upgrade-token",
+	}
+	var out, errOut bytes.Buffer
+	code := interactiveClient(strings.NewReader(inv.String()+"\n0\n"), &out, &errOut)
+	if code == 0 {
+		t.Fatalf("client with an unreachable server returned 0; out=%q", out.String())
+	}
+
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Token != inv.Token || cfg.TLSFingerprint != inv.Fingerprint || cfg.AuthName != "alice" {
+		t.Fatalf("upgraded config = %+v", cfg)
+	}
+}
