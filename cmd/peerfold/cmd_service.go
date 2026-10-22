@@ -217,7 +217,15 @@ func cmdStatus(args []string, stdout, stderr io.Writer) int {
 	// Server line describes a local process or the remote aggregation this
 	// machine belongs to: "stopped" here means "no local server", and on a
 	// machine that only mounts or supplies that would be misleading.
-	addr := statusServerAddress()
+	statusCfg, hasStatusConfig := statusServerConfig()
+	addr := ""
+	if hasStatusConfig {
+		addr = statusCfg.Server
+		if addr == "" && statusCfg.Listen != "" {
+			// An older config predates the listen/server split.
+			addr = dialAddress(statusCfg.Listen)
+		}
+	}
 	var (
 		remoteMounts    []viewer.Mount
 		remoteClients   []viewer.Client
@@ -226,11 +234,14 @@ func cmdStatus(args []string, stdout, stderr io.Writer) int {
 		remoteReachable bool
 	)
 	if addr != "" {
-		if v, err := viewer.DialTimeout(addr, statusQueryTimeout); err == nil {
-			remoteReachable = true
-			remoteMounts, mountsErr = v.ListMounts()
-			remoteClients, clientsErr = v.ListClients()
-			v.Close()
+		dialCfg, cfgErr := viewerDialConfig(statusCfg)
+		if cfgErr == nil {
+			if v, err := viewer.DialTimeoutWithConfig(addr, credentialName(statusCfg), statusQueryTimeout, dialCfg); err == nil {
+				remoteReachable = true
+				remoteMounts, mountsErr = v.ListMounts()
+				remoteClients, clientsErr = v.ListClients()
+				v.Close()
+			}
 		}
 	}
 
@@ -375,37 +386,46 @@ func statusUnsupported(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "not implemented")
 }
 
-// statusServerAddress returns the server whose mounts and clients status should
-// ask about, or "" when no local config names one.
+// statusServerConfig returns the config whose mounts and clients status should
+// ask about, or false when no local config names a server.
 //
 // The server's own config comes first: on the machine that aggregates, that is
 // the authority. Then the mount config and any client config, so a machine that
-// runs only one role still reports the federation it belongs to.
-func statusServerAddress() string {
+// runs only one role still reports the federation it belongs to. The whole
+// config is returned because the query also needs its invite credentials, not
+// only the address.
+func statusServerConfig() (config.Config, bool) {
+	paths := make([]string, 0, 3)
 	if path, err := config.ServerPath(); err == nil {
-		if cfg, err := config.Load(path); err == nil {
-			if cfg.Server != "" {
-				return cfg.Server
-			}
-			if cfg.Listen != "" {
-				// An older config predates the listen/server split.
-				return dialAddress(cfg.Listen)
-			}
-		}
+		paths = append(paths, path)
 	}
 	if path, err := config.MountPath(); err == nil {
-		if cfg, err := config.Load(path); err == nil && cfg.Server != "" {
-			return cfg.Server
-		}
+		paths = append(paths, path)
 	}
 	home, _ := os.UserHomeDir()
 	dirs, _ := filepath.Glob(filepath.Join(home, "peerfold-client-*"))
 	for _, dir := range dirs {
-		if cfg, err := config.Load(filepath.Join(dir, "config.json")); err == nil && cfg.Server != "" {
-			return cfg.Server
+		paths = append(paths, filepath.Join(dir, "config.json"))
+	}
+
+	var fallback config.Config
+	found := false
+	for _, path := range paths {
+		cfg, err := config.Load(path)
+		if err != nil || (cfg.Server == "" && cfg.Listen == "") {
+			continue
+		}
+		if !found {
+			fallback, found = cfg, true
+		}
+		// A config that can actually authenticate is more useful than one
+		// that merely names an address: on a machine that runs both a server
+		// and a mount, the mount's invite is the one that can query it.
+		if hasCredentials(cfg) {
+			return cfg, true
 		}
 	}
-	return ""
+	return fallback, found
 }
 
 // cmdStop stops a running component.

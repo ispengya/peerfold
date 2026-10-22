@@ -1,6 +1,7 @@
 package client
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -85,6 +86,13 @@ type Options struct {
 	// Batch is the largest number of nodes in one upload batch, or zero for
 	// DefaultBatch.
 	Batch int
+	// TLSConfig, when set, wraps the connection. The config must pin the
+	// server's certificate; identity.ClientTLSConfig builds one.
+	TLSConfig *tls.Config
+	// Token is the bearer credential sent in the hello. It is only meaningful
+	// with TLS, and the server refuses authentication over a plaintext
+	// connection.
+	Token string
 }
 
 // Client is one connection to a server, supplying the trees of its shares.
@@ -130,7 +138,13 @@ type Client struct {
 // name is this client's name in the aggregated tree. The shares are what it
 // supplies; a client with no shares is legal and supplies an empty tree.
 func Dial(opt Options) (*Client, error) {
-	raw, err := net.DialTimeout("tcp", opt.Server, dialTimeout)
+	var raw net.Conn
+	var err error
+	if opt.TLSConfig != nil {
+		raw, err = tls.DialWithDialer(&net.Dialer{Timeout: dialTimeout}, "tcp", opt.Server, opt.TLSConfig)
+	} else {
+		raw, err = net.DialTimeout("tcp", opt.Server, dialTimeout)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("client: dial %s: %w", opt.Server, err)
 	}
@@ -158,7 +172,10 @@ func Dial(opt Options) (*Client, error) {
 	if role == "" {
 		role = proto.RoleClient
 	}
-	body, err := json.Marshal(proto.HelloBody{Name: opt.Name, Role: role, Aggregate: opt.Aggregate, Compress: true})
+	body, err := json.Marshal(proto.HelloBody{
+		Name: opt.Name, Role: role, Aggregate: opt.Aggregate,
+		Compress: true, Token: opt.Token,
+	})
 	if err != nil {
 		raw.Close()
 		return nil, fmt.Errorf("client: encode hello: %w", err)

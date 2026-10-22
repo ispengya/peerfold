@@ -3,6 +3,7 @@
 package viewer
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -60,9 +61,15 @@ type Viewer struct {
 	// server is the address this viewer dialled, kept so a pool can open
 	// further read-only connections to the same server.
 	server string
-	conn   net.Conn
-	pc     *proto.Conn
-	next   uint64
+	// authName is the principal this viewer authenticated as. Read-only pool
+	// connections reuse it, because a secure server requires a name on every
+	// connection and the token is bound to one.
+	authName string
+	// dialConfig carries the TLS pin and token to NewReadViewer.
+	dialConfig DialConfig
+	conn       net.Conn
+	pc         *proto.Conn
+	next       uint64
 
 	// mu guards the fields below. It is taken around the fields and never across a
 	// read, because a reader that held it while waiting would stop the very
@@ -142,18 +149,26 @@ type Client struct {
 	Aggregate bool
 }
 
+// DialConfig carries the transport security and credential of a viewer
+// connection. A zero value is the plaintext, unauthenticated mode used by
+// tests and by an explicitly insecure server.
+type DialConfig struct {
+	TLS   *tls.Config
+	Token string
+}
+
 // Dial connects to serverAddr and completes the viewer handshake: the server
 // replies to the hello with its name and aggregate ruling, and a viewer is not
 // registered, so it can observe but cannot publish.
 func Dial(serverAddr string) (*Viewer, error) {
-	return dial(serverAddr, "", "", dialTimeout, true)
+	return dial(serverAddr, "", "", dialTimeout, true, DialConfig{})
 }
 
 // DialMount connects as a viewer that also tells the server where it is
 // mounted. That declaration is what makes the mount visible to other machines:
 // the server records it, and their `peerfold status` asks for the list.
 func DialMount(serverAddr, name, mountPoint string) (*Viewer, error) {
-	return dial(serverAddr, name, mountPoint, dialTimeout, true)
+	return dial(serverAddr, name, mountPoint, dialTimeout, true, DialConfig{})
 }
 
 // DialTimeout is Dial with a caller-chosen bound on the dial and handshake.
@@ -161,16 +176,40 @@ func DialMount(serverAddr, name, mountPoint string) (*Viewer, error) {
 // `peerfold status` uses it: a server that is down should cost status a short
 // wait, not the ten seconds a deliberate dial is allowed.
 func DialTimeout(serverAddr string, timeout time.Duration) (*Viewer, error) {
-	return dial(serverAddr, "", "", timeout, true)
+	return dial(serverAddr, "", "", timeout, true, DialConfig{})
+}
+
+// DialWithConfig is Dial over a pinned TLS connection, authenticated as name.
+func DialWithConfig(serverAddr, name string, cfg DialConfig) (*Viewer, error) {
+	return dial(serverAddr, name, "", dialTimeout, true, cfg)
+}
+
+// DialMountWithConfig is DialMount over a pinned TLS connection.
+func DialMountWithConfig(serverAddr, name, mountPoint string, cfg DialConfig) (*Viewer, error) {
+	return dial(serverAddr, name, mountPoint, dialTimeout, true, cfg)
+}
+
+// DialTimeoutWithConfig is DialTimeout over a pinned TLS connection.
+func DialTimeoutWithConfig(serverAddr, name string, timeout time.Duration, cfg DialConfig) (*Viewer, error) {
+	return dial(serverAddr, name, "", timeout, true, cfg)
 }
 
 // dial is the shared body of the constructors above.
-func dial(serverAddr, name, mountPoint string, timeout time.Duration, watch bool) (*Viewer, error) {
-	conn, err := net.DialTimeout("tcp", serverAddr, timeout)
+func dial(serverAddr, name, mountPoint string, timeout time.Duration, watch bool, cfg DialConfig) (*Viewer, error) {
+	var conn net.Conn
+	var err error
+	if cfg.TLS != nil {
+		conn, err = tls.DialWithDialer(&net.Dialer{Timeout: timeout}, "tcp", serverAddr, cfg.TLS)
+	} else {
+		conn, err = net.DialTimeout("tcp", serverAddr, timeout)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("viewer: dial %s: %w", serverAddr, err)
 	}
-	v := &Viewer{server: serverAddr, conn: conn, pc: proto.NewConn(conn)}
+	v := &Viewer{
+		server: serverAddr, authName: name, dialConfig: cfg,
+		conn: conn, pc: proto.NewConn(conn),
+	}
 	if err := v.handshake(timeout, name, mountPoint, watch); err != nil {
 		conn.Close()
 		return nil, err
@@ -189,7 +228,7 @@ func (v *Viewer) NewReadViewer() (*Viewer, error) {
 	if v.server == "" {
 		return nil, errors.New("viewer: this connection was not opened by Dial, so it has no address to dial")
 	}
-	return dial(v.server, "", "", dialTimeout, false)
+	return dial(v.server, v.authName, "", dialTimeout, false, v.dialConfig)
 }
 
 // handshake sends the hello and requires a hello_ok back.
@@ -199,6 +238,7 @@ func (v *Viewer) handshake(timeout time.Duration, name, mountPoint string, watch
 		Name:       name,
 		MountPoint: mountPoint,
 		Compress:   true,
+		Token:      v.dialConfig.Token,
 	}
 	if !watch {
 		hb.Watch = new(bool) // false: see HelloBody.Watching

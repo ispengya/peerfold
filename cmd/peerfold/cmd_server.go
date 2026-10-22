@@ -9,9 +9,11 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/ispengya/peerfold/internal/config"
+	"github.com/ispengya/peerfold/internal/identity"
 	"github.com/ispengya/peerfold/internal/logging"
 	"github.com/ispengya/peerfold/internal/server"
 )
@@ -59,8 +61,9 @@ func cmdServerWith(args []string, stdout, stderr io.Writer, interrupt <-chan str
 	fs.SetOutput(stderr)
 
 	var (
-		listen  = fs.String("listen", "", "address to listen on (default: the config's listen, else 0.0.0.0:7000)")
-		cfgPath = fs.String("config", "", "config file (default: the per-user config path)")
+		listen   = fs.String("listen", "", "address to listen on (default: the config's listen, else 0.0.0.0:7000)")
+		cfgPath  = fs.String("config", "", "config file (default: the per-user config path)")
+		insecure = fs.Bool("insecure", false, "run plaintext with no authentication (not for untrusted networks)")
 	)
 	fs.Usage = func() {
 		fmt.Fprint(stderr, serverUsage)
@@ -108,7 +111,24 @@ func cmdServerWith(args []string, stdout, stderr io.Writer, interrupt <-chan str
 		defer f.Close()
 	}
 
-	s := server.New(addr)
+	dir := filepath.Dir(path)
+	var s *server.Server
+	fingerprint := ""
+	if *insecure {
+		fmt.Fprintln(stderr, "server: WARNING: running insecure: plaintext, no authentication")
+		s = server.New(addr)
+	} else {
+		id, err := identity.LoadOrCreateServer(dir)
+		if err != nil {
+			fmt.Fprintf(stderr, "server: %v\n", err)
+			return 1
+		}
+		s = server.NewWithOptions(addr, server.Options{
+			TLSConfig:  id.TLSConfig(),
+			TokensPath: filepath.Join(dir, "tokens.json"),
+		})
+		fingerprint = id.Fingerprint()
+	}
 	// New binds the listener, so a port already in use is reported here instead
 	// of after the process has announced that it is running. The operating
 	// system's own message is printed: "address already in use" tells a user
@@ -121,6 +141,9 @@ func cmdServerWith(args []string, stdout, stderr io.Writer, interrupt <-chan str
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- s.Serve() }()
 
+	if fingerprint != "" {
+		fmt.Fprintf(stdout, "tls fingerprint: %s\n", fingerprint)
+	}
 	fmt.Fprintf(stdout, "listening on %s\n", s.Addr())
 
 	select {
@@ -151,4 +174,11 @@ Runs the aggregation server: every client dials out to it, and it holds the one
 global index of what they share. It listens until interrupted.
 
 flags:
+  --listen ADDR    address to listen on
+  --config PATH    config file
+  --insecure       plaintext and no authentication (development only)
+
+Run 'peerfold invite' on this machine to create a credential for another
+machine. The invite contains this server's fingerprint, so the client pins it
+on first use. Without an invite, a peer cannot authenticate.
 `

@@ -42,26 +42,37 @@ func cmdTree(cmd string, args []string, stdin io.Reader, stdout, stderr io.Write
 // server in it, dial — and they fail the same way, so they are done once here
 // instead of once per command with slightly different wording each time.
 func connect(cmd, cfgPath string, stderr io.Writer) (*viewer.Viewer, int, bool) {
-	path0 := cfgPath
-	if path0 == "" {
-		p, err := config.ServerPath()
-		if err != nil {
-			fmt.Fprintf(stderr, "%s: locate config: %v\n", cmd, err)
+	var cfg config.Config
+	if cfgPath == "" {
+		// Look at every local config, not only the server's. On a machine that
+		// only mounts, the mount config (and its invite) is the one that can
+		// reach the federation.
+		found := false
+		cfg, found = statusServerConfig()
+		if !found {
+			fmt.Fprintf(stderr, "%s: no server configured: run `peerfold mount` or `peerfold client` first, or pass --config\n", cmd)
 			return nil, 1, false
 		}
-		path0 = p
+	} else {
+		var err error
+		cfg, err = loadOrDefault(cfgPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "%s: read config %s: %v\n", cmd, cfgPath, err)
+			return nil, 1, false
+		}
 	}
-	cfg, err := loadOrDefault(path0)
-	if err != nil {
-		fmt.Fprintf(stderr, "%s: read config %s: %v\n", cmd, path0, err)
-		return nil, 1, false
-	}
-	if cfg.Server == "" {
+	addr := cfg.Server
+	if addr == "" {
 		fmt.Fprintf(stderr, "%s: no server configured: set one with `peerfold client --server`\n", cmd)
 		return nil, 1, false
 	}
 
-	v, err := viewer.Dial(cfg.Server)
+	dialCfg, err := viewerDialConfig(cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s: %v\n", cmd, err)
+		return nil, 1, false
+	}
+	v, err := viewer.DialWithConfig(addr, credentialName(cfg), dialCfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", cmd, err)
 		return nil, 1, false

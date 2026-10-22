@@ -87,7 +87,7 @@ func TestRunServerServesAndStops(t *testing.T) {
 	cfg := filepath.Join(t.TempDir(), "config.json")
 	done := make(chan int, 1)
 	go func() {
-		done <- cmdServerWith([]string{"--listen", "127.0.0.1:0", "--config", cfg}, &out, &errOut, interrupt)
+		done <- cmdServerWith([]string{"--listen", "127.0.0.1:0", "--config", cfg, "--insecure"}, &out, &errOut, interrupt)
 	}()
 
 	// The address is printed once the listener is bound, so this waits for the
@@ -137,7 +137,7 @@ func TestRunServerReportsWhyThePortIsUnavailable(t *testing.T) {
 	defer ln.Close()
 
 	cfg := filepath.Join(t.TempDir(), "config.json")
-	code := cmdServerWith([]string{"--listen", ln.Addr().String(), "--config", cfg}, &out, &errOut, interrupt)
+	code := cmdServerWith([]string{"--listen", ln.Addr().String(), "--config", cfg, "--insecure"}, &out, &errOut, interrupt)
 
 	if code != 1 {
 		t.Fatalf("cmdServerWith on a taken port = %d, want 1; stderr = %q", code, errOut.String())
@@ -210,7 +210,7 @@ func TestRunDispatchesEveryKnownCommand(t *testing.T) {
 	// client; on a machine whose default 127.0.0.1:7000 is live that joins the
 	// server and never returns. The loop stays for the commands whose bare form
 	// is safely inert.
-	for _, cmd := range []string{"ls", "cat", "put", "mkdir", "rm", "mv"} {
+	for _, cmd := range []string{"ls", "cat", "put", "mkdir", "rm", "mv", "invite"} {
 		var out, errOut bytes.Buffer
 		if code := runWithEmptyStdin([]string{cmd}, &out, &errOut); code == 0 {
 			t.Fatalf("runWithEmptyStdin([%s]) = 0, want non-zero", cmd)

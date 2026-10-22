@@ -33,6 +33,17 @@ type Config struct {
 	// it is copied to another machine.
 	MountPoint string `json:"mount_point"`
 
+	// TLSFingerprint is the pinned SHA-256 of the server certificate, and
+	// Token is the bearer credential for AuthName. They arrive together in an
+	// invite and are stored only after the user has pasted one.
+	//
+	// The file is written 0600 because of Token. Windows ignores most of the
+	// mode, but the per-user profile directory's ACL is the effective boundary
+	// there.
+	TLSFingerprint string `json:"tls_fingerprint,omitempty"`
+	AuthName       string `json:"auth_name,omitempty"`
+	Token          string `json:"token,omitempty"`
+
 	// BufferLimit and BufferTotal are the D3 pair: the read cache for one open
 	// file and for all of them together. Zero means "use the mount package's
 	// default", which is what an omitted key gets.
@@ -108,7 +119,13 @@ func Save(path string, c Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(b, '\n'), 0o644)
+	// 0600: the file can hold the server's bearer token. WriteFile does not
+	// change the mode of an existing file, so an older 0644 config is tightened
+	// explicitly.
+	if err := os.WriteFile(path, append(b, '\n'), 0o600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
 }
 
 // ServerPath returns the config path the server reads its listen address from: a

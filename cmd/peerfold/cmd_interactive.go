@@ -9,8 +9,43 @@ import (
 	"path/filepath"
 
 	"github.com/ispengya/peerfold/internal/config"
+	"github.com/ispengya/peerfold/internal/identity"
 	"github.com/ispengya/peerfold/internal/mount"
 )
+
+// promptInvite asks for one invite string. An empty answer is the explicit
+// plaintext path and is reported as ok=false; anything malformed is an error so
+// the user sees why their paste was refused rather than silently getting an
+// unencrypted connection.
+func promptInvite(in *bufio.Reader, out io.Writer, role string) (identity.Invite, bool, error) {
+	raw := promptString(in, out,
+		"Server invite (paste from `peerfold invite`; leave empty for plaintext setup)", "")
+	if raw == "" {
+		return identity.Invite{}, false, nil
+	}
+	inv, err := identity.ParseInvite(raw)
+	if err != nil {
+		return identity.Invite{}, false, err
+	}
+	if inv.Role != role {
+		return identity.Invite{}, false, fmt.Errorf("this invite is for role %q, but this setup needs %q", inv.Role, role)
+	}
+	return inv, true, nil
+}
+
+// ensureShareDir creates a share directory if it is missing, reporting whether
+// it was created.
+func ensureShareDir(out, errw io.Writer, dir string) bool {
+	_, statErr := os.Stat(dir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		fmt.Fprintf(errw, "  [X] Failed to create share directory %s: %v\n", dir, err)
+		return false
+	}
+	if os.IsNotExist(statErr) {
+		fmt.Fprintf(out, "  [OK] Created share directory: %s\n", dir)
+	}
+	return true
+}
 
 // dialAddress is the address a local client should dial for a server bound to
 // listen. A wildcard bind (":7000", "0.0.0.0:7000", "[::]:7000") is not a
@@ -75,6 +110,17 @@ func interactiveServer(input io.Reader, out, errw io.Writer) int {
 			}
 		}
 		fmt.Fprintf(out, "       Listen: %s\n\n", cfg.Listen)
+	}
+
+	// Show the identity a client will pin, and the one command that creates a
+	// credential. This is printed before the run-mode choice so it is visible
+	// even when the server is started in the background, where the child's
+	// stdout goes to the log file instead of this terminal.
+	if id, err := identity.LoadOrCreateServer(cfgDir); err == nil {
+		fmt.Fprintf(out, "  Server fingerprint: %s\n", id.Fingerprint())
+		fmt.Fprintf(out, "  Enroll a machine:   peerfold invite --name <name> --role client\n\n")
+	} else {
+		fmt.Fprintf(out, "  [!] Could not prepare the server certificate: %v\n\n", err)
 	}
 
 	// 2. Ask run mode
@@ -160,35 +206,61 @@ func interactiveClient(input io.Reader, out, errw io.Writer) int {
 	if cfg.Server == "" {
 		fmt.Fprintf(out, "  No config found. Let's set one up.\n\n")
 
-		name = promptString(in, out, "Client name", name)
-		server := promptString(in, out, "Server address", "127.0.0.1:7000")
-		shareName := promptString(in, out, "Share name", "docs")
-		shareDir := promptString(in, out, "Share directory", defaultShareDir(name))
-
-		// The generated default lives under peerfold-demo and does not exist on
-		// a fresh machine. Creating it here is what makes the default usable;
-		// without it the client saved the config, dialed, and then failed with
-		// "lstat <dir>: no such file or directory".
-		_, statErr := os.Stat(shareDir)
-		if err := os.MkdirAll(shareDir, 0o755); err != nil {
-			fmt.Fprintf(errw, "  [X] Failed to create share directory %s: %v\n", shareDir, err)
+		inv, haveInvite, err := promptInvite(in, out, identity.RoleClient)
+		if err != nil {
+			fmt.Fprintf(errw, "  [X] %v\n", err)
 			return 1
 		}
-		if os.IsNotExist(statErr) {
-			fmt.Fprintf(out, "  [OK] Created share directory: %s\n", shareDir)
+
+		if haveInvite {
+			cfg = config.Default()
+			applyInvite(&cfg, inv)
+			name = inv.Name
+			fmt.Fprintf(out, "       Server: %s\n       Name:   %s\n\n", cfg.Server, cfg.ClientName)
+		} else {
+			name = promptString(in, out, "Client name", name)
+			server := promptString(in, out, "Server address", "127.0.0.1:7000")
+			cfg = config.Default()
+			cfg.Server = server
+			cfg.ClientName = name
 		}
 
-		cfg = config.Default()
-		cfg.Server = server
-		cfg.ClientName = name
-		cfg.Shares = map[string]string{shareName: shareDir}
+		if cfg.Shares == nil {
+			cfg.Shares = map[string]string{}
+		}
+		shareName := promptString(in, out, "Share name", "docs")
+		shareDir := promptString(in, out, "Share directory", defaultShareDir(name))
+		if !ensureShareDir(out, errw, shareDir) {
+			return 1
+		}
+		cfg.Shares[shareName] = shareDir
 
-		cfgPath = filepath.Join(home, "peerfold-client-"+name, "config.json")
+		cfgPath = filepath.Join(home, "peerfold-client-"+cfg.ClientName, "config.json")
 		if err := config.Save(cfgPath, cfg); err != nil {
 			fmt.Fprintf(errw, "  [X] Failed to save config: %v\n", err)
 			return 1
 		}
 		fmt.Fprintf(out, "\n  [OK] Config saved: %s\n\n", cfgPath)
+	} else if hasCredentials(cfg) && (cfg.Token == "" || cfg.TLSFingerprint == "") {
+		// A config from outside the invite flow, or one that was edited by
+		// hand, can be half enrolled. Ask for the invite again rather than
+		// connecting without the protection the user expects.
+		fmt.Fprintf(out, "  This config's invite is incomplete. Paste it again.\n\n")
+		inv, ok, err := promptInvite(in, out, identity.RoleClient)
+		if err != nil {
+			fmt.Fprintf(errw, "  [X] %v\n", err)
+			return 1
+		}
+		if !ok {
+			fmt.Fprintln(errw, "  [X] An invite is required to repair this config.")
+			return 1
+		}
+		applyInvite(&cfg, inv)
+		if err := config.Save(cfgPath, cfg); err != nil {
+			fmt.Fprintf(errw, "  [X] Failed to save config: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(out, "  [OK] Invite saved to: %s\n\n", cfgPath)
 	}
 
 	component := "client-" + cfg.ClientName
@@ -273,11 +345,43 @@ func interactiveMount(input io.Reader, out, errw io.Writer) int {
 		fmt.Fprintf(out, "\n  Press Enter to keep a value in [brackets].\n\n")
 	}
 
-	server := cfg.Server
-	if server == "" {
-		server = "127.0.0.1:7000"
+	haveInvite := hasCredentials(cfg) && cfg.Token != "" && cfg.TLSFingerprint != ""
+	if !haveInvite {
+		// A missing invite is allowed on the first setup: an explicitly
+		// insecure server is still reachable that way. An incomplete one is
+		// repaired here instead of being used half-enrolled.
+		if hasCredentials(cfg) {
+			fmt.Fprintf(out, "  This config's invite is incomplete. Paste it again.\n\n")
+		}
+		inv, ok, err := promptInvite(in, out, identity.RoleViewer)
+		if err != nil {
+			fmt.Fprintf(errw, "  [X] %v\n", err)
+			return 1
+		}
+		if ok {
+			applyInvite(&cfg, inv)
+			haveInvite = true
+			fmt.Fprintf(out, "       Server: %s\n       Name:   %s\n\n", cfg.Server, cfg.AuthName)
+		} else if hasCredentials(cfg) {
+			fmt.Fprintln(errw, "  [X] An invite is required to repair this config.")
+			return 1
+		}
 	}
-	server = promptString(in, out, "Server address", server)
+
+	server := cfg.Server
+	if haveInvite {
+		// The pinned certificate and token belong to this address. Changing it
+		// by hand would only produce a handshake failure, so it is not asked.
+		if server == "" {
+			fmt.Fprintln(errw, "  [X] The saved invite has no server address; paste it again.")
+			return 1
+		}
+	} else {
+		if server == "" {
+			server = "127.0.0.1:7000"
+		}
+		server = promptString(in, out, "Server address", server)
+	}
 
 	mountPoint := cfg.MountPoint
 	if mountPoint == "" {

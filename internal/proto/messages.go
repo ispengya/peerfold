@@ -112,6 +112,12 @@ type HelloBody struct {
 	// Control envelopes are not, which keeps the handshake and any future
 	// credential exchange out of a compressor.
 	Compress bool `json:"compress,omitempty"`
+
+	// Token is the caller's bearer credential when the server requires one.
+	// It travels in a control frame, which is never compressed, and only on a
+	// TLS connection: the server refuses to enable authentication without TLS.
+	// It is empty for a server running in its explicit insecure mode.
+	Token string `json:"token,omitempty"`
 }
 
 // Watching reports whether the hello asked to receive pushed updates. The

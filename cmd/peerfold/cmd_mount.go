@@ -121,7 +121,7 @@ func cmdMount(args []string, stdout, stderr io.Writer) int {
 // unmounting. A second signal path here would be a second place to get that
 // order wrong.
 func runMount(args []string, stdout, stderr io.Writer) int {
-	opts, server, mountPoint, _, err := mountOptionsFrom(args)
+	opts, server, mountPoint, cfgPath, err := mountOptionsFrom(args)
 	if errors.Is(err, flag.ErrHelp) {
 		// --help is a request, not a mistake, and it has to print the flags
 		// rather than the phrase "flag: help requested".
@@ -152,11 +152,35 @@ func runMount(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	// Declare the mount in the handshake. The host name is the identity, and
-	// the mount point is what lets status on another machine say where this
-	// window onto the tree is attached.
+	// Credentials live in the mount config. An absent file or absent invite is
+	// the plaintext mode; a secure server will refuse it, which is better than
+	// silently downgrading a connection that was meant to be encrypted.
+	var cfg config.Config
+	if cfgPath != "" {
+		if c, err := config.Load(cfgPath); err == nil {
+			cfg = c
+		} else if !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(stderr, "mount: read config %s: %v\n", cfgPath, err)
+			return 1
+		}
+	}
+	dialCfg, err := viewerDialConfig(cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "mount: %v\n", err)
+		return 1
+	}
+
+	// Declare the mount in the handshake. The name is the authenticated
+	// principal when an invite is in use; a token is bound to one name.
 	mountName := defaultClientName()
-	v, err := viewer.DialMount(server, mountName, mountPoint)
+	if hasCredentials(cfg) {
+		if cfg.AuthName == "" {
+			fmt.Fprintln(stderr, "mount: the invite has no principal; paste the invite again")
+			return 1
+		}
+		mountName = cfg.AuthName
+	}
+	v, err := viewer.DialMountWithConfig(server, mountName, mountPoint, dialCfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "mount: %v\n", err)
 		return 1
@@ -186,7 +210,7 @@ func runMount(args []string, stdout, stderr io.Writer) int {
 	// install that nil caller and every later operation would panic somewhere far
 	// from the cause.
 	reconnect := func() (mount.Caller, error) {
-		fresh, err := viewer.DialMount(server, mountName, mountPoint)
+		fresh, err := viewer.DialMountWithConfig(server, mountName, mountPoint, dialCfg)
 		if err != nil {
 			return nil, err
 		}

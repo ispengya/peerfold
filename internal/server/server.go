@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ispengya/peerfold/internal/identity"
 	"github.com/ispengya/peerfold/internal/index"
 	"github.com/ispengya/peerfold/internal/logging"
 	"github.com/ispengya/peerfold/internal/node"
@@ -120,12 +122,37 @@ type Server struct {
 	// state change runs and therefore fires after it, so a join fences the whole
 	// attempt rather than just the send.
 	fanout sync.WaitGroup
+
+	// tokensPath is the server's credential file. Empty means authentication is
+	// off, which is the explicit insecure mode. A non-empty path requires TLS:
+	// a bearer token on a plaintext connection would be visible to anyone on
+	// the path, so NewWithOptions refuses that combination.
+	tokensPath string
 }
 
-// New returns a Server listening on listen. A listen failure is remembered and
-// returned by Serve rather than panicking here, so a caller can report it as a
-// startup error; Addr is nil in that case.
+// Options configures a secure server. The zero value is the plaintext server
+// the package tests and the explicit --insecure mode use.
+type Options struct {
+	// TLSConfig, when set, wraps the listener. The handshake happens when the
+	// first frame is read, under the same hello deadline as the rest of the
+	// handshake.
+	TLSConfig *tls.Config
+	// TokensPath is the per-name credential file. Setting it requires TLS.
+	TokensPath string
+}
+
+// New returns a plaintext Server listening on listen.
+//
+// It exists for tests and for the explicit insecure mode. Production callers
+// use NewWithOptions with TLS and a token file.
 func New(listen string) *Server {
+	return NewWithOptions(listen, Options{})
+}
+
+// NewWithOptions returns a Server listening on listen. A listen failure is
+// remembered and returned by Serve rather than panicking here, so a caller can
+// report it as a startup error; Addr is nil in that case.
+func NewWithOptions(listen string, opt Options) *Server {
 	s := &Server{
 		ix:               &index.Index{},
 		reg:              &Registry{},
@@ -137,8 +164,17 @@ func New(listen string) *Server {
 		clientInfos:      make(map[*proto.Conn]proto.ClientInfo),
 		router:           &Router{clients: make(map[string]*clientLink)},
 		broadcastTimeout: DefaultEventBroadcastTimeout,
+		tokensPath:       opt.TokensPath,
 	}
-	s.ln, s.lnErr = net.Listen("tcp", listen)
+	if opt.TokensPath != "" && opt.TLSConfig == nil {
+		s.lnErr = errors.New("server: token authentication requires TLS")
+		return s
+	}
+	if opt.TLSConfig != nil {
+		s.ln, s.lnErr = tls.Listen("tcp", listen, opt.TLSConfig)
+	} else {
+		s.ln, s.lnErr = net.Listen("tcp", listen)
+	}
 	return s
 }
 
@@ -298,6 +334,22 @@ func (s *Server) handleConn(conn net.Conn) {
 	// unchanged.
 	compress := hb.Compress
 	c.SetCompression(compress)
+
+	// Authentication comes before registration or any view of the index. The
+	// token is a bearer credential over TLS, looked up under the claimed name;
+	// the same answer is given for an unknown name, a wrong token, and a role
+	// mismatch, so the connection cannot be used to discover which names exist.
+	if s.tokensPath != "" {
+		if hb.Name == "" {
+			_ = c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindHello, Err: "authentication required: name is required"})
+			return
+		}
+		if _, ok := identity.CheckToken(s.tokensPath, hb.Name, hb.Role, hb.Token); !ok {
+			logging.Errorf("server: authentication failed for %q from %s", hb.Name, conn.RemoteAddr())
+			_ = c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindHello, Err: "authentication failed"})
+			return
+		}
+	}
 
 	// A viewer only asks questions; it supplies nothing, so it is not a
 	// registry entry and owns no index entries.

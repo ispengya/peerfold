@@ -1,7 +1,8 @@
 # 安全设计待办
 
-更新于 2026-10-22。当前代码仍处于 P0：**输入边界收敛**。
-TLS、身份认证与授权尚未实现；在此之前，server 不应暴露到不受信任的网络。
+更新于 2026-10-22。当前代码处于 **P0 + P1**：输入边界收敛、TLS 1.3、
+每主体 token 认证。**P2 授权与 P3 资源边界尚未实现**。
+server 默认只接受 TLS 且要求 token；未登记的 peer 无法连接。
 
 ## 威胁模型
 
@@ -67,21 +68,70 @@ P0 不改线格式，修的是“未受信字符串变成名字或磁盘路径�
   换掉目录。彻底闭合需要 Linux `openat2(RESOLVE_BENEATH)` 与 Windows
   句柄式遍历
 - 硬链接和 bind mount 不受符号链接检查约束（bind mount 属于部署配置）
-- 未经认证的 peer 仍可读、写、抢占名字；P0 只保证它出不了自己的命名空间
-  和 share
+- 在显式 `--insecure` 模式下，未经认证的 peer 仍可读、写、抢占名字；
+  P0 只保证它出不了自己的命名空间和 share
 - 事件日志可能被大量畸形事件刷屏（每批一行），限流留给 P3
 
+## 已完成：P1 传输与身份
+
+### TLS 1.3
+
+- server 首次启动（或首次运行 `peerfold invite`）在 `peerfold-server/` 下生成
+  自签 ECDSA P-256 证书：`tls.crt` 0644、`tls.key` 0600，有效期 10 年
+- server 用 `tls.Listen` 包住 listener；最低 TLS 1.3
+- client/mount 固定证书指纹：invite 携带 SHA-256 指纹，连接用
+  `VerifyConnection` 逐字节比对；不依赖系统 CA，也不做静默 TOFU
+- 指纹不匹配直接失败，并给出期望/实际指纹
+- 连接池共享 `ClientSessionCache`，后续读连接尽量走 TLS 会话恢复
+- 证书轮换：删除证书对并重新给所有机器发 invite；没有自动轮换，避免
+  静默断开已登记机器
+
+### 每主体 token
+
+- `peerfold invite --name <name> --role client|viewer [--write] [--server host:port]`
+  生成 32 字节随机 token，server 端 `tokens.json` 只存 SHA-256；重复同名
+  invite 会轮换旧 token
+- token 与名字、角色绑定；server 在注册前校验，未知名字、错误 token、角色
+  不匹配返回同一句 “authentication failed”
+- 采用 **TLS 内的 bearer token**：token 在 hello 控制帧中发送，控制帧从不
+  压缩；TLS 提供机密性与重放保护，server 只保存哈希。没有做 HMAC 挑战响应，
+  因为那需要 server 持有 token 明文或引入 PAKE，收益不及复杂度
+- token 文件与 client/mount 配置均为 0600；Windows 下依赖用户目录 ACL
+- 认证要求 TLS：`NewWithOptions` 在只给 token 文件不给 TLS 时拒绝启动
+
+### invite 与启动流程
+
+- `peerfold invite` 输出一条 `pf://host:port?fp=…&name=…&role=…&token=…`
+- 首次 `peerfold client`/`mount` 粘贴 invite，一次保存地址、指纹、principal
+  和 token；之后正常启动不再提问
+- 旧 peer 默认被 TLS server 拒绝；`peerfold server --insecure` 是显式明文
+  逃生口，此时客户端没有 invite 配置也能连接
+- 后台/自启进程不提问：凭据在交互设置阶段写入配置
+- server 交互启动会打印指纹和 `peerfold invite` 提示；客户端/mount 的 invite
+  解析失败会明确报错，不会静默降级
+
+测试：`TestServerCertificateIsStableAcrossLoads`、
+`TestClientRejectsTheWrongPinnedCertificate`、
+`TestClientTLSConfigRefusesAPlaintextServer`、
+`TestTokensAreHashedAndBoundToNameAndRole`、`TestInviteRoundTripAndValidation`、
+`TestSecureServerAcceptsOnlyTheTokenBoundToTheNameAndRole`、
+`TestSecureServerRefusesAPlaintextHandshake`、
+`TestE2ESecureFlow`、`TestInteractiveClientSavesInvite`、
+`TestInviteCommandProducesAWorkingViewerCredential`、
+`TestInteractiveMountRepairsAnIncompleteInvite`
+
+### P1 残余风险
+
+- invite 里的 token 是凭据，不能贴到公开日志/聊天；需要泄露时重新生成同名
+  invite 即可轮换
+- `--write` 已经记录在 token 记录里，但 P2 尚未在请求入口执行读写授权；
+  目前所有已认证 viewer 仍可写
+- 没有 token 过期、单独撤销命令或连接频率限制；P3 补齐
+- server 本机的 `ls/cat/status` 需要一份带 invite 的配置；否则它们只能连
+  明文 server。自动为本机创建 viewer 凭据留给后续
+- TLS 只保护传输；server 主机仍能看到所有文件名和转发内容
+
 ## 下一步（未实现）
-
-### P1 传输与身份
-
-- TLS 1.3，server 首次启动生成长期自签 ECDSA 证书，私钥 0600
-- client 显式确认并固定证书指纹；指纹变化报错，不做静默 TOFU
-- 每主体一个 32 字节 token，server 只存 SHA-256；TLS 内做 nonce +
-  HMAC-SHA256 挑战响应；名字以 token 记录为准，消灭冒充与抢占
-- token 文件与 client 凭据 0600；Windows 说明 ACL 行为
-- mount 的连接池共享 `ClientSessionCache`，避免每条连接都付完整握手
-- 兼容：旧 peer 默认拒绝，保留显式 `--insecure` 逃生口
 
 ### P2 授权
 

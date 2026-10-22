@@ -149,7 +149,7 @@ func cmdClient(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	c, err := client.Dial(client.Options{
+	dialOpts := client.Options{
 		Server:    cfg.Server,
 		Name:      clientName,
 		Shares:    sh,
@@ -157,7 +157,26 @@ func cmdClient(args []string, stdout, stderr io.Writer) int {
 		OnBatch: func(sent int) {
 			fmt.Fprintf(stdout, "shared %d entries\n", sent)
 		},
-	})
+	}
+	if hasCredentials(cfg) {
+		// The token is bound to the name in the invite. A local name that
+		// differs would authenticate as that principal and then index under a
+		// name the server never registered, so it is refused here instead of
+		// failing halfway through the handshake.
+		if cfg.AuthName != "" && clientName != cfg.AuthName {
+			fmt.Fprintf(stderr, "client: name %q does not match the invite principal %q; create an invite for this name or use the invited one\n",
+				clientName, cfg.AuthName)
+			return 1
+		}
+		tlsCfg, err := credentialsTLS(cfg)
+		if err != nil {
+			fmt.Fprintf(stderr, "client: %v\n", err)
+			return 1
+		}
+		dialOpts.TLSConfig = tlsCfg
+		dialOpts.Token = cfg.Token
+	}
+	c, err := client.Dial(dialOpts)
 	if err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return 1

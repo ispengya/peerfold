@@ -41,7 +41,7 @@ func TestInteractiveMountSavesConfig(t *testing.T) {
 	// Port 1 is closed on any sane host, so the dial fails immediately. Using
 	// the default port would let this test mount for real on a machine that is
 	// already running a server, and then block in the FUSE loop.
-	input := strings.NewReader("127.0.0.1:1\n" + mountPoint + "\n")
+	input := strings.NewReader("\n127.0.0.1:1\n" + mountPoint + "\n")
 	var out, errOut bytes.Buffer
 
 	// runMount will try to dial and fail; that is fine. What matters is that
@@ -125,7 +125,7 @@ func TestInteractiveClientCreatesDefaultShareDir(t *testing.T) {
 
 	// Name, server, share name, empty share directory (take the default),
 	// foreground mode. The server is a closed port so the dial fails fast.
-	input := strings.NewReader("alice\n127.0.0.1:1\ndocs\n\n1\n")
+	input := strings.NewReader("\nalice\n127.0.0.1:1\ndocs\n\n1\n")
 	var out, errOut bytes.Buffer
 	code := interactiveClient(input, &out, &errOut)
 
@@ -150,7 +150,7 @@ func TestInteractiveMountRejectsRelativePoint(t *testing.T) {
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("HOME", home)
 
-	input := strings.NewReader("127.0.0.1:7000\nrelative/path\n")
+	input := strings.NewReader("\n127.0.0.1:7000\nrelative/path\n")
 	var out, errOut bytes.Buffer
 	if code := interactiveMount(input, &out, &errOut); code == 0 {
 		t.Fatal("interactiveMount with a relative mount point returned 0, want non-zero")
