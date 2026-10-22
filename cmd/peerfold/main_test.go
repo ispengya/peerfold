@@ -5,11 +5,32 @@ import (
 	"net"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/ispengya/peerfold/internal/client"
 )
+
+// syncBuffer is a bytes.Buffer that can be written by the command's goroutine
+// while the test reads it. The server prints "listening on ..." from that
+// goroutine, and the test polls for the line, so a plain Buffer is a data race.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
 
 func TestRunUnknownCommand(t *testing.T) {
 	var out, errOut bytes.Buffer
@@ -59,7 +80,8 @@ func TestRunHelpFlags(t *testing.T) {
 // It is driven through cmdServerWith because cmdServer waits on the process's
 // own interrupt signal, which a test cannot send to itself.
 func TestRunServerServesAndStops(t *testing.T) {
-	var out, errOut bytes.Buffer
+	var out syncBuffer
+	var errOut bytes.Buffer
 	interrupt := make(chan struct{})
 
 	cfg := filepath.Join(t.TempDir(), "config.json")
@@ -136,8 +158,10 @@ func TestRunServerReportsWhyThePortIsUnavailable(t *testing.T) {
 	}
 }
 
-// waitForAddress reads the "listening on <addr>" line the server prints.
-func waitForAddress(t *testing.T, out *bytes.Buffer) string {
+// waitForAddress reads the "listening on <addr>" line the server prints. The
+// output may still be written by the server goroutine, so the caller passes the
+// synchronised buffer rather than a plain one.
+func waitForAddress(t *testing.T, out interface{ String() string }) string {
 	t.Helper()
 
 	deadline := time.Now().Add(10 * time.Second)

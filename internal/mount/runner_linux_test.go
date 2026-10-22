@@ -19,8 +19,8 @@ func TestPrepareMountPointCreatesThePath(t *testing.T) {
 		t.Fatalf("prepareMountPoint: %v", err)
 	}
 	if cleanup != nil {
-		t.Errorf("prepareMountPoint returned a cleanup for a Linux mount point; the "+
-			"directory is meant to survive an unmount, got %v", cleanup)
+		t.Errorf("prepareMountPoint returned a cleanup for a Linux mount point; the " +
+			"directory is meant to survive an unmount")
 	}
 	info, statErr := os.Stat(p)
 	if statErr != nil {
