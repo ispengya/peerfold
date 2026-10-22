@@ -292,6 +292,13 @@ func (s *Server) handleConn(conn net.Conn) {
 		return
 	}
 
+	// Compression is agreed before the first data frame in either direction.
+	// A peer that did not ask keeps the connection plain, which is what lets an
+	// older peer — one that would not understand a compressed frame — connect
+	// unchanged.
+	compress := hb.Compress
+	c.SetCompression(compress)
+
 	// A viewer only asks questions; it supplies nothing, so it is not a
 	// registry entry and owns no index entries.
 	//
@@ -316,10 +323,10 @@ func (s *Server) handleConn(conn net.Conn) {
 				Since:      time.Now().Unix(),
 			})
 			defer s.unregisterViewer(c)
-			logging.Infof("server: mount %q at %q connected from %s",
-				hb.Name, hb.MountPoint, conn.RemoteAddr())
+			logging.Infof("server: mount %q at %q connected from %s (compression=%v)",
+				hb.Name, hb.MountPoint, conn.RemoteAddr(), compress)
 		}
-		if err := s.replyHello(c, env.ID, hb.Name, false); err != nil {
+		if err := s.replyHello(c, env.ID, hb.Name, false, compress); err != nil {
 			return
 		}
 		if hb.Watching() {
@@ -382,14 +389,14 @@ func (s *Server) handleConn(conn net.Conn) {
 	})
 	defer s.unregisterClientInfo(c)
 
-	if err := s.replyHello(c, env.ID, hb.Name, aggregate); err != nil {
+	if err := s.replyHello(c, env.ID, hb.Name, aggregate, compress); err != nil {
 		return
 	}
 	// Requests can only be forwarded to a client that is reachable, and this
 	// starts after the hello is answered so the order stays "the handshake, then
 	// everything else".
 	s.router.attach(hb.Name, c)
-	logging.Infof("server: client %q connected", hb.Name)
+	logging.Infof("server: client %q connected (compression=%v)", hb.Name, compress)
 	// A mount that is already up has no way to learn about a new client by
 	// asking: nothing it is listing has changed, so it would keep the listing it
 	// already has. The join is a tree change like any other, and broadcasting it
@@ -406,9 +413,10 @@ func (s *Server) handleConn(conn net.Conn) {
 	s.serveLoop(hb.Name, c, cleanup)
 }
 
-// replyHello answers a hello with the server's ruling on the aggregate role.
-func (s *Server) replyHello(c *proto.Conn, id uint64, name string, aggregate bool) error {
-	body, err := json.Marshal(proto.HelloOKBody{Name: name, Aggregate: aggregate})
+// replyHello answers a hello with the server's ruling on the aggregate role and
+// on connection compression.
+func (s *Server) replyHello(c *proto.Conn, id uint64, name string, aggregate, compress bool) error {
+	body, err := json.Marshal(proto.HelloOKBody{Name: name, Aggregate: aggregate, Compress: compress})
 	if err != nil {
 		return err
 	}

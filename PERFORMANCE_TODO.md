@@ -96,6 +96,35 @@
 更宽。若首次读还要更快，只能提升 VM 出带宽、把 server 挪到离挂载端更近的位置，
 或对文本内容做协议级压缩（图片本身收益很小）。
 
+### 协议级数据帧压缩（2026-10-22 深夜）
+
+代码/文档是主要使用场景，这条链路的瓶颈又是带宽，因此在帧层做压缩：
+
+- **只压缩数据流，不压缩控制帧**：文件内容、写回内容、listing 的 JSON body 都走
+  data frame；hello、事件、读写请求和未来的凭据交换保持明文控制帧，避免把认证
+  材料放进压缩器。
+- **逐帧自动回退**：每个 data frame 独立用 flate（`BestSpeed`）压缩；压缩后不比
+  原文小就直接发 `FrameData`。JPEG、zip、视频本身不可压缩，带宽与之前一样。
+  一条流的第一帧如果压不动，后续帧直接走原文，不再为同一张大图反复尝试压缩；
+  流结束时清掉这个标记。
+- **握手协商**：`HelloBody.Compress` 请求，`HelloOKBody.Compress` 确认；只有双方
+  都支持才启用。旧 server 不回该字段、旧 client 不带该字段，连接保持原文，
+  完全兼容。
+- **逐跳压缩**：server 对每条连接独立解压/压缩。owner 在 server 本机时，owner
+  方向的压缩收益不大，但 CPU 在这个带宽下可以忽略；远端 owner 则同样受益。
+- 解压上限固定为一帧 `MaxChunk`，压缩帧不可能膨胀成任意大的分配。
+- 压缩级别刻意选最快档：这条链路的瓶颈是 2–4 Mbps，而 BestSpeed 的吞吐远高于
+  它；对 JS/JSON/文档通常还有数倍压缩比。
+- 回归测试：`TestCompressedDataRoundTrips`、
+  `TestCompressionOnlyCostsBytesWhenItSavesThem`、
+  `TestACompressedFrameCannotExpandPastOneChunk`、
+  `TestServerNegotiatesCompression`；E2E 的 read/write/list 用例在压缩开启下
+  全部通过。
+
+**预期**：代码、日志、JSON listing 的传输字节数下降数倍；图片/视频基本不变，
+只多一次可忽略的压缩尝试（同一流失败后即跳过）。TLS 落地后应先压缩再加密，
+控制帧不参与压缩，因此不会引入凭据压缩侧信道。
+
 ## 第一梯队（已完成）
 
 1. `--exclude` CLI/配置

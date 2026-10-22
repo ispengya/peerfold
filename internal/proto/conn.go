@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,12 +34,35 @@ type Conn struct {
 	// werr is the first write error, remembered so later writes fail loudly
 	// instead of continuing on a stream whose frame boundaries are lost.
 	werr error
+
+	// compress says whether outbound data frames may be compressed. Both ends
+	// agree on it during the handshake, and it is an atomic because SendData
+	// may be called from a forwarded request while another goroutine installs
+	// the handshake result. Inbound frames are accepted in both forms
+	// regardless: a peer that never compresses is always readable.
+	compress atomic.Bool
+
+	// compressSkip remembers streams whose first frame did not shrink, so the
+	// rest of a JPEG or an archive is sent raw instead of paying for a
+	// compression attempt per frame. It is guarded by wmu, like werr, because
+	// only sendDataLocked touches it.
+	compressSkip map[uint64]struct{}
 }
 
 // NewConn wraps rw. The Conn owns rw: Close closes it.
 func NewConn(rw io.ReadWriteCloser) *Conn {
 	return &Conn{rw: rw}
 }
+
+// SetCompression enables or disables compression of outbound data frames.
+//
+// It is the handshake's job to call this on both ends. Until it does, every
+// data frame is plain, which is what makes a peer that does not understand
+// compression safe to talk to: it never receives a frame it cannot read.
+func (c *Conn) SetCompression(on bool) { c.compress.Store(on) }
+
+// Compression reports whether outbound data frames are compressed.
+func (c *Conn) Compression() bool { return c.compress.Load() }
 
 // Send writes env as a control frame. Once a write has failed on this Conn,
 // Send reports that first error instead of writing, because the stream's frame
@@ -196,10 +220,29 @@ func (c *Conn) sendDataLocked(id uint64, chunk []byte) error {
 	if c.werr != nil {
 		return fmt.Errorf("proto: write on a broken connection: %w", c.werr)
 	}
-	payload := make([]byte, dataHeaderLen+len(chunk))
+
+	kind, content := FrameData, chunk
+	if len(chunk) == 0 {
+		// The stream is over. A later request can reuse this ID, so its
+		// compressibility is a fresh question.
+		delete(c.compressSkip, id)
+	} else if c.compress.Load() && len(chunk) >= minCompressSize {
+		if _, skip := c.compressSkip[id]; !skip {
+			if z, ok := compressChunk(chunk); ok {
+				kind, content = FrameCompressed, z
+			} else {
+				if c.compressSkip == nil {
+					c.compressSkip = make(map[uint64]struct{})
+				}
+				c.compressSkip[id] = struct{}{}
+			}
+		}
+	}
+
+	payload := make([]byte, dataHeaderLen+len(content))
 	binary.BigEndian.PutUint64(payload[:dataHeaderLen], id)
-	copy(payload[dataHeaderLen:], chunk)
-	if err := WriteFrame(c.rw, FrameData, payload); err != nil {
+	copy(payload[dataHeaderLen:], content)
+	if err := WriteFrame(c.rw, kind, payload); err != nil {
 		c.werr = err
 		return err
 	}
@@ -252,7 +295,7 @@ func (c *Conn) RecvDataEvent(id uint64, handle func(Envelope)) ([]byte, bool, er
 			}
 			continue
 		}
-		if kind != FrameData {
+		if kind != FrameData && kind != FrameCompressed {
 			return nil, false, fmt.Errorf("proto: expected a data frame, got frame kind %d", kind)
 		}
 		if len(payload) < dataHeaderLen {
@@ -262,6 +305,13 @@ func (c *Conn) RecvDataEvent(id uint64, handle func(Envelope)) ([]byte, bool, er
 			return nil, false, fmt.Errorf("proto: data frame is for stream %d, want %d", got, id)
 		}
 		chunk := payload[dataHeaderLen:]
+		if kind == FrameCompressed {
+			var err error
+			chunk, err = decompressChunk(chunk, MaxChunk)
+			if err != nil {
+				return nil, false, fmt.Errorf("proto: decompress data frame: %w", err)
+			}
+		}
 		if len(chunk) == 0 {
 			return nil, true, nil
 		}

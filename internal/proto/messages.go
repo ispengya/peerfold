@@ -102,6 +102,16 @@ type HelloBody struct {
 	// server does not build and send event batches to a peer that never reads
 	// them.
 	Watch *bool `json:"watch,omitempty"`
+
+	// Compress asks to compress data frames on this connection. Both ends of a
+	// connection have to agree before either sends a compressed frame, so an
+	// older peer, which omits the field and would not understand the frame,
+	// simply keeps talking in plain data frames.
+	//
+	// Only data streams are compressed — file content and listing bodies.
+	// Control envelopes are not, which keeps the handshake and any future
+	// credential exchange out of a compressor.
+	Compress bool `json:"compress,omitempty"`
 }
 
 // Watching reports whether the hello asked to receive pushed updates. The
@@ -116,6 +126,12 @@ func (h HelloBody) Watching() bool {
 type HelloOKBody struct {
 	Name      string `json:"name"`
 	Aggregate bool   `json:"aggregate"`
+
+	// Compress is the server's ruling on the connection's compression. True
+	// means both directions of this connection may carry compressed data
+	// frames. A client that asked and gets false — an older server, or one
+	// configured not to compress — sends plain frames.
+	Compress bool `json:"compress,omitempty"`
 }
 
 // NodeJSON mirrors node.Node for the wire, so the two encode identically and

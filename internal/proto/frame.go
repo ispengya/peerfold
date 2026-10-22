@@ -16,6 +16,11 @@ type FrameKind uint8
 const (
 	FrameControl FrameKind = 1
 	FrameData    FrameKind = 2
+	// FrameCompressed is a data frame whose content (after the stream id) has
+	// been compressed. It is only sent on a connection where both ends agreed
+	// to compression in the handshake; FrameData remains valid on every
+	// connection and is used for content compression does not help.
+	FrameCompressed FrameKind = 3
 )
 
 // MaxPayload bounds one frame's payload. A response body larger than this is

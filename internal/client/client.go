@@ -158,7 +158,7 @@ func Dial(opt Options) (*Client, error) {
 	if role == "" {
 		role = proto.RoleClient
 	}
-	body, err := json.Marshal(proto.HelloBody{Name: opt.Name, Role: role, Aggregate: opt.Aggregate})
+	body, err := json.Marshal(proto.HelloBody{Name: opt.Name, Role: role, Aggregate: opt.Aggregate, Compress: true})
 	if err != nil {
 		raw.Close()
 		return nil, fmt.Errorf("client: encode hello: %w", err)
@@ -177,15 +177,24 @@ func Dial(opt Options) (*Client, error) {
 		return nil, fmt.Errorf("client: server refused the handshake: %s", env.Err)
 	}
 	var ok proto.HelloOKBody
-	if err := json.Unmarshal(env.Body, &ok); err != nil {
-		raw.Close()
-		return nil, fmt.Errorf("client: decode hello reply: %w", err)
+	if len(env.Body) > 0 {
+		if err := json.Unmarshal(env.Body, &ok); err != nil {
+			raw.Close()
+			return nil, fmt.Errorf("client: decode hello reply: %w", err)
+		}
 	}
 	// The server's ruling is what this client answers reads under. Taking it from
 	// the reply rather than from the request keeps the two ends agreeing even if
 	// the request asked for something the server declined.
 	c.name = ok.Name
 	c.aggregate = ok.Aggregate
+
+	// Enable compression only after the server has said it accepted the
+	// request. An older server omits the field, and a connection that stayed
+	// plain is fully supported; that is what keeps mixed versions working.
+	if ok.Compress {
+		c.pc.SetCompression(true)
+	}
 	if err := raw.SetDeadline(time.Time{}); err != nil {
 		raw.Close()
 		return nil, fmt.Errorf("client: clear deadline: %w", err)

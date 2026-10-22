@@ -156,3 +156,43 @@ func TestServerDropsEventsWithInvalidPaths(t *testing.T) {
 		t.Fatalf("event = %+v, want one node at evil/docs/a.txt", got)
 	}
 }
+
+func TestServerNegotiatesCompression(t *testing.T) {
+	_, addr := start(t)
+
+	for _, tc := range []struct {
+		name     string
+		compress bool
+	}{
+		{"plain", false},
+		{"compressed", true},
+	} {
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		c.SetDeadline(time.Now().Add(15 * time.Second))
+		conn := proto.NewConn(c)
+		body, err := json.Marshal(proto.HelloBody{
+			Name: tc.name, Role: proto.RoleClient, Compress: tc.compress,
+		})
+		if err != nil {
+			t.Fatalf("Marshal hello: %v", err)
+		}
+		if err := conn.Send(proto.Envelope{ID: 1, Kind: proto.KindHello, Body: body}); err != nil {
+			t.Fatalf("Send hello: %v", err)
+		}
+		env, err := conn.Recv()
+		if err != nil {
+			t.Fatalf("Recv hello reply: %v", err)
+		}
+		var ok proto.HelloOKBody
+		if err := json.Unmarshal(env.Body, &ok); err != nil {
+			t.Fatalf("decode hello reply: %v", err)
+		}
+		if ok.Compress != tc.compress {
+			t.Errorf("hello compress=%v got HelloOK compress=%v", tc.compress, ok.Compress)
+		}
+		c.Close()
+	}
+}

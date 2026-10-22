@@ -198,6 +198,7 @@ func (v *Viewer) handshake(timeout time.Duration, name, mountPoint string, watch
 		Role:       proto.RoleViewer,
 		Name:       name,
 		MountPoint: mountPoint,
+		Compress:   true,
 	}
 	if !watch {
 		hb.Watch = new(bool) // false: see HelloBody.Watching
@@ -224,6 +225,19 @@ func (v *Viewer) handshake(timeout time.Duration, name, mountPoint string, watch
 	}
 	if env.ID != id {
 		return fmt.Errorf("viewer: hello reply ID = %d, want %d", env.ID, id)
+	}
+
+	// Only the server's acceptance turns compression on. A server that does not
+	// answer the field is older and keeps the connection plain, which every
+	// operation supports. An empty body is that older shape too.
+	if len(env.Body) > 0 {
+		var ok proto.HelloOKBody
+		if err := json.Unmarshal(env.Body, &ok); err != nil {
+			return fmt.Errorf("viewer: decode hello reply: %w", err)
+		}
+		if ok.Compress {
+			v.pc.SetCompression(true)
+		}
 	}
 	return nil
 }
