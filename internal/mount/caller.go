@@ -141,10 +141,11 @@ type Mount struct {
 	// cannot take a token is skipped rather than queued: the data path always
 	// has priority over speculative work.
 	prefetchTokens chan struct{}
-	// latencyMu guards the moving average of a cache-miss fill. It is what the
-	// adaptive read unit is derived from: a high-latency link wants fewer,
-	// larger round trips, while a local one wants smaller units so a small read
-	// does not wait for a large one.
+	// latencyMu guards the moving average of a latency-dominated round trip
+	// (a cache-miss listing). It is what the adaptive read unit is derived
+	// from: a high-latency link wants fewer, larger round trips, while a local
+	// one wants smaller units so a small read does not wait for a large one.
+	// Bulk read durations deliberately do not feed it; see noteRTT.
 	latencyMu      sync.Mutex
 	latency        time.Duration
 	latencySamples int
@@ -311,7 +312,9 @@ type Options struct {
 	ReadConcurrency int
 	// ChunkSize is how many bytes one ranged read asks the owner for. It is
 	// the knob that trades first-byte latency against sequential throughput on
-	// a high-RTT link; zero means the package default.
+	// a high-RTT link; zero means the package default. The effective unit is
+	// clamped to the protocol's range and rounded to a multiple of the 256 KiB
+	// cache block, then adapted to the measured RTT.
 	ChunkSize int
 	// AttrTimeout and EntryTimeout are how long the kernel may trust an
 	// attribute or a directory entry it was handed. Events invalidate a path
@@ -435,17 +438,20 @@ func readConcurrency(opts Options) int {
 
 // readChunk is the ranged-read unit: the configured size, adapted within the
 // protocol's range to the latency the mount is actually seeing.
+//
+// The result is always a multiple of cacheBlock. The cache stores fixed blocks,
+// so a unit that did not align to them could neither be assembled from cached
+// bytes nor stored back as whole blocks.
 func (m *Mount) readChunk() int {
 	base := m.opts.ChunkSize
 	if base <= 0 {
 		base = chunkSize
 	}
-	if base > MaxChunkSize {
-		base = MaxChunkSize
-	}
+	base = normalizeChunk(base)
 
-	// The average is only trusted once a few fills have been observed: adapting
-	// on the first slow read would double the unit for a single hiccup.
+	// The average is only trusted once a few samples have been observed:
+	// adapting on the first slow round trip would resize every following read
+	// for a single hiccup.
 	m.latencyMu.Lock()
 	latency, samples := m.latency, m.latencySamples
 	m.latencyMu.Unlock()
@@ -456,23 +462,41 @@ func (m *Mount) readChunk() int {
 	case latency >= 15*time.Millisecond:
 		// One round trip dominates: halve the number of them.
 		base *= 2
-		if base > MaxChunkSize {
-			base = MaxChunkSize
-		}
 	case latency <= 2*time.Millisecond:
 		// The link is local; a smaller unit gets a small read its first byte
 		// sooner and wastes less on every file tail.
-		if base > 256<<10 {
-			base /= 2
-		}
+		base /= 2
 	}
-	return base
+	return normalizeChunk(base)
 }
 
-// noteChunkLatency folds one fill's duration into the moving average readChunk
-// uses. The weight is one fifth, which is slow enough that one slow packet does
-// not resize every following read and fast enough to settle within a few units.
-func (m *Mount) noteChunkLatency(d time.Duration) {
+// normalizeChunk clamps a unit to the protocol's range and rounds it to a
+// whole number of cache blocks.
+func normalizeChunk(n int) int {
+	if n < cacheBlock {
+		return cacheBlock
+	}
+	if n > MaxChunkSize {
+		n = MaxChunkSize
+	}
+	n -= n % cacheBlock
+	if n < cacheBlock {
+		return cacheBlock
+	}
+	return n
+}
+
+// noteRTT folds one latency-dominated round trip into the moving average
+// readChunk uses. The weight is one fifth, which is slow enough that one slow
+// packet does not resize every following read and fast enough to settle within a
+// few samples.
+//
+// The sample comes from a listing, not from a bulk read. A read's duration is
+// dominated by how many bytes it carries, so feeding it here made every
+// bandwidth-limited link look "high latency" and pinned the unit at its
+// maximum — without buying a single round trip, because the transfer, not the
+// round trip, was the cost.
+func (m *Mount) noteRTT(d time.Duration) {
 	if d <= 0 {
 		return
 	}

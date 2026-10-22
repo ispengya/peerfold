@@ -1,6 +1,9 @@
 package mount
 
-import "testing"
+import (
+	"bytes"
+	"testing"
+)
 
 func TestChunkCacheHitsAndMisses(t *testing.T) {
 	c := newChunkCache(1<<20, 4<<20)
@@ -273,5 +276,57 @@ func TestReputKeepsTheExistingChunk(t *testing.T) {
 	}
 	if c.openTotal(1) != len("first") {
 		t.Errorf("re-put double-counted: openTotal = %d, want %d", c.openTotal(1), len("first"))
+	}
+}
+
+// The cache stores fixed blocks, so a unit is only a view onto them. Reading
+// the same file at a different unit size must hit the blocks the previous unit
+// produced instead of fetching the bytes again.
+func TestAUnitIsAssembledFromBlocksWhateverUnitFetchedThem(t *testing.T) {
+	c := newChunkCache(4<<20, 8<<20)
+	c.bind(1, "/f")
+	gen := c.generation(1)
+
+	half := bytes.Repeat([]byte("a"), 2*cacheBlock) // 512 KiB: two blocks
+	c.putUnitAt(1, gen, len(half), 0, half)
+	if got, ok := c.getAt(1, len(half), 0); !ok || !bytes.Equal(got, half) {
+		t.Fatalf("512 KiB unit did not hit the blocks it was stored as (ok=%v, len=%d)", ok, len(got))
+	}
+
+	full := make([]byte, 4*cacheBlock) // 1 MiB: needs two more blocks
+	copy(full, half)
+	if _, ok := c.getAt(1, len(full), 0); ok {
+		t.Fatal("a 1 MiB unit hit while half of its blocks were absent")
+	}
+	tail := bytes.Repeat([]byte("b"), 2*cacheBlock)
+	c.putUnitAt(1, gen, len(tail), 1, tail) // the unit after the first 512 KiB
+	copy(full[len(half):], tail)
+
+	got, ok := c.getAt(1, len(full), 0)
+	if !ok {
+		t.Fatal("a 1 MiB unit missed blocks that were cached as two 512 KiB units")
+	}
+	if !bytes.Equal(got, full) {
+		t.Fatal("the assembled 1 MiB unit has the wrong bytes")
+	}
+}
+
+// A short block is the file's last one, and the unit assembled from it ends
+// there instead of waiting for bytes that do not exist.
+func TestAShortBlockEndsTheAssembledUnit(t *testing.T) {
+	c := newChunkCache(4<<20, 8<<20)
+	c.bind(1, "/f")
+	short := []byte("end")
+	c.putUnitAt(1, c.generation(1), cacheBlock, 0, short)
+
+	got, ok := c.getAt(1, cacheBlock, 0)
+	if !ok || !bytes.Equal(got, short) {
+		t.Fatalf("getAt(short block) = %q, %v, want %q, true", got, ok, short)
+	}
+	// A two-block unit starts with the same short block, so it is a valid hit
+	// that ends at the file's end rather than a miss.
+	got, ok = c.getAt(1, 2*cacheBlock, 0)
+	if !ok || !bytes.Equal(got, short) {
+		t.Fatalf("getAt(two-block unit) = %q, %v, want the short block, true", got, ok)
 	}
 }

@@ -13,8 +13,8 @@ import (
 // pays one round trip per chunk, so the ceiling on sequential throughput is
 // roughly chunkSize/RTT: 128 KiB over a 50 ms link is 2.5 MB/s regardless of
 // available bandwidth. 512 KiB reduces the round trips fourfold while still
-// fitting comfortably inside one 1 MiB wire frame; it is a field rather than a
-// constant so a deployment can trade first-byte latency for throughput.
+// fitting comfortably inside one 1 MiB wire frame. Options.ChunkSize overrides
+// it, and readChunk adapts within the protocol's range.
 const chunkSize = 512 << 10
 
 // MaxChunkSize bounds the configured read unit. A read's content is split into
@@ -22,14 +22,37 @@ const chunkSize = 512 << 10
 // entry and delays the first byte of a small read.
 const MaxChunkSize = 1 << 20
 
-// chunkKey identifies one cached chunk by the file it belongs to, the
-// generation of that file's content, and the chunk index.
+// cacheBlock is the granularity the read cache stores, independent of the read
+// unit.
+//
+// Keeping the unit out of the cache key is what lets the adaptive unit change
+// without throwing away everything already fetched: a 1 MiB read is assembled
+// from four of these blocks, whether the previous read fetched them as two
+// 512 KiB units or four 256 KiB ones. Before this split, the unit was part of
+// the key, so the first adaptive change made every cached byte unreachable and
+// the same file was downloaded again.
+//
+// It must divide every allowed read unit. readChunk normalises its result to a
+// multiple of this value.
+const cacheBlock = 256 << 10
+
+// blockKey identifies one cached block by its file, the generation of that
+// file's content, and the block index.
 //
 // The generation is what makes invalidation cheap and safe. A cache fill can be
 // in flight when an event says the file changed; the fill completes afterwards
 // and must not publish the old bytes under the new state. Bumping the
 // generation makes every in-flight fill for that path unwritable, without
 // waiting for it.
+type blockKey struct {
+	path  string
+	gen   uint64
+	block int64
+}
+
+// chunkKey identifies one ranged read that is in flight: the file, the content
+// generation the read started from, and the unit it covers. It is not a cache
+// key; cached bytes are stored by blockKey.
 type chunkKey struct {
 	path  string
 	gen   uint64
@@ -66,15 +89,15 @@ type chunkCache struct {
 	// absent rather than present-and-zero, so the map does not accumulate an
 	// entry for every file that was ever opened.
 	bytes map[string]int
-	items map[chunkKey][]byte
+	items map[blockKey][]byte
 	// order is the eviction queue, most recently used at the back.
 	order *list.List
 	// index locates a key in order, so a hit can move it to the back without
 	// scanning the list.
-	index map[chunkKey]*list.Element
+	index map[blockKey]*list.Element
 	// byPath locates the chunks of one path, so invalidation removes exactly
 	// those entries rather than scanning the whole cache per event.
-	byPath map[string]map[chunkKey]struct{}
+	byPath map[string]map[blockKey]struct{}
 	// fhPath maps an open handle to the path it reads. It is the bridge between
 	// the handle-keyed read path and the path-keyed cache.
 	fhPath map[uint64]string
@@ -102,10 +125,10 @@ func newChunkCache(perOpen, global int) *chunkCache {
 		perOpen: perOpen,
 		global:  global,
 		bytes:   map[string]int{},
-		items:   map[chunkKey][]byte{},
+		items:   map[blockKey][]byte{},
 		order:   list.New(),
-		index:   map[chunkKey]*list.Element{},
-		byPath:  map[string]map[chunkKey]struct{}{},
+		index:   map[blockKey]*list.Element{},
+		byPath:  map[string]map[blockKey]struct{}{},
 		fhPath:  map[uint64]string{},
 		gen:     map[string]uint64{},
 	}
@@ -144,7 +167,7 @@ func (c *chunkCache) unbindLocked(fh uint64) { delete(c.fhPath, fh) }
 
 // generation returns the current content generation for a handle's path, or 0
 // when the handle is not bound. A fill remembers this value and stores its
-// bytes with putAt, so a change during the fill cannot be overwritten.
+// bytes with putUnitAt, so a change during the fill cannot be overwritten.
 func (c *chunkCache) generation(fh uint64) uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -168,29 +191,27 @@ func (c *chunkCache) key(fh uint64, unit int, chunk int64) (chunkKey, bool) {
 	return chunkKey{path: path, gen: c.gen[path], unit: unit, chunk: chunk}, true
 }
 
-// get returns a cached chunk and marks it recently used.
+// get returns one cached block and marks it recently used.
 //
-// The slice is returned as stored, without copying: the caller is the read path,
-// which copies out of it into the caller's buffer. Handing back the cached slice
-// is what makes a hit cheap, and it is safe because nothing writes to a cached
-// chunk in place — a chunk is immutable once read from the owner. The lock is
-// released before the caller touches those bytes, which is sound precisely
-// because no one ever mutates them.
-func (c *chunkCache) get(fh uint64, chunk int64) ([]byte, bool) {
-	return c.getAt(fh, 0, chunk)
-}
-
-// getAt is get for a specific read unit. The unit is part of the key because a
-// chunk index means a different byte range at a different unit; sharing the key
-// across units would return the wrong bytes, not merely a stale cache hit.
-func (c *chunkCache) getAt(fh uint64, unit int, chunk int64) ([]byte, bool) {
+// The slice is returned as stored, without copying: the caller copies out of it
+// into its own buffer. Handing back the cached slice is what makes a hit cheap,
+// and it is safe because nothing writes to a cached block in place — a block is
+// immutable once read from the owner. The lock is released before the caller
+// touches those bytes, which is sound precisely because no one ever mutates
+// them.
+func (c *chunkCache) get(fh uint64, block int64) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	path, ok := c.fhPath[fh]
 	if !ok {
 		return nil, false
 	}
-	k := chunkKey{path: path, gen: c.gen[path], unit: unit, chunk: chunk}
+	return c.getBlockLocked(blockKey{path: path, gen: c.gen[path], block: block})
+}
+
+// getBlockLocked returns one block and moves it to the back of the LRU order.
+// The caller holds the lock.
+func (c *chunkCache) getBlockLocked(k blockKey) ([]byte, bool) {
 	data, ok := c.items[k]
 	if !ok {
 		return nil, false
@@ -201,9 +222,44 @@ func (c *chunkCache) getAt(fh uint64, unit int, chunk int64) ([]byte, bool) {
 	return data, true
 }
 
-// put caches one chunk at the path's current generation. It is the convenience
+// getAt assembles one read unit from the fixed-size blocks.
+//
+// A unit is a transfer decision, not a storage decision: it may be 256 KiB,
+// 512 KiB, or 1 MiB, and whichever size the previous fill used, the blocks it
+// produced are reusable here. A missing block means the whole unit misses;
+// callers then fetch it and the fill stores its blocks for the next unit size.
+//
+// A short block is the file's last one, so the unit ends there: the assembled
+// result is returned as a hit even though it is shorter than a unit.
+func (c *chunkCache) getAt(fh uint64, unit int, chunk int64) ([]byte, bool) {
+	if unit <= 0 || unit%cacheBlock != 0 {
+		return nil, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	path, ok := c.fhPath[fh]
+	if !ok {
+		return nil, false
+	}
+	gen := c.gen[path]
+	first := chunk * int64(unit) / int64(cacheBlock)
+	out := make([]byte, 0, unit)
+	for i := 0; i < unit/cacheBlock; i++ {
+		data, ok := c.getBlockLocked(blockKey{path: path, gen: gen, block: first + int64(i)})
+		if !ok {
+			return nil, false
+		}
+		out = append(out, data...)
+		if len(data) < cacheBlock {
+			return out, true
+		}
+	}
+	return out, true
+}
+
+// put caches one block at the path's current generation. It is the convenience
 // form used by tests and by callers that were not in flight across a change.
-func (c *chunkCache) put(fh uint64, chunk int64, data []byte) {
+func (c *chunkCache) put(fh uint64, block int64, data []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	path, ok := c.fhPath[fh]
@@ -211,31 +267,45 @@ func (c *chunkCache) put(fh uint64, chunk int64, data []byte) {
 		path = syntheticPath(fh)
 		c.bindLocked(fh, path)
 	}
-	c.putLocked(chunkKey{path: path, gen: c.gen[path], chunk: chunk}, data)
+	c.putLocked(blockKey{path: path, gen: c.gen[path], block: block}, data)
 }
 
-// putAt caches a chunk that was fetched at generation gen. A fill that raced an
+// putUnitAt stores a fetched unit as its fixed-size blocks. A fill that raced an
 // invalidation is discarded: its bytes describe the file as it was, and the
 // next read must go back to the owner.
-func (c *chunkCache) putAt(fh uint64, gen uint64, unit int, chunk int64, data []byte) {
+func (c *chunkCache) putUnitAt(fh uint64, gen uint64, unit int, chunk int64, data []byte) {
+	if unit <= 0 || unit%cacheBlock != 0 {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	path, ok := c.fhPath[fh]
 	if !ok || gen == 0 || c.gen[path] != gen {
 		return
 	}
-	c.putLocked(chunkKey{path: path, gen: gen, unit: unit, chunk: chunk}, data)
+	first := chunk * int64(unit) / int64(cacheBlock)
+	for off := 0; off < len(data); off += cacheBlock {
+		end := off + cacheBlock
+		if end > len(data) {
+			end = len(data)
+		}
+		c.putLocked(blockKey{
+			path:  path,
+			gen:   gen,
+			block: first + int64(off/cacheBlock),
+		}, data[off:end])
+	}
 }
 
-// putLocked stores one chunk. The data is stored as given and must not be
+// putLocked stores one block. The data is stored as given and must not be
 // modified afterwards by the caller; the read path allocates each chunk for
 // this purpose.
 //
 // A put for a key already present is ignored rather than replacing the stored
-// bytes. A chunk's content is immutable, so a second put for the same key is the
+// bytes. A block's content is immutable, so a second put for the same key is the
 // same bytes, and replacing would throw away the position the existing entry has
 // in the eviction order.
-func (c *chunkCache) putLocked(k chunkKey, data []byte) {
+func (c *chunkCache) putLocked(k blockKey, data []byte) {
 	if len(data) > c.global {
 		// Larger than the entire budget: caching it would evict everything
 		// else and still not fit, so serve it and forget it.
@@ -248,7 +318,7 @@ func (c *chunkCache) putLocked(k chunkKey, data []byte) {
 	c.index[k] = c.order.PushBack(k)
 	c.bytes[k.path] += len(data)
 	if c.byPath[k.path] == nil {
-		c.byPath[k.path] = map[chunkKey]struct{}{}
+		c.byPath[k.path] = map[blockKey]struct{}{}
 	}
 	c.byPath[k.path][k] = struct{}{}
 	c.evictOpen(k.path)
@@ -287,7 +357,7 @@ func (c *chunkCache) evictGlobal() {
 // cap, and the cap bounds how many of that path's chunks are in the list.
 func (c *chunkCache) oldestOf(path string) *list.Element {
 	for el := c.order.Front(); el != nil; el = el.Next() {
-		if el.Value.(chunkKey).path == path {
+		if el.Value.(blockKey).path == path {
 			return el
 		}
 	}
@@ -295,7 +365,7 @@ func (c *chunkCache) oldestOf(path string) *list.Element {
 }
 
 func (c *chunkCache) removeElement(el *list.Element) {
-	k := el.Value.(chunkKey)
+	k := el.Value.(blockKey)
 	data := c.items[k]
 	delete(c.items, k)
 	delete(c.index, k)
@@ -355,10 +425,10 @@ func (c *chunkCache) clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.bytes = map[string]int{}
-	c.items = map[chunkKey][]byte{}
+	c.items = map[blockKey][]byte{}
 	c.order = list.New()
-	c.index = map[chunkKey]*list.Element{}
-	c.byPath = map[string]map[chunkKey]struct{}{}
+	c.index = map[blockKey]*list.Element{}
+	c.byPath = map[string]map[blockKey]struct{}{}
 	for p := range c.gen {
 		c.gen[p]++
 	}

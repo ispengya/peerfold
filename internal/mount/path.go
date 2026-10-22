@@ -152,6 +152,11 @@ func (m *Mount) listDirLogged(dir string, logAccess bool) (children []node.Node,
 		}
 		m.listingMu.Unlock()
 		if logAccess {
+			// A listing is the latency-dominated round trip the read unit
+			// adaptation is supposed to follow. Prefetch fills skip this: they
+			// are speculative and would skew the average with work the caller
+			// never waited for.
+			m.noteRTT(took)
 			log.Printf("mount: list %s entries=%d took=%s cached=false", dir, len(fetched), took)
 		}
 	} else {

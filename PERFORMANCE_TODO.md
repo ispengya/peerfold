@@ -62,6 +62,40 @@
 元数据/写请求真正并行，并去掉每个文件的 fsync；跨文件 batch 与 write-behind 仍列在
 下面的后续项中。
 
+### 读取缓存与并行填充（2026-10-22 深夜）
+
+实测一份 1.5 MB 图片的挂载日志：第一次读传了 3×512 KiB，读块自适应到 1 MiB 后
+第二次打开又把 0–1 MiB 和 1–1.5 MiB 重传了一遍。同一时间段的 server 日志显示
+`read` 耗时 0.70–3.22 s，而 owner（server 本机）的本地读只有 0.1–1 ms；挂载端
+在公网回家链路上，有效带宽约 2–4 Mbps。也就是说：
+
+- 首次打开慢的主因是 **VM 公网出带宽**，不是 mount 代码；回环实测 1.5 MB 冷读
+  15 ms（104 MB/s，`iflag=direct`），第二次 3 ms。
+- 重复下载是代码问题：缓存 key 带了读块大小，自适应一变，旧缓存全部查不到。
+
+本轮改动：
+
+- **缓存按固定 256 KiB 块存储**，key 只有 `(path, generation, block)`；读块
+  （256 KiB / 512 KiB / 1 MiB）只是传输单位，用块拼装。读块变化不再丢缓存，
+  第二次打开同一图片全部命中。
+- `readChunk` 的结果规范化为块大小的整数倍，缓存与传输的边界因此始终一致。
+- **自适应改看 List RTT**，不再用整块传输耗时：慢带宽会把每次大读都测成“高延迟”，
+  从而把读块永久顶到 1 MiB，却并不能减少实际传输时间。真实 RTT 由 cache-miss
+  listing 采样，预取 listing 不参与。
+- **一次 FUSE Read 覆盖多个读块时并发填充**，上限为连接池宽度（默认 4），
+  不再一块接一块地等；错误仍按顺序处理，已读到的前缀照旧返回。
+- **预取改为并发**，并且在第一次“大读”（请求长度 ≥ 读块）时就触发；Windows
+  并行/乱序读不再让 `chunkIdx == lastChunk+1` 永远为假。预取仍只允许一批在跑，
+  且跳过已缓存、句柄已关闭或已变脏的情况。
+- 回归测试：`TestAUnitIsAssembledFromBlocksWhateverUnitFetchedThem`、
+  `TestAShortBlockEndsTheAssembledUnit`、`TestChangingTheReadUnitDoesNotRefetchCachedBytes`、
+  `TestABulkReadPrefetchesOnItsFirstAccess`、`TestAReadSpanningUnitsFillsThemConcurrently`
+
+**实测边界**：owner 的 `readLoop` 在一条连接上逐条服务读请求，所以同一 owner 的
+读本质上是串行的；mount 的并发只能填满链路，不能把一条 2–4 Mbps 的公网链路变成
+更宽。若首次读还要更快，只能提升 VM 出带宽、把 server 挪到离挂载端更近的位置，
+或对文本内容做协议级压缩（图片本身收益很小）。
+
 ## 第一梯队（已完成）
 
 1. `--exclude` CLI/配置

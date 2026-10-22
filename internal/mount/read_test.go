@@ -784,17 +784,125 @@ func TestReadUnitAdaptsToMeasuredLatency(t *testing.T) {
 		t.Fatalf("cold read unit = %d, want the configured %d", got, chunkSize)
 	}
 
-	for i := 0; i < 4; i++ {
-		m.noteChunkLatency(20 * time.Millisecond)
+	// Open's lookup already contributed a fast listing sample, so converge
+	// the moving average onto the high RTT rather than assuming it starts empty.
+	for i := 0; i < 12; i++ {
+		m.noteRTT(50 * time.Millisecond)
 	}
 	if got := m.readChunk(); got != MaxChunkSize {
 		t.Errorf("read unit at 20 ms = %d, want %d", got, MaxChunkSize)
 	}
 
 	for i := 0; i < 40; i++ {
-		m.noteChunkLatency(time.Millisecond)
+		m.noteRTT(time.Millisecond)
 	}
 	if got := m.readChunk(); got != 256<<10 {
 		t.Errorf("read unit on a local link = %d, want %d", got, 256<<10)
+	}
+}
+
+// Changing the adaptive unit must not make the cache unreachable. Before the
+// fixed-block split, a 512 KiB fill was keyed by its unit, so the first switch
+// to 1 MiB re-fetched every byte the file had already downloaded.
+func TestChangingTheReadUnitDoesNotRefetchCachedBytes(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addContent("/big.bin", bytes.Repeat([]byte("x"), MaxChunkSize))
+
+	fh, code := m.Open("/big.bin", OReadOnly)
+	if code != 0 {
+		t.Fatalf("Open = %d", code)
+	}
+
+	// Fill the file as two 512 KiB units.
+	if _, err := m.fetchChunk(fh, "/big.bin", 0, chunkSize); err != nil {
+		t.Fatalf("fetch unit 0: %v", err)
+	}
+	if _, err := m.fetchChunk(fh, "/big.bin", 1, chunkSize); err != nil {
+		t.Fatalf("fetch unit 1: %v", err)
+	}
+	before := f.readCount()
+
+	// Open's lookup already contributed a fast listing sample, so converge
+	// the moving average onto the high RTT rather than assuming it starts empty.
+	for i := 0; i < 12; i++ {
+		m.noteRTT(50 * time.Millisecond)
+	}
+	if got := m.readChunk(); got != MaxChunkSize {
+		t.Fatalf("read unit = %d, want %d after a high RTT", got, MaxChunkSize)
+	}
+
+	if _, err := m.fetchChunk(fh, "/big.bin", 0, MaxChunkSize); err != nil {
+		t.Fatalf("fetch at the new unit: %v", err)
+	}
+	if got := f.readCount(); got != before {
+		t.Fatalf("wire reads = %d after changing the unit, want still %d: the cached blocks were not reused", got, before)
+	}
+}
+
+// A bulk read is the signal that the caller wants more than one unit: it must
+// start read-ahead on its first access, not wait for a strictly sequential
+// follow-up that Windows may never issue (it reads several ranges in parallel).
+func TestABulkReadPrefetchesOnItsFirstAccess(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	f.addContent("/big.bin", bytes.Repeat([]byte("x"), chunkSize*4))
+
+	fh, _ := m.Open("/big.bin", OReadOnly)
+	buf := make([]byte, chunkSize)
+	if n := m.Read("/big.bin", buf, 0, fh); n != len(buf) {
+		t.Fatalf("Read = %d, want %d", n, len(buf))
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := m.cache.getAt(fh, chunkSize, 1); ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the unit after the first bulk read was never prefetched")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// The units of one read are fetched concurrently, so the data path can use the
+// connection pool instead of paying one transfer after another.
+func TestAReadSpanningUnitsFillsThemConcurrently(t *testing.T) {
+	m := newTestMount(t)
+	f := fakeOf(t, m)
+	const delay = 100 * time.Millisecond
+	f.setReadDelay(delay)
+	f.addContent("/big.bin", bytes.Repeat([]byte("x"), chunkSize*4))
+
+	fh, _ := m.Open("/big.bin", OReadOnly)
+	buf := make([]byte, chunkSize*4)
+	started := time.Now()
+	if n := m.Read("/big.bin", buf, 0, fh); n != len(buf) {
+		t.Fatalf("Read = %d, want %d", n, len(buf))
+	}
+	elapsed := time.Since(started)
+
+	// Four units fetched one after another would take at least 4*delay. The
+	// assertion leaves room for scheduling, but not for serialisation.
+	if elapsed >= 3*delay {
+		t.Fatalf("a four-unit read took %s with a %s per-unit fill; the fills did not overlap", elapsed, delay)
+	}
+}
+
+func TestReadUnitIsNormalizedToCacheBlocks(t *testing.T) {
+	cases := []struct {
+		in, want int
+	}{
+		{1, cacheBlock},
+		{300 << 10, cacheBlock},
+		{700 << 10, 2 * cacheBlock},
+		{MaxChunkSize, MaxChunkSize},
+		{4 * MaxChunkSize, MaxChunkSize},
+	}
+	for _, c := range cases {
+		if got := normalizeChunk(c.in); got != c.want {
+			t.Errorf("normalizeChunk(%d) = %d, want %d", c.in, got, c.want)
+		}
 	}
 }

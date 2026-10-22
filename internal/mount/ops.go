@@ -5,6 +5,7 @@ import (
 	stdpath "path"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ispengya/peerfold/internal/node"
@@ -560,63 +561,115 @@ func (m *Mount) Read(path string, buf []byte, off int64, fh uint64) int {
 	}
 
 	unit := m.readChunk()
-	total := 0
-	for total < len(buf) {
-		pos := off + int64(total)
-		chunkIdx := pos / int64(unit)
-		chunkOff := chunkIdx * int64(unit)
+	firstIdx := off / int64(unit)
+	lastIdx := (off + int64(len(buf)) - 1) / int64(unit)
 
-		// The access is recorded before the lookup: a sequential run that
-		// happens to be served from the cache still tells the prefetcher what
-		// comes next.
-		sequential := m.noteChunkAccess(fh, chunkIdx)
+	// Record every unit this call touches. The first one answers whether this
+	// is a sequential continuation, and leaving the handle's position at the
+	// last one is what lets the next request prefetch ahead of itself.
+	sequential := m.noteChunkAccess(fh, firstIdx)
+	for i := firstIdx + 1; i <= lastIdx; i++ {
+		m.noteChunkAccess(fh, i)
+	}
 
-		chunk, ok := m.cache.getAt(fh, unit, chunkIdx)
-		if !ok {
+	// Fill every missing unit at once, bounded by the connection-pool width.
+	// Waiting for them one at a time left the link idle between round trips and
+	// made a multi-unit read as slow as the sum of its units, even though the
+	// wire already supports several requests in flight.
+	type fill struct {
+		data    []byte
+		err     error
+		took    time.Duration
+		fetched bool
+	}
+	fills := make([]fill, lastIdx-firstIdx+1)
+	sem := make(chan struct{}, m.readConcurrency())
+	var wg sync.WaitGroup
+	for i := range fills {
+		idx := firstIdx + int64(i)
+		if chunk, ok := m.cache.getAt(fh, unit, idx); ok {
+			fills[i].data = chunk
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(slot int, idx int64) {
+			defer wg.Done()
+			defer func() { <-sem }()
 			started := time.Now()
-			data, err := m.fetchChunk(fh, t.path, chunkIdx, unit)
-			took := time.Since(started)
-			if err != nil {
+			data, err := m.fetchChunk(fh, t.path, idx, unit)
+			fills[slot] = fill{data: data, err: err, took: time.Since(started), fetched: true}
+		}(i, idx)
+	}
+	wg.Wait()
+
+	total := 0
+	eof := false
+	var firstErr error
+	for i := range fills {
+		f := fills[i]
+		chunkOff := (firstIdx + int64(i)) * int64(unit)
+		if f.fetched {
+			if f.err != nil {
 				log.Printf("mount: read %s off=%d n=%d took=%s failed: %v",
-					t.path, chunkOff, unit, took, err)
-				// A partial read is returned rather than discarded. Throwing
-				// away the bytes already in the buffer would make a large file
-				// unreadable over a flaky link, because the retry starts from
-				// scratch and hits the same failure.
-				if total > 0 {
-					return total
-				}
-				return errnoFor(err)
+					t.path, chunkOff, unit, f.took, f.err)
+				firstErr = f.err
+				break
 			}
 			// Slow fills are worth a line; the common one is not. A build reads
 			// thousands of units, and logging each of them cost more than the
 			// cache lookup it accompanied.
-			if took > 100*time.Millisecond {
+			if f.took > 100*time.Millisecond {
 				log.Printf("mount: read %s off=%d n=%d bytes=%d took=%s",
-					t.path, chunkOff, unit, len(data), took)
-			}
-			chunk = data
-			if sequential {
-				m.startPrefetch(fh, t.path, chunkIdx+1, unit)
+					t.path, chunkOff, unit, len(f.data), f.took)
 			}
 		}
-		if len(chunk) == 0 {
-			break // end of file
+		if total >= len(buf) {
+			break
 		}
-		within := pos - chunkOff
-		if within >= int64(len(chunk)) {
-			break // the chunk does not reach the offset, so the file ends here
+		if len(f.data) == 0 {
+			eof = true
+			break
 		}
-		total += copy(buf[total:], chunk[within:])
-		if len(chunk) < unit {
-			break // a short chunk means the file ended
+		within := off - chunkOff
+		if within < 0 {
+			within = 0
 		}
-		// No "buffer is full" check belongs here. Each iteration advances the
-		// position by a whole chunk because a full-size chunk always moves
-		// total to at least the next boundary, so the only way to return to the
-		// same leftover bytes is a short chunk -- caught above. A guard was
-		// written here and then removed, because no input could make it fire and
-		// a line no test can reach is a line no test can defend.
+		if within >= int64(len(f.data)) {
+			eof = true
+			break
+		}
+		part := f.data[within:]
+		if room := len(buf) - total; len(part) > room {
+			part = part[:room]
+		}
+		total += copy(buf[total:], part)
+		if len(f.data) < unit {
+			eof = true
+			break
+		}
+	}
+	if firstErr != nil {
+		// A partial read is returned rather than discarded. Throwing away the
+		// bytes already in the buffer would make a large file unreadable over a
+		// flaky link, because the retry starts from scratch and hits the same
+		// failure.
+		if total > 0 {
+			return total
+		}
+		return errnoFor(firstErr)
+	}
+
+	// Read ahead after a bulk or sequential read, not only after a strictly
+	// sequential one. Windows issues several reads of one file in parallel and
+	// out of order, so per-handle "chunkIdx == lastChunk+1" used to be false on
+	// exactly the reads a prefetcher exists for. A bulk request is the signal
+	// that the caller wants more than one unit.
+	if !eof && (sequential || len(buf) >= unit) {
+		next := firstIdx + int64(len(fills))
+		if t.size <= 0 || next*int64(unit) < t.size {
+			m.startPrefetch(fh, t.path, next, unit)
+		}
 	}
 	return total
 }
