@@ -1,6 +1,8 @@
 package client
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -16,10 +18,47 @@ import (
 // through a declared share rather than taken at face value.
 type FS struct {
 	shares Shares
+	// realRoots is each share root with symbolic links resolved, computed once
+	// when the FS is built. Roots are guaranteed to exist and not to be links
+	// themselves, but their parents may be, and every containment check has to
+	// compare canonical paths or a link in the configured path would make all
+	// of them disagree.
+	realRoots map[string]string
 }
 
 // NewFS returns an FS over the given shares.
-func NewFS(sh Shares) *FS { return &FS{shares: sh} }
+func NewFS(sh Shares) *FS {
+	f := &FS{shares: sh, realRoots: make(map[string]string, len(sh.names))}
+	for _, name := range sh.names {
+		root, ok := sh.Root(name)
+		if !ok {
+			continue
+		}
+		f.realRoots[name] = resolveExisting(root)
+	}
+	return f
+}
+
+// realRoot is a share's canonical root.
+func (f *FS) realRoot(share string) string {
+	if real, ok := f.realRoots[share]; ok {
+		return real
+	}
+	root, _ := f.shares.Root(share)
+	return resolveExisting(root)
+}
+
+// resolveExisting resolves symlinks in p, or returns p unchanged if it cannot.
+// A root that cannot be resolved is one whose link chain changed under us;
+// leaving it as written makes the containment check below compare against a
+// path that the operating system will itself resolve, which can only reject,
+// not accept, an escape.
+func resolveExisting(p string) string {
+	if real, err := filepath.EvalSymlinks(p); err == nil {
+		return real
+	}
+	return p
+}
 
 // LocalPath resolves a share-relative path to an absolute path on this machine.
 //
@@ -27,6 +66,18 @@ func NewFS(sh Shares) *FS { return &FS{shares: sh} }
 // it refuses to produce one that escapes the share root. On refusal it returns
 // an empty path as well as an error: a caller that received a path alongside
 // the error would be free to use it, which is the whole thing being prevented.
+//
+// Containment is checked in two steps. The lexical check catches ".." before
+// anything touches the filesystem. The second resolves the path's parent
+// through symbolic links and requires the result to stay under the share's
+// canonical root: without it, a link inside the share (a perfectly ordinary way
+// to bring a directory in) would let a wire path such as "link/passwd" read or
+// write outside the share even though the lexical path is inside it.
+//
+// The final component is deliberately not resolved. Callers use the returned
+// path for create, rename, and remove, where following the last link would turn
+// "replace this name" into "replace that link's target". Reads, which do mean
+// to follow it, use localPathFollow.
 //
 // The empty relative path is refused here rather than by each operation, because
 // it names the share root itself and the escape check does not catch it:
@@ -37,6 +88,24 @@ func NewFS(sh Shares) *FS { return &FS{shares: sh} }
 // from the wire, since "win/Documents" names a client and a share and no path
 // inside it.
 func (f *FS) LocalPath(share, rel string) (string, error) {
+	full, err := f.lexicalPath(share, rel)
+	if err != nil {
+		return "", err
+	}
+
+	realParent, err := resolveParent(filepath.Dir(full))
+	if err != nil {
+		return "", fmt.Errorf("client: resolve %q: %w", rel, err)
+	}
+	if !node.IsUnder(f.realRoot(share), realParent) {
+		return "", fmt.Errorf("client: path %q escapes share %q through a symbolic link", rel, share)
+	}
+	return filepath.Join(realParent, filepath.Base(full)), nil
+}
+
+// lexicalPath is the part of LocalPath that needs no filesystem access: it
+// resolves the share, refuses the empty path, and refuses a ".." escape.
+func (f *FS) lexicalPath(share, rel string) (string, error) {
 	root, ok := f.shares.Root(share)
 	if !ok {
 		return "", fmt.Errorf("client: no such share %q", share)
@@ -56,6 +125,79 @@ func (f *FS) LocalPath(share, rel string) (string, error) {
 	return full, nil
 }
 
+// localPathFollow is LocalPath for an operation that means to follow the last
+// symbolic link (a read or a stat), with the target of that link checked
+// against the share as well.
+//
+// A path that does not exist is returned in its parent-resolved form rather
+// than reported as an escape: the caller's own open or stat is what should
+// produce that error, and it does so with the operating system's
+// classification (ENOENT and so on) instead of a containment failure.
+func (f *FS) localPathFollow(share, rel string) (string, error) {
+	full, err := f.lexicalPath(share, rel)
+	if err != nil {
+		return "", err
+	}
+
+	real, err := filepath.EvalSymlinks(full)
+	if err == nil {
+		// The whole path, including its last link, resolved. One check covers
+		// every component.
+		if !node.IsUnder(f.realRoot(share), real) {
+			return "", fmt.Errorf("client: path %q escapes share %q through a symbolic link", rel, share)
+		}
+		return real, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+
+	// Nothing at the path yet. The parent still has to be contained, and it is
+	// the parent-resolved name the caller should try, so the error it gets is
+	// the operating system's.
+	realParent, err := resolveParent(filepath.Dir(full))
+	if err != nil {
+		return "", fmt.Errorf("client: resolve %q: %w", rel, err)
+	}
+	if !node.IsUnder(f.realRoot(share), realParent) {
+		return "", fmt.Errorf("client: path %q escapes share %q through a symbolic link", rel, share)
+	}
+	return filepath.Join(realParent, filepath.Base(full)), nil
+}
+
+// resolveParent resolves a directory path to its canonical form, including when
+// the directory does not exist yet.
+//
+// EvalSymlinks needs every component to exist, but create and mkdir routinely
+// name a path whose parent exists and whose leaf does not. The walk finds the
+// nearest existing ancestor, resolves that, and reattaches the missing names.
+// Those names contain no "..": they come from a cleaned absolute path, so the
+// reattached result cannot climb out of the ancestor it was resolved from.
+func resolveParent(dir string) (string, error) {
+	existing := dir
+	var missing []string
+	for {
+		real, err := filepath.EvalSymlinks(existing)
+		if err == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				real = filepath.Join(real, missing[i])
+			}
+			return real, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		next := filepath.Dir(existing)
+		if next == existing {
+			// The root itself does not exist, which is unusual enough that the
+			// real failure is better reported by the operation.
+			return dir, nil
+		}
+		missing = append(missing, filepath.Base(existing))
+		existing = next
+	}
+}
+
 // ReadAt returns at most n bytes of a file starting at off, along with the
 // file's metadata.
 //
@@ -67,7 +209,7 @@ func (f *FS) LocalPath(share, rel string) (string, error) {
 // same nothing, and the caller asks for a range, not for a diagnosis. n < 0
 // means "to the end of the file".
 func (f *FS) ReadAt(share, rel string, off int64, n int) ([]byte, os.FileInfo, error) {
-	full, err := f.LocalPath(share, rel)
+	full, err := f.localPathFollow(share, rel)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -126,7 +268,7 @@ func (f *FS) ReadAt(share, rel string, off int64, n int) ([]byte, os.FileInfo, e
 // Stat returns a path's metadata without reading it, so a caller can tell a
 // directory from a file before deciding what to do.
 func (f *FS) Stat(share, rel string) (os.FileInfo, error) {
-	full, err := f.LocalPath(share, rel)
+	full, err := f.localPathFollow(share, rel)
 	if err != nil {
 		return nil, err
 	}
@@ -135,6 +277,34 @@ func (f *FS) Stat(share, rel string) (os.FileInfo, error) {
 
 // tempSuffix marks the file a write goes through before it reaches its name.
 const tempSuffix = ".peerfold.tmp"
+
+// openTempFile creates the temporary file an atomic write goes through, in the
+// target's own directory so the final rename stays within one filesystem.
+//
+// The name carries a random component and is opened with O_EXCL, both of which
+// are load-bearing. A predictable name is a target: the directory may be
+// writable by another local process, which can pre-create a symlink there and
+// have the write follow it to a file outside the share. O_EXCL refuses an
+// existing name outright, symlink or not. The randomness also keeps two
+// concurrent writes to the same target from sharing one temporary file and
+// publishing each other's half-written bytes.
+func openTempFile(dir, base string) (*os.File, string, error) {
+	for attempt := 0; attempt < 10; attempt++ {
+		var b [8]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			return nil, "", fmt.Errorf("client: temporary file for %q: %w", base, err)
+		}
+		name := filepath.Join(dir, "."+base+"."+hex.EncodeToString(b[:])+tempSuffix)
+		fh, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err == nil {
+			return fh, name, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, "", err
+		}
+	}
+	return nil, "", fmt.Errorf("client: temporary file for %q: no unique name after 10 attempts", base)
+}
 
 // WriteAll replaces the file at rel with everything r produces, and returns how
 // many bytes were written.
@@ -193,9 +363,7 @@ func (f *FS) replaceAtomically(share, rel string, sink func(io.Writer) error, ve
 	if err != nil {
 		return err
 	}
-	tmp := filepath.Join(filepath.Dir(full), "."+filepath.Base(full)+tempSuffix)
-
-	fh, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	fh, tmp, err := openTempFile(filepath.Dir(full), filepath.Base(full))
 	if err != nil {
 		return err
 	}

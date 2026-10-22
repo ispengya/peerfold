@@ -71,6 +71,39 @@ func SplitFirst(p string) (head, rest string) {
 	return p, ""
 }
 
+// ValidName reports whether name may name a client or a share.
+//
+// A name becomes a component of every path in its namespace: a client name is
+// the first component of the aggregated tree, and a share name is the first
+// component the client indexes. A separator or a dot segment in either would
+// make those paths mean something else, so the shape is checked once and shared
+// by every side of the protocol.
+func ValidName(name string) bool {
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+	return !strings.ContainsAny(name, `/\`)
+}
+
+// ValidRelPath reports whether p is a share-relative, slash-separated path:
+// non-empty, not absolute, and made only of ordinary components.
+//
+// It is the wire's path shape, not a filesystem path. The index, the client
+// that produced the path, and the server that accepts it all have to agree on
+// it, or a path that the index silently drops could still be broadcast to
+// mounts.
+func ValidRelPath(p string) bool {
+	if p == "" || strings.HasPrefix(p, "/") || strings.Contains(p, `\`) {
+		return false
+	}
+	for _, part := range strings.Split(p, "/") {
+		if part == "" || part == "." || part == ".." {
+			return false
+		}
+	}
+	return true
+}
+
 // IsUnder reports whether child is inside parent or equal to it. Both are
 // absolute paths.
 //

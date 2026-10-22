@@ -111,10 +111,9 @@ func (s Shares) Excluded(abs string) bool {
 // paths. It must be a single ordinary path component: no separators (which
 // would make it look like a nested path), and not "." or "..".
 func validName(name string) bool {
-	if name == "." || name == ".." {
-		return false
-	}
-	return !strings.ContainsAny(name, `/\`)
+	// One definition, shared with the server, which has to make the same
+	// decision about a name arriving on the wire.
+	return node.ValidName(name)
 }
 
 // DefaultBatch is the batch size used when a caller passes a non-positive one.

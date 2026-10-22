@@ -843,3 +843,55 @@ func TestAShareRelativeListingIsCachedUnderTheMountPath(t *testing.T) {
 		t.Errorf("the update refetched the directory: %d Lists, want %d", got, before)
 	}
 }
+
+// An event path is applied to a cached listing by its parent. path.Dir cleans
+// its argument, so a path carrying ".." would otherwise be attributed to a
+// directory it never named — one owner's event reaching another owner's cache.
+// The server refuses such paths, and the mount refuses them again on arrival.
+func TestEventsCannotPatchAListingThroughDotDot(t *testing.T) {
+	f := newFakeCaller()
+	f.addDir("/")
+	f.addDir("/victim")
+	f.addFile("/victim/real.txt", 5)
+	m := New(f, DefaultOptions())
+
+	if _, _, err := m.listDir("/victim"); err != nil {
+		t.Fatalf("listDir(/victim): %v", err)
+	}
+
+	m.applyEvent(Batch{Seq: 1, Nodes: []node.Node{{
+		Path: "evil/../victim/fake.txt", Kind: node.KindFile, Size: 99,
+	}}})
+
+	m.listingMu.Lock()
+	e, ok := m.listings["/victim"]
+	m.listingMu.Unlock()
+	if !ok {
+		t.Fatal("/victim is no longer cached; the malformed event must not have invalidated it")
+	}
+	if _, injected := e.byName["fake.txt"]; injected {
+		t.Fatal("an event for evil/../victim/fake.txt was attributed to /victim")
+	}
+	if len(e.children) != 1 || e.children[0].Path != "/victim/real.txt" {
+		t.Fatalf("cached children = %+v, want only /victim/real.txt", e.children)
+	}
+
+	// The filter is about shape, not about refusing events: a clean path from
+	// the same owner still patches its entry in place.
+	m.applyEvent(Batch{Seq: 2, Nodes: []node.Node{{
+		Path: "victim/real.txt", Kind: node.KindFile, Size: 7,
+	}}})
+	m.listingMu.Lock()
+	e = m.listings["/victim"]
+	m.listingMu.Unlock()
+	if got := e.byName["real.txt"].Size; got != 7 {
+		t.Fatalf("real.txt size = %d, want 7 after a clean event", got)
+	}
+
+	// A tombstone on the mount root would wipe the event table. No owner's
+	// change names it, so it is dropped too.
+	m.applyEvent(Batch{Seq: 3, Nodes: []node.Node{{Path: "", Kind: node.KindDeleted}}})
+	if _, ok := m.eventFor("/victim/real.txt"); !ok {
+		t.Fatal("a root tombstone wiped the event table; it must be ignored")
+	}
+}

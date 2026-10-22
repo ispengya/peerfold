@@ -456,6 +456,20 @@ func fusePath(p string) string {
 	return "/" + p
 }
 
+// cleanEventPath reports whether p is a well-formed absolute FUSE path for an
+// event: rooted, not the mount root itself, and already clean.
+//
+// The server rejects malformed paths before broadcasting, and this is the
+// consumer's half of that contract. It matters because path.Dir cleans its
+// argument: an event path carrying "../" or a doubled separator would otherwise
+// be attributed, after cleaning, to a parent it never named — which is how one
+// owner's event could land in another owner's cached directory. An event that
+// names the root is refused too: no owner's change is a change to the mount's
+// own root, and a tombstone there would wipe the event table.
+func cleanEventPath(p string) bool {
+	return p != "" && p != "/" && strings.HasPrefix(p, "/") && path.Clean(p) == p
+}
+
 // isRootChild reports whether p names a client at the mount root.
 //
 // With the leading slash now present, a plain Contains(p, "/") would be true for

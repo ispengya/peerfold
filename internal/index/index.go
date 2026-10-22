@@ -268,14 +268,7 @@ func (ix *Index) Len() int {
 // cannot poison the index. That also means the index cannot be relied on to
 // tell a caller its path was bad.
 func validPath(p string) bool {
-	if p == "" || strings.HasPrefix(p, "/") || strings.Contains(p, `\`) {
-		return false
-	}
-	parts := strings.Split(p, "/")
-	for _, part := range parts {
-		if part == "" || part == "." || part == ".." {
-			return false
-		}
-	}
-	return true
+	// The shape is defined by node.ValidRelPath so the index, the server's
+	// event/accepted-path checks, and the client's scanner cannot drift apart.
+	return node.ValidRelPath(p)
 }

@@ -141,3 +141,15 @@ func TestRegistryConcurrentRegister(t *testing.T) {
 		t.Fatalf("AggregateOwner() = (%q, %v), want (c00, true)", owner, ok)
 	}
 }
+
+func TestRegistryRejectsNamesThatAreNotOnePathComponent(t *testing.T) {
+	for _, name := range []string{".", "..", "a/b", `a\b`, "/abs", "a/../b"} {
+		var r server.Registry
+		if _, err := r.Register(name, false); !errors.Is(err, server.ErrInvalidName) {
+			t.Errorf("Register(%q) error = %v, want ErrInvalidName", name, err)
+		}
+		if live := r.Live(); len(live) != 0 {
+			t.Errorf("Register(%q) registered %v, want nothing", name, live)
+		}
+	}
+}

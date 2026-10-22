@@ -6,6 +6,8 @@ import (
 	"errors"
 	"sort"
 	"sync"
+
+	"github.com/ispengya/peerfold/internal/node"
 )
 
 // ErrDuplicateName reports that a client name is already connected. Names are
@@ -17,6 +19,11 @@ var ErrNoSuchClient = errors.New("server: no such client")
 
 // ErrEmptyName reports a registration attempt with no name.
 var ErrEmptyName = errors.New("server: client name must not be empty")
+
+// ErrInvalidName reports a name that is not a single path component. A name is
+// the first component of every indexed path it owns, so a separator or a dot
+// segment in it would make those paths name someone else's subtree.
+var ErrInvalidName = errors.New("server: client name must be one path component")
 
 // ErrClientOffline reports that a request named a client that is not connected,
 // so there is no one to answer it. It is distinct from a failure the owner did
@@ -48,6 +55,9 @@ type Registry struct {
 func (r *Registry) Register(name string, aggregate bool) (bool, error) {
 	if name == "" {
 		return false, ErrEmptyName
+	}
+	if !node.ValidName(name) {
+		return false, ErrInvalidName
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()

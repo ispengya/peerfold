@@ -209,11 +209,21 @@ func (m *Mount) applyEvent(b Batch) bool {
 	// cached listing; a batch from a build can carry hundreds of nodes.
 	var changed []node.Node
 	var removedSubtrees []string
+	invalidPaths := 0
 	for _, raw := range b.Nodes {
 		n := raw
 		// The wire speaks index paths; this package speaks FUSE paths. See
 		// fusePath.
 		n.Path = fusePath(n.Path)
+
+		// An event that does not name a clean path inside the tree is dropped
+		// rather than cleaned. Cleaning would attribute it to a parent it did
+		// not name, which is exactly how a path from one owner's namespace
+		// could reach another's cached listing. See cleanEventPath.
+		if !cleanEventPath(n.Path) {
+			invalidPaths++
+			continue
+		}
 
 		// A create for a path under a directory this mount already knows is
 		// gone is stale. It can happen when a batch boundary or an out-of-order
@@ -254,6 +264,10 @@ func (m *Mount) applyEvent(b Batch) bool {
 	}
 	hook := m.invalidatePath
 	m.mu.Unlock()
+
+	if invalidPaths > 0 {
+		log.Printf("mount: dropped %d event(s) naming a path outside the tree", invalidPaths)
+	}
 
 	m.applyListingEvents(changed, removedSubtrees)
 	for _, n := range changed {

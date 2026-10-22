@@ -75,3 +75,37 @@ func TestKindValues(t *testing.T) {
 		t.Errorf("KindDeleted = %d, want 255", node.KindDeleted)
 	}
 }
+
+func TestValidName(t *testing.T) {
+	valid := []string{"win", "hanzhipeng", "my-laptop", "文档", "a.b", "..foo"}
+	for _, name := range valid {
+		if !node.ValidName(name) {
+			t.Errorf("ValidName(%q) = false, want true", name)
+		}
+	}
+	// Each of these would stop being a single path component the moment it was
+	// concatenated with "/" or joined onto a directory.
+	invalid := []string{"", ".", "..", "a/b", "../x", "a\\b", "/abs"}
+	for _, name := range invalid {
+		if node.ValidName(name) {
+			t.Errorf("ValidName(%q) = true, want false", name)
+		}
+	}
+}
+
+func TestValidRelPath(t *testing.T) {
+	valid := []string{"Documents", "Documents/a.txt", "a/b/c", "..foo/bar"}
+	for _, p := range valid {
+		if !node.ValidRelPath(p) {
+			t.Errorf("ValidRelPath(%q) = false, want true", p)
+		}
+	}
+	invalid := []string{
+		"", "/abs", "a//b", "a/", "/", "a/.", "a/..", "../a", "a\\b",
+	}
+	for _, p := range invalid {
+		if node.ValidRelPath(p) {
+			t.Errorf("ValidRelPath(%q) = true, want false", p)
+		}
+	}
+}

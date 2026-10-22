@@ -282,6 +282,16 @@ func (s *Server) handleConn(conn net.Conn) {
 		return
 	}
 
+	// A name is a path component in every namespace it touches: the top-level
+	// listing, the prefix the server puts on this client's events, and the
+	// mount's own tree. A separator or a dot segment there would let one peer
+	// address another peer's subtree, so the shape is refused before the name
+	// is registered or used to label anything.
+	if hb.Name != "" && !node.ValidName(hb.Name) {
+		_ = c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindHello, Err: fmt.Sprintf("bad hello: invalid name %q", hb.Name)})
+		return
+	}
+
 	// A viewer only asks questions; it supplies nothing, so it is not a
 	// registry entry and owns no index entries.
 	//
@@ -643,6 +653,29 @@ func (s *Server) applyEvent(name string, env proto.Envelope) {
 	nodes := fromNodeJSON(b.Nodes)
 	if len(nodes) == 0 {
 		return
+	}
+
+	// The index drops a malformed path on its own, but the broadcast below
+	// carries the same nodes to every watcher. Dropping the path from the index
+	// while still forwarding it would leave the two views disagreeing, and a
+	// path with a dot segment or a doubled separator reaches a mount's cache
+	// after path.Dir cleans it — which is how one client's event could name
+	// another client's directory. An event that cannot be applied is therefore
+	// not forwarded at all.
+	//
+	// The empty path is the share root, which withClient turns into the client's
+	// own name; it is the one path that is not share-relative.
+	for _, n := range nodes {
+		if n.Path != "" && !node.ValidRelPath(n.Path) {
+			logging.Errorf("server: event from %q dropped: invalid path %q", name, n.Path)
+			return
+		}
+		switch n.Kind {
+		case node.KindFile, node.KindDir, node.KindSymlink, node.KindDeleted:
+		default:
+			logging.Errorf("server: event from %q dropped: invalid kind %d for %q", name, n.Kind, n.Path)
+			return
+		}
 	}
 
 	// One line per batch: a coalesced build batch can name hundreds of paths,
@@ -1472,10 +1505,23 @@ func (s *Server) applyBatch(name string, env proto.Envelope) error {
 		return fmt.Errorf("bad tree batch: %w", err)
 	}
 	nodes := make([]node.Node, 0, len(b.Nodes))
-	for _, n := range b.Nodes {
+	for i, n := range b.Nodes {
+		// A batch is refused whole rather than filtered: its paths were produced
+		// by one scan, so one malformed path means the upload is not describing
+		// the tree it claims to, and partially applying it would leave the index
+		// with a shape no scan ever produced.
+		if !node.ValidRelPath(n.Path) {
+			return fmt.Errorf("bad tree batch: node %d has invalid path %q", i, n.Path)
+		}
+		kind := node.Kind(n.Kind)
+		switch kind {
+		case node.KindFile, node.KindDir, node.KindSymlink, node.KindDeleted:
+		default:
+			return fmt.Errorf("bad tree batch: node %d has invalid kind %d", i, n.Kind)
+		}
 		nodes = append(nodes, node.Node{
 			Path:  n.Path,
-			Kind:  node.Kind(n.Kind),
+			Kind:  kind,
 			Size:  n.Size,
 			Mode:  n.Mode,
 			Mtime: n.Mtime,
