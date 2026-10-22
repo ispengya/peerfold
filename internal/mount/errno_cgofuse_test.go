@@ -8,18 +8,18 @@ import (
 
 // TestErrnosMatchCgofuse pins this package's errno table against the library's.
 //
-// The core keeps its own copies of these numbers so that it builds without a FUSE
-// library, and that duplication is a real hazard rather than a tidiness question:
-// every one of these values is handed back to the kernel through cgofuse, so a
-// number that agrees with uname(1) but not with the library is simply the wrong
-// error. ENOSYS was 38 here for three tasks and is 40 in cgofuse -- 38 would have
-// told a Linux kernel ENAMETOOLONG.
+// The core keeps its own copies of these numbers so that it can name the error
+// without importing the library everywhere, and that duplication is a real
+// hazard rather than a tidiness question: every one of these values is handed
+// back to the kernel through cgofuse, so a number that agrees with uname(1) but
+// not with the library is simply the wrong error.
 //
-// The comparison is against cgofuse's own constants rather than against measured
-// literals, so it holds on both of cgofuse's builds: the cgo one redefines errno
-// in C and the pure-Go Windows one declares them in Go, and they agree with each
-// other. A cgofuse upgrade that moved a number would fail here instead of
-// silently changing what the mount reports.
+// The comparison is against cgofuse's own constants rather than against
+// measured literals. The cgo build takes several of them from the C library and
+// the pure-Go Windows build declares its own table, so the two do not agree
+// with each other; the core's constants are selected per platform to match
+// whichever build is in use. A cgofuse upgrade that moved a number would fail
+// here instead of silently changing what the mount reports.
 func TestErrnosMatchCgofuse(t *testing.T) {
 	cases := []struct {
 		name string

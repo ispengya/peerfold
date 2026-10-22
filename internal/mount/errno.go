@@ -8,42 +8,32 @@ import (
 	"github.com/ispengya/peerfold/internal/viewer"
 )
 
-// The errno values cgofuse uses on both platforms. They are declared here
-// rather than taken from syscall, because syscall's values are
-// platform-specific and the core must build everywhere.
+// The errno values cgofuse hands back to the kernel. Most of them are the same
+// on every platform; the ones that are not live in errno_linux.go and
+// errno_windows.go.
 //
-// "Both platforms" is not a figure of speech: cgofuse ships its own table, and
-// it is the same one on Windows and on Linux. The cgo build redefines errno in
-// C to these numbers and the pure-Go Windows build declares them in Go, so
-// ENOSYS is 40 on both, not the 38 an uname(1) would suggest. The values were
-// read out of the library (fsop_cgo.go and fsop_nocgo_windows.go) and are pinned
-// there by TestErrnosMatchCgofuse, because every one of these numbers is handed
-// back to the kernel through cgofuse and a wrong one is a wrong error.
+// The split is not cosmetic. cgofuse's cgo build takes ENOSYS, ENOTEMPTY,
+// EOPNOTSUPP, ELOOP and ENOATTR from the C library, so on Linux they are 38,
+// 39, 95, 40 and 61. Its pure-Go Windows build declares its own table, where
+// the same names are 40, 41, 130, 114 and 120. Returning the Windows numbers on
+// Linux tells the kernel ELOOP when the mount meant ENOSYS, and EALREADY when
+// it meant ELOOP. TestErrnosMatchCgofuse compares the pair the current build
+// actually uses against the library, so the mistake cannot come back silently.
 //
 // EPERM=1 ENOENT=2 EIO=5 EBADF=9 EACCES=13 EEXIST=17 EXDEV=18 ENOTDIR=20
-// EISDIR=21 EINVAL=22 ENOSPC=28 ENOSYS=40 ENOTEMPTY=41 ENOATTR=120 ELOOP=114.
+// EISDIR=21 EINVAL=22 ENOSPC=28.
 const (
-	EPERM      = 1
-	ENOENT     = 2
-	EIO        = 5
-	EBADF      = 9
-	EACCES     = 13
-	EEXIST     = 17
-	EXDEV      = 18
-	ENOTDIR    = 20
-	EISDIR     = 21
-	EINVAL     = 22
-	ENOSPC     = 28
-	ENOSYS     = 40
-	ENOTEMPTY  = 41
-	EOPNOTSUPP = 130
-	ELOOP      = 114
-	// ENOATTR is what a getxattr for a missing attribute must return. It is
-	// cgofuse's name for ENODATA on every platform it builds for, and 120 is its
-	// value on both -- the same 120 that a Linux kernel would call something else
-	// entirely, which is why this number is copied from the library rather than
-	// from experience.
-	ENOATTR = 120
+	EPERM   = 1
+	ENOENT  = 2
+	EIO     = 5
+	EBADF   = 9
+	EACCES  = 13
+	EEXIST  = 17
+	EXDEV   = 18
+	ENOTDIR = 20
+	EISDIR  = 21
+	EINVAL  = 22
+	ENOSPC  = 28
 )
 
 // Error tokens come from internal/errtoken, which both this package and the

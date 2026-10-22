@@ -48,7 +48,7 @@ func prepareMountPoint(path string) (cleanup func(), err error) {
 			": " + err.Error())
 	}
 	if len(entries) != 0 {
-		return nil, errStr("mount: " + path + " is not empty; " +
+		return nil, errStr("mount: " + path + " exists and is not empty; " +
 			"mounting here would hide its contents without warning")
 	}
 	return nil, nil

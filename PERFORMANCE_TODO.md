@@ -122,11 +122,16 @@
 
 ## 已知的既有测试失败
 
-以下问题在本轮之前就存在，与本轮改动无关：
+无。此前存在的三项已经修复：
 
-- `internal/mount`：`TestErrnosMatchCgofuse`（平台 errno 差异）
-- `internal/mount`：`TestPrepareMountPointRefusesANonEmptyDirectory`（错误文案断言）
-- `internal/viewer`：`TestEmitAndCloseCannotMeetOnAClosedChannel` 在 `-race` 下报告测试自身对 `v.events` 的未同步读取
+- `TestErrnosMatchCgofuse`：errno 常量按平台拆分，Linux 使用 cgo 的 38/39/95/40/61，
+  Windows 使用纯 Go 表的 40/41/130/114/120
+- `TestPrepareMountPointRefusesANonEmptyDirectory`：Linux 与 Windows 的拒绝文案统一为
+  “exists and is not empty”
+- `TestEmitAndCloseCannotMeetOnAClosedChannel`：测试改为持有自己的事件通道引用，
+  不再与 `Close` 写 `v.events` 竞争
+
+当前 `go test ./...` 与关键包的 `-race` 全部通过。
 
 Windows 交叉编译验证命令：
 
