@@ -51,6 +51,10 @@
   预取失败不记日志。深树 walk 的下一层因此在回调消费当前层时已在路上
 - 回归测试：`TestFlushPatchesTheCachedParentListing`、
   `TestCreateKeepsTheCachedParentListing`、`TestReaddirWarmsChildListings`
+- 修复（上述改动暴露）：目录 listing 的子项路径原本保留 server 的 share-relative
+  形式（`share/docs/a.txt`），而事件是聚合形式（`win/share/docs/a.txt`）；增量 patch
+  按全路径匹配失败，于是把同一文件追加成第二项。现在 `listDir` 用“被列目录 + 条目名”
+  重建 FUSE 全路径，`TestAShareRelativeListingIsCachedUnderTheMountPath` 固定这个行为
 
 **关于“批量元数据写”**：FUSE 的 mkdir/create/close 是逐个同步调用，构建工具会等待
 每个 close 的结果，因此真正的跨文件 batch-put 只能靠 write-behind（提前返回）或

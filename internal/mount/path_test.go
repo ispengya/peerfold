@@ -777,3 +777,69 @@ func TestReaddirWarmsChildListings(t *testing.T) {
 		t.Errorf("the prefetched directory was fetched again: %d Lists, want %d", got, before)
 	}
 }
+
+// shareRelativeCaller mimics the server's listing spelling: a listing inside a
+// client comes back share-relative ("share/docs/a.txt"), while the updates that
+// patch the cache are aggregated ("win/share/docs/a.txt").
+type shareRelativeCaller struct{ *fakeCaller }
+
+func (c shareRelativeCaller) List(path string) ([]node.Node, error) {
+	children, err := c.fakeCaller.List(path)
+	if err != nil {
+		return nil, err
+	}
+	for i := range children {
+		children[i].Path = strings.TrimPrefix(children[i].Path, "/win/")
+	}
+	return children, nil
+}
+
+// TestAShareRelativeListingIsCachedUnderTheMountPath pins the path spelling of
+// the listing cache. Cached children used to keep the server's share-relative
+// spelling, while the events that patch the cache carry the aggregated form.
+// applyListingEvents matches by full path, so the event could never find the
+// entry: it appended a second one and the directory showed the file twice even
+// though the owner had one. The base-name index does not save the listing from
+// this, because Readdir emits children, not the name map.
+func TestAShareRelativeListingIsCachedUnderTheMountPath(t *testing.T) {
+	f := newFakeCaller()
+	f.addDir("/")
+	f.addFile("/win/share/docs/a.txt", 1)
+	f.addFile("/win/share/docs/b.txt", 1)
+	m := New(shareRelativeCaller{f}, DefaultOptions())
+
+	children, _, err := m.listDir("/win/share/docs")
+	if err != nil {
+		t.Fatalf("listDir: %v", err)
+	}
+	want := map[string]bool{"/win/share/docs/a.txt": true, "/win/share/docs/b.txt": true}
+	for _, c := range children {
+		if !want[c.Path] {
+			t.Fatalf("listDir child path = %q, want one of %v", c.Path, want)
+		}
+		delete(want, c.Path)
+	}
+	if len(want) != 0 {
+		t.Fatalf("listDir is missing %v", want)
+	}
+
+	before := f.countCalls("List /win/share/docs")
+	m.applyEvent(Batch{Nodes: []node.Node{{Path: "win/share/docs/a.txt", Kind: node.KindFile, Size: 9}}})
+	if n, code := m.lookup("/win/share/docs/a.txt"); code != 0 || n.Size != 9 {
+		t.Fatalf("lookup after the update = %+v, %d; want size 9", n, code)
+	}
+
+	m.listingMu.Lock()
+	e := m.listings["/win/share/docs"]
+	paths := make([]string, len(e.children))
+	for i, c := range e.children {
+		paths[i] = c.Path
+	}
+	m.listingMu.Unlock()
+	if len(paths) != 2 {
+		t.Fatalf("cached children after one update = %v, want 2 entries", paths)
+	}
+	if got := f.countCalls("List /win/share/docs"); got != before {
+		t.Errorf("the update refetched the directory: %d Lists, want %d", got, before)
+	}
+}

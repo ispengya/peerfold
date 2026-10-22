@@ -107,15 +107,24 @@ func (m *Mount) listDirLogged(dir string, logAccess bool) (children []node.Node,
 	fetched, err := m.call().List(dir)
 	took := time.Since(started)
 	if err == nil {
-		// The wire's paths are index paths ("win/Documents"), while everything in
-		// this package keys on FUSE paths ("/win/Documents"). The adapter could do
-		// this, but doing it here makes every Caller obey the same convention: the
-		// event table, pending table and handed-out table are all keyed by the
-		// result, so a relative path in any one of them is a path that never matches.
+		// Rebuild each child's path from the directory being listed and the
+		// entry's own name. The wire's spelling is not the mount's: a listing
+		// inside a client comes back share-relative ("share/docs/a.txt"), while
+		// the index updates that patch this cache are aggregated
+		// ("win/share/docs/a.txt"), and everything here keys on FUSE paths
+		// ("/win/share/docs/a.txt"). Taking the base name and joining it to the
+		// directory we asked about makes all three agree, no matter how the
+		// caller spells its paths.
+		//
+		// This is not cosmetic. applyListingEvents matches a cached child by
+		// full path; a cached "/share/docs/a.txt" never matched an event for
+		// "/win/share/docs/a.txt", so the event was appended as a second entry
+		// and the directory showed the file twice.
 		byName := make(map[string]node.Node, len(fetched))
 		for i := range fetched {
-			fetched[i].Path = fusePath(fetched[i].Path)
-			byName[path.Base(fetched[i].Path)] = fetched[i]
+			name := path.Base(fusePath(fetched[i].Path))
+			fetched[i].Path = path.Join(dir, name)
+			byName[name] = fetched[i]
 		}
 		fetchedCopy := append([]node.Node(nil), fetched...)
 		call.children = fetchedCopy
@@ -263,6 +272,10 @@ func (m *Mount) applyListingEvents(changed []node.Node, subtrees []string) {
 }
 
 // upsertListingChildLocked replaces or appends one entry in a cached listing.
+//
+// The base-name index is updated unconditionally, while the slice is matched by
+// full path. Both are safe only because listDir stores children under the
+// mount's own path spelling; see the rebuild there.
 func (m *Mount) upsertListingChildLocked(e *dirCacheEntry, base string, n node.Node) {
 	e.byName[base] = n
 	for i := range e.children {
