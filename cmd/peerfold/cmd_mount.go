@@ -254,10 +254,10 @@ func mountOptionsFrom(args []string) (mount.Options, string, string, string, err
 
 	var (
 		server    = fs.String("server", "", "server address to dial (host:port)")
-		mountPath = fs.String("mount", "", "where to mount (default: the per-user mount point)")
+		mountPath = fs.String("mount", "", "where to mount (default: the platform default)")
 		buffer    = fs.String("buffer", "", "read cache per open file (default: 64MiB)")
 		bufferTot = fs.String("buffer-total", "", "read cache across all open files (default: 256MiB)")
-		chunk     = fs.String("chunk", "", "bytes per read request (default: 512KiB, max 1MiB)")
+		chunk     = fs.String("chunk", "", "read unit base (default: 512KiB, adapted 256KiB-1MiB)")
 		cfgPath   = fs.String("config", "", "config file (default: the per-user config path)")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -434,15 +434,16 @@ Mounts the federated tree as a directory, so files can be opened, edited and
 saved with ordinary programs. Reading is what the mount is for by default;
 writes go back to the client that owns the file.
 
-The mount point defaults to a directory under your home. With no --server the
+The mount point defaults to ~/peerfold on Linux and D:\peerfold on Windows,
+falling back to the user profile when D: is absent. With no --server the
 address in the config file is used, and --mount, --buffer and --buffer-total all
 fall back to the config before the built-in default.
 
 flags:
   --server ADDR         server to dial (config: server)
-  --mount PATH          where to mount (config: mount_point; default: ~/peerfold)
+  --mount PATH          where to mount (config: mount_point; default: ~/peerfold, D:\peerfold on Windows)
   --buffer SIZE         read cache per open file (config: buffer_limit; default: 64MiB)
   --buffer-total SIZE   read cache across all open files (config: buffer_total; default: 256MiB)
-  --chunk SIZE          bytes per read request (config: chunk_size; default: 512KiB, max 1MiB)
+  --chunk SIZE          read unit base (config: chunk_size; default: 512KiB, adapted 256KiB-1MiB)
   --config PATH         config file (default: the per-user config path)
 `

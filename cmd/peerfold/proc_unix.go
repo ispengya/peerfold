@@ -112,10 +112,15 @@ func quoteDesktopArg(s string) string {
 }
 
 // defaultShareDir returns the interactive setup's suggested share directory.
+//
+// Shares live beside the mount point rather than inside it: the mount point
+// has to be empty, so a share under ~/peerfold would make mounting there
+// impossible. The home directory is the reliable writable location; /tmp is
+// only for a bare environment with no home.
 func defaultShareDir(clientName string) string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
-		return filepath.Join("/tmp", "peerfold-demo", clientName)
+		return filepath.Join("/tmp", "peerfold-shares", clientName)
 	}
-	return filepath.Join(home, "peerfold-demo", clientName)
+	return filepath.Join(home, "peerfold-shares", clientName)
 }

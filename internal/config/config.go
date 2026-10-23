@@ -74,7 +74,7 @@ func Default() Config {
 		// All interfaces, not loopback: a server that only answers on
 		// 127.0.0.1 is unreachable from the machines whose trees it is meant
 		// to aggregate. Deployments that must stay local pass --listen
-		// 127.0.0.1:7000 (and should, because the protocol has no auth).
+		// 127.0.0.1:7000; TLS and token authentication stay on either way.
 		Listen: "0.0.0.0:7000",
 		Shares: map[string]string{},
 

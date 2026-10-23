@@ -101,6 +101,20 @@ func deleteRegistry(path, name string) error {
 }
 
 // defaultShareDir returns the interactive setup's suggested share directory.
+//
+// D: is the preferred data drive; a machine with only C: falls back to the
+// user profile rather than refusing to suggest anything. Shares are kept in a
+// subdirectory instead of the drive root so the default never indexes an
+// entire disk, and beside the mount point rather than inside it because the
+// mount point must not exist when WinFsp mounts.
 func defaultShareDir(clientName string) string {
-	return filepath.Join(`C:\peerfold-demo`, clientName)
+	root := `D:\`
+	if info, err := os.Stat(root); err != nil || !info.IsDir() {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			root = home
+		} else {
+			root = `C:\`
+		}
+	}
+	return filepath.Join(root, "peerfold-shares", clientName)
 }

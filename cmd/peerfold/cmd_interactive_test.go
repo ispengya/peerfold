@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -115,10 +116,15 @@ func TestInteractiveClientForegroundStartsWithoutDaemonFlag(t *testing.T) {
 
 // TestInteractiveClientCreatesDefaultShareDir pins that a fresh interactive
 // setup makes the directory it is about to share. The default lives under
-// peerfold-demo and does not exist yet, and the client refuses to start on a
-// missing share — so a user who accepted the default used to get a saved
+// peerfold-shares and does not exist yet, and the client refuses to start on
+// a missing share — so a user who accepted the default used to get a saved
 // config and an immediate lstat failure.
 func TestInteractiveClientCreatesDefaultShareDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// The Windows default prefers D:, so accepting it here would create a
+		// real directory on an arbitrary drive instead of the temp HOME.
+		t.Skip("the Windows default may live on D: and must not be created by a test")
+	}
 	home := t.TempDir()
 	t.Setenv("USERPROFILE", home) // windows
 	t.Setenv("HOME", home)        // unix
@@ -129,7 +135,7 @@ func TestInteractiveClientCreatesDefaultShareDir(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := interactiveClient(input, &out, &errOut)
 
-	shareDir := filepath.Join(home, "peerfold-demo", "alice")
+	shareDir := filepath.Join(home, "peerfold-shares", "alice")
 	if _, err := os.Stat(shareDir); err != nil {
 		t.Fatalf("default share directory was not created (code=%d, out=%q err=%q): %v",
 			code, out.String(), errOut.String(), err)

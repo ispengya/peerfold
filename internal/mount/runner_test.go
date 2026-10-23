@@ -9,9 +9,11 @@ import (
 	"time"
 )
 
-// TestDefaultMountPointIsUnderHome pins the one thing every platform agrees on:
-// the mount point is a directory called peerfold under the user's home.
-func TestDefaultMountPointIsUnderHome(t *testing.T) {
+// TestDefaultMountPointIsAbsoluteAndNamedPeerfold pins the one thing every
+// platform agrees on: the default is an absolute directory called peerfold.
+// Windows prefers D:\peerfold when that drive exists and falls back to the
+// user profile otherwise; Linux keeps it under the user's home.
+func TestDefaultMountPointIsAbsoluteAndNamedPeerfold(t *testing.T) {
 	p, err := DefaultMountPoint()
 	if err != nil {
 		t.Fatalf("DefaultMountPoint: %v", err)

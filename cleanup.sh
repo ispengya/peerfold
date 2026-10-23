@@ -140,6 +140,8 @@ fi
 
 section 4 "Remove demo directories"
 
+# Only the legacy demo directory. The current default share root is
+# peerfold-shares, which holds the user's files and is never removed here.
 for demo in "${HOME_DIR}/peerfold-demo" "/tmp/peerfold-demo"; do
   if [ -d "$demo" ]; then
     rm -rf "$demo"

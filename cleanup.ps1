@@ -111,6 +111,9 @@ if ($peerfoldKeys) {
 
 Section 4 $total "Remove demo directories"
 
+# Only the legacy demo directory. The current default share root is
+# peerfold-shares (D:\peerfold-shares when D: exists), which holds the user's
+# files and is never removed here.
 $demo = "C:\peerfold-demo"
 if (Test-Path $demo) {
     Remove-Item $demo -Force -Recurse -ErrorAction SilentlyContinue

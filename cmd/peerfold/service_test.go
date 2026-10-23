@@ -43,16 +43,20 @@ func TestDefaultClientNameFallsBackToHostname(t *testing.T) {
 	}
 }
 
-// TestDefaultShareDirIsAPerUserPath pins that the interactive suggestion is a
-// real per-user directory and not a hard-coded foreign path.
-func TestDefaultShareDirIsAPerUserPath(t *testing.T) {
+// TestDefaultShareDirNamesTheClient pins that the interactive suggestion is a
+// stable, client-scoped directory and not a fixed path shared by every
+// machine. Windows prefers D:, with the user profile as its fallback.
+func TestDefaultShareDirNamesTheClient(t *testing.T) {
 	got := defaultShareDir("alice")
 	if !strings.Contains(got, "alice") {
 		t.Fatalf("defaultShareDir(alice) = %q, want it to contain the client name", got)
 	}
 	if runtime.GOOS == "windows" {
-		if !strings.Contains(strings.ToLower(got), "peerfold-demo") {
-			t.Fatalf("defaultShareDir(alice) = %q, want peerfold-demo", got)
+		if !strings.Contains(strings.ToLower(got), "peerfold-shares") {
+			t.Fatalf("defaultShareDir(alice) = %q, want peerfold-shares", got)
+		}
+		if !strings.HasPrefix(strings.ToUpper(got), `D:\`) {
+			t.Logf("D: is unavailable; defaultShareDir(alice) = %q uses the fallback", got)
 		}
 		return
 	}
@@ -60,7 +64,7 @@ func TestDefaultShareDirIsAPerUserPath(t *testing.T) {
 	if err != nil {
 		t.Skipf("no home: %v", err)
 	}
-	want := filepath.Join(home, "peerfold-demo", "alice")
+	want := filepath.Join(home, "peerfold-shares", "alice")
 	if got != want {
 		t.Fatalf("defaultShareDir(alice) = %q, want %q", got, want)
 	}

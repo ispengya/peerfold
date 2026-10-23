@@ -26,8 +26,17 @@ func platformMountArgs() []string {
 	return []string{"-o", "FileSecurity=D:P(A;;FA;;;WD)"}
 }
 
-// DefaultMountPoint is %USERPROFILE%\peerfold.
+// DefaultMountPoint is D:\peerfold when D: exists, else
+// %USERPROFILE%\peerfold.
+//
+// The data drive is preferred because the mount is meant to replace an
+// everyday working directory, and putting that on the system drive is the
+// choice a machine with a second disk is trying to avoid. The fallback keeps
+// a single-drive machine usable.
 func DefaultMountPoint() (string, error) {
+	if info, err := os.Stat(`D:\`); err == nil && info.IsDir() {
+		return `D:\peerfold`, nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err

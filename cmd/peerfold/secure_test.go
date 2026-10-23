@@ -25,9 +25,12 @@ func TestInteractiveClientSavesLoginCode(t *testing.T) {
 		Fingerprint: strings.Repeat("a", 64),
 		Secret:      "test-secret",
 	}
-	// Code, client name, server address, default share name, default share
-	// directory, foreground mode.
-	input := strings.NewReader(code.String() + "\nalice\n127.0.0.1:1\n\n\n0\n")
+	// Code, client name, server address, default share name, an explicit
+	// share directory, foreground mode. The directory is explicit because the
+	// platform default is allowed to live outside HOME (D: on Windows), and a
+	// test must not create it there.
+	shareDir := filepath.Join(home, "shares", "alice")
+	input := strings.NewReader(code.String() + "\nalice\n127.0.0.1:1\n\n" + shareDir + "\n0\n")
 	var out, errOut bytes.Buffer
 	exit := interactiveClient(input, &out, &errOut)
 	if exit == 0 {
@@ -51,8 +54,8 @@ func TestInteractiveClientSavesLoginCode(t *testing.T) {
 	if cfg.Server != "127.0.0.1:1" {
 		t.Fatalf("Server = %q, want 127.0.0.1:1", cfg.Server)
 	}
-	if _, err := os.Stat(filepath.Join(home, "peerfold-demo", "alice")); err != nil {
-		t.Fatalf("default share directory was not created: %v", err)
+	if _, err := os.Stat(shareDir); err != nil {
+		t.Fatalf("share directory was not created: %v", err)
 	}
 }
 
