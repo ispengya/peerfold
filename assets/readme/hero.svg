@@ -27,7 +27,7 @@
     <line x1="64" y1="336" x2="200" y2="336" stroke="#26313C" stroke-width="1.5"/>
 
     <text x="64" y="374" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', monospace"
-          font-size="18" letter-spacing="1.4" fill="#8B98A5">LINUX · WINDOWS · TCP · MIT</text>
+          font-size="18" letter-spacing="1.4" fill="#8B98A5">LINUX · WINDOWS · TLS 1.3 · MIT</text>
   </g>
 
   <!-- System map: clients and mount all dial the server; the server holds the index -->
