@@ -67,9 +67,13 @@ type Viewer struct {
 	authName string
 	// dialConfig carries the TLS pin and token to NewReadViewer.
 	dialConfig DialConfig
-	conn       net.Conn
-	pc         *proto.Conn
-	next       uint64
+	// issuedToken is set when this connection enrolled. The handshake promotes
+	// it into dialConfig so pool connections use the token, not the enrollment
+	// secret.
+	issuedToken string
+	conn        net.Conn
+	pc          *proto.Conn
+	next        uint64
 
 	// mu guards the fields below. It is taken around the fields and never across a
 	// read, because a reader that held it while waiting would stop the very
@@ -278,9 +282,17 @@ func (v *Viewer) handshake(timeout time.Duration, name, mountPoint string, watch
 		if ok.Compress {
 			v.pc.SetCompression(true)
 		}
+		if ok.IssuedToken != "" {
+			v.issuedToken = ok.IssuedToken
+			v.dialConfig.Token = ok.IssuedToken
+		}
 	}
 	return nil
 }
+
+// IssuedToken is the per-name token the server issued during enrollment, or ""
+// when this connection authenticated with a token it already had.
+func (v *Viewer) IssuedToken() string { return v.issuedToken }
 
 // List returns the direct children of path, ascending.
 //

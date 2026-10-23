@@ -30,7 +30,13 @@ func Open(relPath string) (*os.File, error) {
 	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 		return nil, err
 	}
-	return os.OpenFile(full, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(full, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	// An existing file may have been created 0644 by an earlier version.
+	_ = f.Chmod(0o600)
+	return f, nil
 }
 
 // Infof records a normal operation: a request served, a change applied, a peer

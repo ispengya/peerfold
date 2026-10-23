@@ -14,7 +14,7 @@ func main() {
 // them. dispatch uses a switch rather than ranging over this, so the two are
 // separate lists; dispatcherKnows reads this one and the usage text, which is
 // what lets a test catch a command that is documented and not implemented.
-var commands = []string{"server", "client", "mount", "invite", "status", "stop", "restart", "ls", "cat", "put", "mkdir", "rm", "mv"}
+var commands = []string{"server", "client", "mount", "status", "stop", "restart", "ls", "cat", "put", "mkdir", "rm", "mv"}
 
 // run dispatches one command line and returns the process exit code, so
 // tests can drive the CLI without spawning a process.
@@ -69,8 +69,6 @@ func dispatch(cmd string, rest []string, stdin io.Reader, stdout, stderr io.Writ
 			return interactiveMount(stdin, stdout, stderr)
 		}
 		return cmdMount(rest, stdout, stderr)
-	case "invite":
-		return cmdInvite(rest, stdout, stderr)
 	case "status":
 		return cmdStatus(rest, stdout, stderr)
 	case "stop":
@@ -107,7 +105,6 @@ usage: peerfold <command> [args]
 service:
   server      start the aggregation server (interactive without flags)
   client      start a client (interactive without flags)
-  invite      create a credential/invite for another machine
   status      show local components and mounts/clients on the server
   stop        stop a running component (server|client|mount|all)
   restart     restart a component (server|client)
@@ -128,9 +125,9 @@ other:
   --version   show version
 
 examples:
-  peerfold server                     interactive setup
-  peerfold invite --name laptop --role client
-  peerfold client                     interactive setup (paste the invite)
+  peerfold server                     interactive setup; prints a login code
+  peerfold client                     paste the login code once
+  peerfold mount                      paste the login code once
   peerfold server --listen 127.0.0.1:7000
   peerfold client --server 127.0.0.1:7000 --name alice --share docs=C:\data
   peerfold status

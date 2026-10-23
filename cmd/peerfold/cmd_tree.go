@@ -45,7 +45,7 @@ func connect(cmd, cfgPath string, stderr io.Writer) (*viewer.Viewer, int, bool) 
 	var cfg config.Config
 	if cfgPath == "" {
 		// Look at every local config, not only the server's. On a machine that
-		// only mounts, the mount config (and its invite) is the one that can
+		// only mounts, the mount config (and its enrolled token) is the one that can
 		// reach the federation.
 		found := false
 		cfg, found = statusServerConfig()

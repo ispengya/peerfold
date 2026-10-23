@@ -1,7 +1,7 @@
 // Package identity holds the small amount of cryptography peerfold needs:
 // a self-signed server certificate pinned by its clients, hashed per-principal
-// tokens, and the invite string that carries an address, fingerprint, name and
-// token from the server operator to a new machine.
+// tokens, and the login code that enrolls a new machine with the certificate
+// fingerprint it should pin.
 //
 // There is deliberately no CA and no dependence on the system trust store. A
 // peerfold server is not a public web site; a client that has been given the
@@ -25,8 +25,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,10 +33,7 @@ import (
 	"github.com/ispengya/peerfold/internal/node"
 )
 
-// InviteScheme is the URL scheme of an invite string.
-const InviteScheme = "pf"
-
-// Roles an invite or token may name.
+// Roles a token may name.
 const (
 	RoleClient = "client"
 	RoleViewer = "viewer"
@@ -198,7 +193,7 @@ func ClientTLSConfig(fingerprint string) (*tls.Config, error) {
 // ── tokens ────────────────────────────────────────────────────────────────
 
 // TokenRecord is one principal's credential, as stored on the server. Only the
-// hash is kept; the token itself is shown once when the invite is created.
+// hash is kept; the token itself is returned once, when the machine enrolls.
 type TokenRecord struct {
 	Name    string `json:"name"`
 	Role    string `json:"role"`
@@ -217,24 +212,30 @@ func TokenHash(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// AddToken creates a token for name, replacing any earlier token for the same
-// name, and returns the token to put in an invite.
-func AddToken(path, name, role string, write bool) (string, error) {
-	if !node.ValidName(name) {
-		return "", fmt.Errorf("identity: %q is not one path component", name)
-	}
-	if role != RoleClient && role != RoleViewer {
-		return "", fmt.Errorf("identity: unknown role %q", role)
-	}
+// NewToken returns a fresh 256-bit token in URL-safe base64.
+func NewToken() (string, error) {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
 		return "", fmt.Errorf("identity: generate token: %w", err)
 	}
-	token := base64.RawURLEncoding.EncodeToString(buf)
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
 
+// SetToken records token as name's credential, replacing any earlier token for
+// the same name. Only the hash is stored.
+func SetToken(path, name, role, token string, write bool) error {
+	if !node.ValidName(name) {
+		return fmt.Errorf("identity: %q is not one path component", name)
+	}
+	if role != RoleClient && role != RoleViewer {
+		return fmt.Errorf("identity: unknown role %q", role)
+	}
+	if token == "" {
+		return errors.New("identity: token must not be empty")
+	}
 	tf, err := loadTokens(path)
 	if err != nil {
-		return "", err
+		return err
 	}
 	kept := tf.Tokens[:0]
 	for _, t := range tf.Tokens {
@@ -249,7 +250,17 @@ func AddToken(path, name, role string, write bool) (string, error) {
 		Write:   write,
 		Created: time.Now().Unix(),
 	})
-	if err := saveTokens(path, tf); err != nil {
+	return saveTokens(path, tf)
+}
+
+// AddToken creates a token for name, replacing any earlier token for the same
+// name, and returns the freshly generated token.
+func AddToken(path, name, role string, write bool) (string, error) {
+	token, err := NewToken()
+	if err != nil {
+		return "", err
+	}
+	if err := SetToken(path, name, role, token, write); err != nil {
 		return "", err
 	}
 	return token, nil
@@ -304,8 +315,8 @@ func loadTokens(path string) (tokenFile, error) {
 }
 
 // saveTokens writes the file atomically and with owner-only permissions. An
-// invite is a credential, so a partially written file must never become one a
-// login happens to read.
+// A token file is a credential store, so a partially written file must never
+// become one a login happens to read.
 func saveTokens(path string, tf tokenFile) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -340,70 +351,71 @@ func saveTokens(path string, tf tokenFile) error {
 	return nil
 }
 
-// ── invites ───────────────────────────────────────────────────────────────
+// ── login code ────────────────────────────────────────────────────────────
 
-// Invite is everything a new machine needs, in one pasteable string.
-type Invite struct {
-	Address     string
+// LoadOrCreateEnrollSecret returns the server's enrollment secret, generating
+// it on first use. The file is owner-only; a machine that can read it can
+// enroll new peers.
+//
+// The secret is intentionally stable across restarts: the server prints the
+// same login code until the operator deletes the file. Deleting it revokes
+// every not-yet-enrolled machine, while already-issued per-name tokens keep
+// working.
+func LoadOrCreateEnrollSecret(dir string) (string, error) {
+	path := filepath.Join(dir, "enroll.key")
+	if b, err := os.ReadFile(path); err == nil {
+		s := strings.TrimSpace(string(b))
+		if s == "" {
+			return "", fmt.Errorf("identity: %s is empty", path)
+		}
+		return s, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("identity: read %s: %w", path, err)
+	}
+
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("identity: create %s: %w", dir, err)
+	}
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("identity: generate enrollment secret: %w", err)
+	}
+	secret := base64.RawURLEncoding.EncodeToString(buf)
+	if err := os.WriteFile(path, []byte(secret+"\n"), 0o600); err != nil {
+		return "", fmt.Errorf("identity: write %s: %w", path, err)
+	}
+	return secret, nil
+}
+
+// LoginCode is what the server prints at startup: the certificate a client
+// should pin and the secret that enrolls it. It deliberately contains no
+// address, principal or role; those belong to the machine being enrolled.
+type LoginCode struct {
 	Fingerprint string
-	Name        string
-	Role        string
-	Token       string
-	Write       bool
+	Secret      string
 }
 
-// String encodes the invite as pf://host:port?fp=…&name=…&role=…&token=…
-func (i Invite) String() string {
-	q := url.Values{}
-	q.Set("fp", i.Fingerprint)
-	q.Set("name", i.Name)
-	q.Set("role", i.Role)
-	q.Set("token", i.Token)
-	if i.Write {
-		q.Set("write", "1")
-	}
-	u := url.URL{Scheme: InviteScheme, Host: i.Address, RawQuery: q.Encode()}
-	return u.String()
+// String is PF1.<fingerprint>.<secret>. A dot is not part of either component,
+// so the string splits unambiguously.
+func (c LoginCode) String() string {
+	return "PF1." + c.Fingerprint + "." + c.Secret
 }
 
-// ParseInvite validates an invite string. The token is a credential, so every
-// field is checked before any network connection is attempted.
-func ParseInvite(s string) (Invite, error) {
-	u, err := url.Parse(strings.TrimSpace(s))
+// ParseLoginCode validates a pasted login code.
+func ParseLoginCode(s string) (LoginCode, error) {
+	parts := strings.Split(strings.TrimSpace(s), ".")
+	if len(parts) != 3 || parts[0] != "PF1" {
+		return LoginCode{}, errors.New("identity: login code must look like PF1.<fingerprint>.<secret>")
+	}
+	fp, err := NormalizeFingerprint(parts[1])
 	if err != nil {
-		return Invite{}, fmt.Errorf("identity: parse invite: %w", err)
+		return LoginCode{}, err
 	}
-	if u.Scheme != InviteScheme && u.Scheme != "peerfold" {
-		return Invite{}, fmt.Errorf("identity: invite scheme is %q, want %q", u.Scheme, InviteScheme)
+	if parts[2] == "" {
+		return LoginCode{}, errors.New("identity: login code has no secret")
 	}
-	if u.Host == "" {
-		return Invite{}, errors.New("identity: invite has no server address")
+	if _, err := base64.RawURLEncoding.DecodeString(parts[2]); err != nil {
+		return LoginCode{}, fmt.Errorf("identity: login code secret is not base64url: %w", err)
 	}
-	if _, _, err := net.SplitHostPort(u.Host); err != nil {
-		return Invite{}, fmt.Errorf("identity: invite address %q is not host:port", u.Host)
-	}
-	q := u.Query()
-	inv := Invite{
-		Address:     u.Host,
-		Fingerprint: q.Get("fp"),
-		Name:        q.Get("name"),
-		Role:        q.Get("role"),
-		Token:       q.Get("token"),
-		Write:       q.Get("write") == "1",
-	}
-	fp, err := NormalizeFingerprint(inv.Fingerprint)
-	if err != nil {
-		return Invite{}, err
-	}
-	inv.Fingerprint = fp
-	if !node.ValidName(inv.Name) {
-		return Invite{}, fmt.Errorf("identity: invite name %q is not one path component", inv.Name)
-	}
-	if inv.Role != RoleClient && inv.Role != RoleViewer {
-		return Invite{}, fmt.Errorf("identity: invite role %q is unknown", inv.Role)
-	}
-	if inv.Token == "" {
-		return Invite{}, errors.New("identity: invite has no token")
-	}
-	return inv, nil
+	return LoginCode{Fingerprint: fp, Secret: parts[2]}, nil
 }

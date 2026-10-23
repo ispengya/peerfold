@@ -132,9 +132,12 @@ func launchBackground(args []string) (int, error) {
 	home, err := os.UserHomeDir()
 	if err == nil {
 		logDir := filepath.Join(home, "peerfold-"+component)
-		os.MkdirAll(logDir, 0o755)
+		os.MkdirAll(logDir, 0o700)
 		logFile := filepath.Join(logDir, component+".log")
-		if f, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+		if f, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
+			// The server prints its login code to stdout, which lands in this
+			// file, so the log is a credential-bearing artifact.
+			_ = f.Chmod(0o600)
 			cmd.Stdout = f
 			cmd.Stderr = f
 			defer f.Close()
@@ -392,8 +395,8 @@ func statusUnsupported(err error) bool {
 // The server's own config comes first: on the machine that aggregates, that is
 // the authority. Then the mount config and any client config, so a machine that
 // runs only one role still reports the federation it belongs to. The whole
-// config is returned because the query also needs its invite credentials, not
-// only the address.
+// config is returned because the query also needs its credentials, not only
+// the address.
 func statusServerConfig() (config.Config, bool) {
 	paths := make([]string, 0, 3)
 	if path, err := config.ServerPath(); err == nil {
@@ -420,7 +423,7 @@ func statusServerConfig() (config.Config, bool) {
 		}
 		// A config that can actually authenticate is more useful than one
 		// that merely names an address: on a machine that runs both a server
-		// and a mount, the mount's invite is the one that can query it.
+		// and a mount, the mount's enrolled token is the one that can query it.
 		if hasCredentials(cfg) {
 			return cfg, true
 		}

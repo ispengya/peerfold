@@ -16,12 +16,13 @@ import (
 )
 
 type secureFixture struct {
-	srv         *server.Server
-	addr        string
-	fingerprint string
-	tokens      string
-	clientToken string
-	viewerToken string
+	srv          *server.Server
+	addr         string
+	fingerprint  string
+	tokens       string
+	clientToken  string
+	viewerToken  string
+	enrollSecret string
 }
 
 func startSecure(t *testing.T) secureFixture {
@@ -41,9 +42,11 @@ func startSecure(t *testing.T) secureFixture {
 		t.Fatalf("AddToken(viewer): %v", err)
 	}
 
+	const enrollSecret = "dGVzdC1lbnJvbGwtc2VjcmV0"
 	s := server.NewWithOptions("127.0.0.1:0", server.Options{
-		TLSConfig:  id.TLSConfig(),
-		TokensPath: tokensPath,
+		TLSConfig:    id.TLSConfig(),
+		TokensPath:   tokensPath,
+		EnrollSecret: enrollSecret,
 	})
 	if s.Addr() == nil {
 		t.Fatalf("secure server did not bind: %v", s.Err())
@@ -58,6 +61,7 @@ func startSecure(t *testing.T) secureFixture {
 	return secureFixture{
 		srv: s, addr: s.Addr().String(), fingerprint: id.Fingerprint(),
 		tokens: tokensPath, clientToken: clientToken, viewerToken: viewerToken,
+		enrollSecret: enrollSecret,
 	}
 }
 
@@ -165,5 +169,56 @@ func TestAuthenticationWithoutTLSIsRefusedAtStartup(t *testing.T) {
 	}
 	if err := s.Err(); err == nil || !strings.Contains(err.Error(), "requires TLS") {
 		t.Fatalf("Err() = %v, want a TLS requirement", err)
+	}
+}
+
+// The enrollment secret is not an identity: the first login receives a fresh
+// per-name token, and later logins use that token without the secret.
+func TestEnrollmentIssuesATokenAndThenUsesIt(t *testing.T) {
+	f := startSecure(t)
+
+	env := dialSecure(t, f.addr, f.fingerprint, "newbox", proto.RoleClient, f.enrollSecret, false)
+	if env.Err != "" {
+		t.Fatalf("enrollment refused: %s", env.Err)
+	}
+	var ok proto.HelloOKBody
+	if err := json.Unmarshal(env.Body, &ok); err != nil {
+		t.Fatalf("decode hello_ok: %v", err)
+	}
+	if ok.IssuedToken == "" {
+		t.Fatal("enrollment returned no per-name token")
+	}
+
+	// The issued token now works alone, and does not enroll again.
+	env = dialSecure(t, f.addr, f.fingerprint, "newbox", proto.RoleClient, ok.IssuedToken, false)
+	if env.Err != "" {
+		t.Fatalf("issued token refused: %s", env.Err)
+	}
+	var second proto.HelloOKBody
+	if err := json.Unmarshal(env.Body, &second); err != nil {
+		t.Fatal(err)
+	}
+	if second.IssuedToken != "" {
+		t.Fatal("a token login was answered with another token")
+	}
+
+	// A wrong secret is not an enrollment.
+	env = dialSecure(t, f.addr, f.fingerprint, "other", proto.RoleClient, "not-the-secret", false)
+	if env.Err == "" {
+		t.Fatal("an arbitrary secret enrolled a name")
+	}
+}
+
+// A name enrolled for one role cannot be repurposed by the master code.
+func TestEnrollmentDoesNotChangeARecordedRole(t *testing.T) {
+	f := startSecure(t)
+
+	env := dialSecure(t, f.addr, f.fingerprint, "dual", proto.RoleClient, f.enrollSecret, false)
+	if env.Err != "" {
+		t.Fatalf("first enrollment refused: %s", env.Err)
+	}
+	env = dialSecure(t, f.addr, f.fingerprint, "dual", proto.RoleViewer, f.enrollSecret, false)
+	if env.Err == "" {
+		t.Fatal("the master code changed a name's role from client to viewer")
 	}
 }

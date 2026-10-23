@@ -13,24 +13,21 @@ import (
 	"github.com/ispengya/peerfold/internal/mount"
 )
 
-// promptInvite asks for one invite string. An empty answer is the explicit
-// plaintext path and is reported as ok=false; anything malformed is an error so
-// the user sees why their paste was refused rather than silently getting an
-// unencrypted connection.
-func promptInvite(in *bufio.Reader, out io.Writer, role string) (identity.Invite, bool, error) {
+// promptLoginCode asks for the code the server prints at startup. An empty
+// answer is the explicit plaintext path and is reported as ok=false; anything
+// malformed is an error so the user sees why the paste was refused rather than
+// silently getting an unencrypted connection.
+func promptLoginCode(in *bufio.Reader, out io.Writer) (identity.LoginCode, bool, error) {
 	raw := promptString(in, out,
-		"Server invite (paste from `peerfold invite`; leave empty for plaintext setup)", "")
+		"Login code (printed by the server; leave empty for plaintext setup)", "")
 	if raw == "" {
-		return identity.Invite{}, false, nil
+		return identity.LoginCode{}, false, nil
 	}
-	inv, err := identity.ParseInvite(raw)
+	code, err := identity.ParseLoginCode(raw)
 	if err != nil {
-		return identity.Invite{}, false, err
+		return identity.LoginCode{}, false, err
 	}
-	if inv.Role != role {
-		return identity.Invite{}, false, fmt.Errorf("this invite is for role %q, but this setup needs %q", inv.Role, role)
-	}
-	return inv, true, nil
+	return code, true, nil
 }
 
 // ensureShareDir creates a share directory if it is missing, reporting whether
@@ -112,13 +109,18 @@ func interactiveServer(input io.Reader, out, errw io.Writer) int {
 		fmt.Fprintf(out, "       Listen: %s\n\n", cfg.Listen)
 	}
 
-	// Show the identity a client will pin, and the one command that creates a
-	// credential. This is printed before the run-mode choice so it is visible
-	// even when the server is started in the background, where the child's
-	// stdout goes to the log file instead of this terminal.
+	// Print the one code a client or mount needs. This happens before the
+	// run-mode choice so it is visible even when the server is started in the
+	// background, where the child's stdout goes to the log file instead.
 	if id, err := identity.LoadOrCreateServer(cfgDir); err == nil {
-		fmt.Fprintf(out, "  Server fingerprint: %s\n", id.Fingerprint())
-		fmt.Fprintf(out, "  Enroll a machine:   peerfold invite --name <name> --role client\n\n")
+		secret, err := identity.LoadOrCreateEnrollSecret(cfgDir)
+		if err != nil {
+			fmt.Fprintf(out, "  [!] Could not prepare the enrollment secret: %v\n\n", err)
+		} else {
+			code := identity.LoginCode{Fingerprint: id.Fingerprint(), Secret: secret}
+			fmt.Fprintf(out, "  Login code: %s\n", code.String())
+			fmt.Fprintf(out, "  Paste it once into `peerfold client` or `peerfold mount` on another machine.\n\n")
+		}
 	} else {
 		fmt.Fprintf(out, "  [!] Could not prepare the server certificate: %v\n\n", err)
 	}
@@ -206,23 +208,22 @@ func interactiveClient(input io.Reader, out, errw io.Writer) int {
 	if cfg.Server == "" {
 		fmt.Fprintf(out, "  No config found. Let's set one up.\n\n")
 
-		inv, haveInvite, err := promptInvite(in, out, identity.RoleClient)
+		code, haveCode, err := promptLoginCode(in, out)
 		if err != nil {
 			fmt.Fprintf(errw, "  [X] %v\n", err)
 			return 1
 		}
 
-		if haveInvite {
-			cfg = config.Default()
-			applyInvite(&cfg, inv)
-			name = inv.Name
-			fmt.Fprintf(out, "       Server: %s\n       Name:   %s\n\n", cfg.Server, cfg.ClientName)
-		} else {
-			name = promptString(in, out, "Client name", name)
-			server := promptString(in, out, "Server address", "127.0.0.1:7000")
-			cfg = config.Default()
-			cfg.Server = server
-			cfg.ClientName = name
+		name = promptString(in, out, "Client name", name)
+		server := promptString(in, out, "Server address", "127.0.0.1:7000")
+
+		cfg = config.Default()
+		cfg.Server = server
+		cfg.ClientName = name
+		cfg.AuthName = name
+		if haveCode {
+			applyLoginCode(&cfg, code, name)
+			fmt.Fprintf(out, "  [OK] Login code accepted; this machine will enroll as %q on first connect.\n", name)
 		}
 
 		if cfg.Shares == nil {
@@ -241,54 +242,39 @@ func interactiveClient(input io.Reader, out, errw io.Writer) int {
 			return 1
 		}
 		fmt.Fprintf(out, "\n  [OK] Config saved: %s\n\n", cfgPath)
-	} else if !hasCredentials(cfg) {
-		// A config written before invites existed, or one the user chose to
-		// keep in plaintext mode. Offer the upgrade once per start; an empty
-		// answer preserves the old, explicitly unencrypted behaviour.
-		fmt.Fprintf(out, "  This config has no invite. Paste one to enable TLS, or leave empty for plaintext mode.\n\n")
-		inv, ok, err := promptInvite(in, out, identity.RoleClient)
-		if err != nil {
-			fmt.Fprintf(errw, "  [X] %v\n", err)
-			return 1
+	} else if !hasCredentials(cfg) || cfg.Token == "" || cfg.TLSFingerprint == "" {
+		// A config written before the login code existed, a plaintext-only
+		// config, or one edited by hand. Offer the upgrade; an empty answer
+		// keeps the old plaintext behaviour only when there was no credential
+		// to repair in the first place.
+		required := hasCredentials(cfg)
+		if required {
+			fmt.Fprintf(out, "  This config's login code is incomplete. Paste it again.\n\n")
+		} else {
+			fmt.Fprintf(out, "  This config has no login code. Paste the one the server prints, or leave empty for plaintext mode.\n\n")
 		}
-		if ok {
-			if cfg.ClientName != "" && inv.Name != cfg.ClientName {
-				fmt.Fprintf(errw, "  [X] The invite is for %q, but this config is for %q. Create an invite for %q or start from a fresh config.\n",
-					inv.Name, cfg.ClientName, cfg.ClientName)
-				return 1
-			}
-			applyInvite(&cfg, inv)
-			if err := config.Save(cfgPath, cfg); err != nil {
-				fmt.Fprintf(errw, "  [X] Failed to save config: %v\n", err)
-				return 1
-			}
-			fmt.Fprintf(out, "  [OK] Invite saved to: %s\n\n", cfgPath)
-		}
-	} else if cfg.Token == "" || cfg.TLSFingerprint == "" {
-		// A config from outside the invite flow, or one that was edited by
-		// hand, can be half enrolled. Ask for the invite again rather than
-		// connecting without the protection the user expects.
-		fmt.Fprintf(out, "  This config's invite is incomplete. Paste it again.\n\n")
-		inv, ok, err := promptInvite(in, out, identity.RoleClient)
+		code, ok, err := promptLoginCode(in, out)
 		if err != nil {
 			fmt.Fprintf(errw, "  [X] %v\n", err)
 			return 1
 		}
 		if !ok {
-			fmt.Fprintln(errw, "  [X] An invite is required to repair this config.")
-			return 1
+			if required {
+				fmt.Fprintln(errw, "  [X] A login code is required to repair this config.")
+				return 1
+			}
+		} else {
+			if cfg.ClientName == "" {
+				cfg.ClientName = defaultClientName()
+			}
+			cfg.AuthName = cfg.ClientName
+			applyLoginCode(&cfg, code, cfg.ClientName)
+			if err := config.Save(cfgPath, cfg); err != nil {
+				fmt.Fprintf(errw, "  [X] Failed to save config: %v\n", err)
+				return 1
+			}
+			fmt.Fprintf(out, "  [OK] Login code saved to: %s; this machine will enroll as %q.\n\n", cfgPath, cfg.ClientName)
 		}
-		if cfg.ClientName != "" && inv.Name != cfg.ClientName {
-			fmt.Fprintf(errw, "  [X] The invite is for %q, but this config is for %q. Create an invite for %q.\n",
-				inv.Name, cfg.ClientName, cfg.ClientName)
-			return 1
-		}
-		applyInvite(&cfg, inv)
-		if err := config.Save(cfgPath, cfg); err != nil {
-			fmt.Fprintf(errw, "  [X] Failed to save config: %v\n", err)
-			return 1
-		}
-		fmt.Fprintf(out, "  [OK] Invite saved to: %s\n\n", cfgPath)
 	}
 
 	component := "client-" + cfg.ClientName
@@ -373,43 +359,33 @@ func interactiveMount(input io.Reader, out, errw io.Writer) int {
 		fmt.Fprintf(out, "\n  Press Enter to keep a value in [brackets].\n\n")
 	}
 
-	haveInvite := hasCredentials(cfg) && cfg.Token != "" && cfg.TLSFingerprint != ""
-	if !haveInvite {
-		// A missing invite is allowed on the first setup: an explicitly
-		// insecure server is still reachable that way. An incomplete one is
-		// repaired here instead of being used half-enrolled.
+	complete := hasCredentials(cfg) && cfg.Token != "" && cfg.TLSFingerprint != ""
+	if !complete {
+		// A missing code is allowed on a first setup: an explicitly insecure
+		// server is still reachable that way. An incomplete one is repaired
+		// here instead of being used half-enrolled.
 		if hasCredentials(cfg) {
-			fmt.Fprintf(out, "  This config's invite is incomplete. Paste it again.\n\n")
+			fmt.Fprintf(out, "  This config's login code is incomplete. Paste it again.\n\n")
 		}
-		inv, ok, err := promptInvite(in, out, identity.RoleViewer)
+		code, ok, err := promptLoginCode(in, out)
 		if err != nil {
 			fmt.Fprintf(errw, "  [X] %v\n", err)
 			return 1
 		}
 		if ok {
-			applyInvite(&cfg, inv)
-			haveInvite = true
-			fmt.Fprintf(out, "       Server: %s\n       Name:   %s\n\n", cfg.Server, cfg.AuthName)
+			applyLoginCode(&cfg, code, "")
+			fmt.Fprintf(out, "  [OK] Login code accepted; this mount will enroll on first connect.\n\n")
 		} else if hasCredentials(cfg) {
-			fmt.Fprintln(errw, "  [X] An invite is required to repair this config.")
+			fmt.Fprintln(errw, "  [X] A login code is required to repair this config.")
 			return 1
 		}
 	}
 
 	server := cfg.Server
-	if haveInvite {
-		// The pinned certificate and token belong to this address. Changing it
-		// by hand would only produce a handshake failure, so it is not asked.
-		if server == "" {
-			fmt.Fprintln(errw, "  [X] The saved invite has no server address; paste it again.")
-			return 1
-		}
-	} else {
-		if server == "" {
-			server = "127.0.0.1:7000"
-		}
-		server = promptString(in, out, "Server address", server)
+	if server == "" {
+		server = "127.0.0.1:7000"
 	}
+	server = promptString(in, out, "Server address", server)
 
 	mountPoint := cfg.MountPoint
 	if mountPoint == "" {

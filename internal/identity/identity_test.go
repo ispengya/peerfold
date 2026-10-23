@@ -115,37 +115,6 @@ func TestTokensAreHashedAndBoundToNameAndRole(t *testing.T) {
 	}
 }
 
-func TestInviteRoundTripAndValidation(t *testing.T) {
-	fp := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-	inv := identity.Invite{
-		Address:     "example.test:7000",
-		Fingerprint: fp,
-		Name:        "laptop",
-		Role:        identity.RoleClient,
-		Token:       "tok",
-		Write:       true,
-	}
-	got, err := identity.ParseInvite(inv.String())
-	if err != nil {
-		t.Fatalf("ParseInvite: %v", err)
-	}
-	if got != inv {
-		t.Fatalf("round trip = %+v, want %+v", got, inv)
-	}
-	for _, bad := range []string{
-		"",
-		"http://example.test:7000",
-		"pf://example.test:7000?fp=" + fp + "&name=../x&role=client&token=t",
-		"pf://example.test:7000?fp=nope&name=x&role=client&token=t",
-		"pf://example.test:7000?fp=" + fp + "&name=x&role=admin&token=t",
-		"pf://example.test:7000?fp=" + fp + "&name=x&role=client",
-	} {
-		if _, err := identity.ParseInvite(bad); err == nil {
-			t.Errorf("ParseInvite(%q) succeeded", bad)
-		}
-	}
-}
-
 // A handshake that is not TLS must not be mistaken for one: the client config
 // is what enforces that, and it does so by refusing a plain server.
 func TestClientTLSConfigRefusesAPlaintextServer(t *testing.T) {
@@ -169,5 +138,43 @@ func TestClientTLSConfigRefusesAPlaintextServer(t *testing.T) {
 	if err == nil {
 		conn.Close()
 		t.Fatal("a TLS client completed a handshake with a plaintext listener")
+	}
+}
+
+func TestLoginCodeRoundTripAndValidation(t *testing.T) {
+	dir := t.TempDir()
+	id, err := identity.LoadOrCreateServer(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret, err := identity.LoadOrCreateEnrollSecret(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := identity.LoadOrCreateEnrollSecret(dir)
+	if err != nil || again != secret {
+		t.Fatalf("enrollment secret changed across loads: %q -> %q (%v)", secret, again, err)
+	}
+
+	code := identity.LoginCode{Fingerprint: id.Fingerprint(), Secret: secret}
+	got, err := identity.ParseLoginCode(code.String())
+	if err != nil {
+		t.Fatalf("ParseLoginCode: %v", err)
+	}
+	if got != code {
+		t.Fatalf("round trip = %+v, want %+v", got, code)
+	}
+
+	for _, bad := range []string{
+		"",
+		"PF1." + id.Fingerprint(),
+		"PF2." + id.Fingerprint() + "." + secret,
+		"PF1.nope." + secret,
+		"PF1." + id.Fingerprint() + ".",
+		"PF1." + id.Fingerprint() + ".not base64!",
+	} {
+		if _, err := identity.ParseLoginCode(bad); err == nil {
+			t.Errorf("ParseLoginCode(%q) succeeded", bad)
+		}
 	}
 }

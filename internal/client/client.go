@@ -102,13 +102,14 @@ type Options struct {
 // request to read a file — is dispatched from there, so no two readers ever
 // interleave on the same frames.
 type Client struct {
-	conn      net.Conn
-	pc        *proto.Conn
-	fs        *FS
-	shares    Shares
-	name      string
-	batch     int
-	aggregate bool
+	conn        net.Conn
+	pc          *proto.Conn
+	fs          *FS
+	shares      Shares
+	name        string
+	batch       int
+	aggregate   bool
+	issuedToken string
 
 	mu        sync.Mutex
 	onBatch   func(int)
@@ -212,6 +213,9 @@ func Dial(opt Options) (*Client, error) {
 	if ok.Compress {
 		c.pc.SetCompression(true)
 	}
+	// Enrollment answers with the token this machine uses from now on. The
+	// caller persists it; the client itself has no config file to write.
+	c.issuedToken = ok.IssuedToken
 	if err := raw.SetDeadline(time.Time{}); err != nil {
 		raw.Close()
 		return nil, fmt.Errorf("client: clear deadline: %w", err)
@@ -223,6 +227,11 @@ func Dial(opt Options) (*Client, error) {
 
 // Name is the name the server registered this client under.
 func (c *Client) Name() string { return c.name }
+
+// IssuedToken is the per-name token the server issued during enrollment, or ""
+// when this connection authenticated with a token it already had. The caller
+// should persist it and use it for later connections.
+func (c *Client) IssuedToken() string { return c.issuedToken }
 
 // Aggregate reports whether the server accepted this client as the aggregating
 // one, which is what lets it serve other clients' trees too.

@@ -10,15 +10,16 @@ import (
 	"github.com/ispengya/peerfold/internal/viewer"
 )
 
-// hasCredentials reports whether a config carries an invite at all.
+// hasCredentials reports whether a config carries a login code or an enrolled
+// token.
 func hasCredentials(cfg config.Config) bool {
 	return cfg.Token != "" || cfg.TLSFingerprint != ""
 }
 
-// viewerDialConfig turns a config's invite into a viewer connection config. An
-// empty invite is the explicit plaintext mode: the server, if secure, will
-// refuse the handshake, which is the correct failure rather than a silent
-// downgrade.
+// viewerDialConfig turns a config's login code or enrolled token into a viewer
+// connection config. An empty credential set is the explicit plaintext mode:
+// the server, if secure, will refuse the handshake, which is the correct
+// failure rather than a silent downgrade.
 func viewerDialConfig(cfg config.Config) (viewer.DialConfig, error) {
 	if !hasCredentials(cfg) {
 		return viewer.DialConfig{}, nil
@@ -30,15 +31,15 @@ func viewerDialConfig(cfg config.Config) (viewer.DialConfig, error) {
 	return viewer.DialConfig{TLS: tlsCfg, Token: cfg.Token}, nil
 }
 
-// credentialsTLS validates an invite that is present and returns its pinned
-// client config. An incomplete invite is an error, never a partial credential.
+// credentialsTLS validates credentials that are present and returns the pinned
+// client config. An incomplete pair is an error, never a partial credential.
 func credentialsTLS(cfg config.Config) (*tls.Config, error) {
 	if cfg.Token == "" || cfg.TLSFingerprint == "" {
-		return nil, errors.New("incomplete invite: both tls_fingerprint and token are required; paste the invite again")
+		return nil, errors.New("incomplete credentials: both tls_fingerprint and token are required; paste the server login code again")
 	}
 	tlsCfg, err := identity.ClientTLSConfig(cfg.TLSFingerprint)
 	if err != nil {
-		return nil, fmt.Errorf("invite fingerprint: %w", err)
+		return nil, fmt.Errorf("pinned server fingerprint: %w", err)
 	}
 	return tlsCfg, nil
 }
@@ -52,13 +53,13 @@ func credentialName(cfg config.Config) string {
 	return cfg.ClientName
 }
 
-// applyInvite stores an invite in a config. The invite fixes the server, the
-// pinned certificate, the principal and the token; a client name the server
-// will index under is the same principal.
-func applyInvite(cfg *config.Config, inv identity.Invite) {
-	cfg.Server = inv.Address
-	cfg.TLSFingerprint = inv.Fingerprint
-	cfg.AuthName = inv.Name
-	cfg.Token = inv.Token
-	cfg.ClientName = inv.Name
+// applyLoginCode stores a server-printed login code in a config. The code
+// carries the certificate pin and the enrollment secret; the name and role are
+// the machine's own and are sent when it enrolls.
+func applyLoginCode(cfg *config.Config, code identity.LoginCode, name string) {
+	cfg.TLSFingerprint = code.Fingerprint
+	cfg.Token = code.Secret
+	if name != "" {
+		cfg.AuthName = name
+	}
 }

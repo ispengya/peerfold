@@ -210,7 +210,7 @@ func TestRunDispatchesEveryKnownCommand(t *testing.T) {
 	// client; on a machine whose default 127.0.0.1:7000 is live that joins the
 	// server and never returns. The loop stays for the commands whose bare form
 	// is safely inert.
-	for _, cmd := range []string{"ls", "cat", "put", "mkdir", "rm", "mv", "invite"} {
+	for _, cmd := range []string{"ls", "cat", "put", "mkdir", "rm", "mv"} {
 		var out, errOut bytes.Buffer
 		if code := runWithEmptyStdin([]string{cmd}, &out, &errOut); code == 0 {
 			t.Fatalf("runWithEmptyStdin([%s]) = 0, want non-zero", cmd)

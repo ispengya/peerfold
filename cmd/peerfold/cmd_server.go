@@ -113,7 +113,7 @@ func cmdServerWith(args []string, stdout, stderr io.Writer, interrupt <-chan str
 
 	dir := filepath.Dir(path)
 	var s *server.Server
-	fingerprint := ""
+	loginCode := ""
 	if *insecure {
 		fmt.Fprintln(stderr, "server: WARNING: running insecure: plaintext, no authentication")
 		s = server.New(addr)
@@ -123,11 +123,17 @@ func cmdServerWith(args []string, stdout, stderr io.Writer, interrupt <-chan str
 			fmt.Fprintf(stderr, "server: %v\n", err)
 			return 1
 		}
+		secret, err := identity.LoadOrCreateEnrollSecret(dir)
+		if err != nil {
+			fmt.Fprintf(stderr, "server: %v\n", err)
+			return 1
+		}
 		s = server.NewWithOptions(addr, server.Options{
-			TLSConfig:  id.TLSConfig(),
-			TokensPath: filepath.Join(dir, "tokens.json"),
+			TLSConfig:    id.TLSConfig(),
+			TokensPath:   filepath.Join(dir, "tokens.json"),
+			EnrollSecret: secret,
 		})
-		fingerprint = id.Fingerprint()
+		loginCode = identity.LoginCode{Fingerprint: id.Fingerprint(), Secret: secret}.String()
 	}
 	// New binds the listener, so a port already in use is reported here instead
 	// of after the process has announced that it is running. The operating
@@ -141,8 +147,9 @@ func cmdServerWith(args []string, stdout, stderr io.Writer, interrupt <-chan str
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- s.Serve() }()
 
-	if fingerprint != "" {
-		fmt.Fprintf(stdout, "tls fingerprint: %s\n", fingerprint)
+	if loginCode != "" {
+		fmt.Fprintf(stdout, "login code: %s\n", loginCode)
+		fmt.Fprintln(stdout, "paste this code once into `peerfold client` or `peerfold mount` on another machine")
 	}
 	fmt.Fprintf(stdout, "listening on %s\n", s.Addr())
 
@@ -178,7 +185,7 @@ flags:
   --config PATH    config file
   --insecure       plaintext and no authentication (development only)
 
-Run 'peerfold invite' on this machine to create a credential for another
-machine. The invite contains this server's fingerprint, so the client pins it
-on first use. Without an invite, a peer cannot authenticate.
+At startup the server prints a login code. Paste it once into "peerfold client"
+or "peerfold mount" on another machine; each machine then gets its own token.
+Without enrollment, a peer cannot authenticate.
 `

@@ -34,8 +34,9 @@ type Config struct {
 	MountPoint string `json:"mount_point"`
 
 	// TLSFingerprint is the pinned SHA-256 of the server certificate, and
-	// Token is the bearer credential for AuthName. They arrive together in an
-	// invite and are stored only after the user has pasted one.
+	// Token is the bearer credential for AuthName. They arrive together in the
+	// server's login code; Token is replaced by this machine's own token after
+	// the first enrollment.
 	//
 	// The file is written 0600 because of Token. Windows ignores most of the
 	// mode, but the per-user profile directory's ACL is the effective boundary

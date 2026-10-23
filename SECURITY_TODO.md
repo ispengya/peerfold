@@ -76,63 +76,72 @@ P0 不改线格式，修的是“未受信字符串变成名字或磁盘路径�
 
 ### TLS 1.3
 
-- server 首次启动（或首次运行 `peerfold invite`）在 `peerfold-server/` 下生成
-  自签 ECDSA P-256 证书：`tls.crt` 0644、`tls.key` 0600，有效期 10 年
+- server 首次启动在 `peerfold-server/` 下生成自签 ECDSA P-256 证书：
+  `tls.crt` 0644、`tls.key` 0600，有效期 10 年
 - server 用 `tls.Listen` 包住 listener；最低 TLS 1.3
-- client/mount 固定证书指纹：invite 携带 SHA-256 指纹，连接用
-  `VerifyConnection` 逐字节比对；不依赖系统 CA，也不做静默 TOFU
+- 登录码里带证书的 SHA-256 指纹；client/mount 用 `VerifyConnection`
+  逐字节比对，不依赖系统 CA，也不做静默 TOFU
 - 指纹不匹配直接失败，并给出期望/实际指纹
 - 连接池共享 `ClientSessionCache`，后续读连接尽量走 TLS 会话恢复
-- 证书轮换：删除证书对并重新给所有机器发 invite；没有自动轮换，避免
-  静默断开已登记机器
+- 证书轮换：删除证书对并重新分发登录码；没有自动轮换
 
-### 每主体 token
+### 登录码与每主体 token
 
-- `peerfold invite --name <name> --role client|viewer [--write] [--server host:port]`
-  生成 32 字节随机 token，server 端 `tokens.json` 只存 SHA-256；重复同名
-  invite 会轮换旧 token
-- token 与名字、角色绑定；server 在注册前校验，未知名字、错误 token、角色
-  不匹配返回同一句 “authentication failed”
-- 采用 **TLS 内的 bearer token**：token 在 hello 控制帧中发送，控制帧从不
-  压缩；TLS 提供机密性与重放保护，server 只保存哈希。没有做 HMAC 挑战响应，
-  因为那需要 server 持有 token 明文或引入 PAKE，收益不及复杂度
+- server 首次启动生成 32 字节 enrollment secret（`enroll.key`，0600），启动
+  时打印：
+  `login code: PF1.<证书指纹>.<enrollment secret>`
+- 登录码跨重启稳定；删除 `enroll.key` 并重启即可轮换，已签发的 per-name
+  token 不受影响
+- 首次 `peerfold client`/`mount` 只需要粘贴这一个登录码；名字、server 地址
+  和角色仍由本机设置提供
+- 客户端在 TLS 握手后把 enrollment secret 放在 hello 里；server 校验后：
+  - 若该名字已有 token 且匹配 → 正常登录
+  - 若名字没有 token，或同名同角色重新登记 → 生成 32 字节 per-name token，
+    server 只存 SHA-256，并通过 hello_ok 返回一次
+  - 同名但角色不一致 → 拒绝
+- client/mount 收到 issued token 后立即写回配置（0600），后续启动、重连都
+  使用该 token，不再需要登录码
+- 采用 **TLS 内的 bearer token**：登录码或 per-name token 在 hello 控制帧中
+  发送，控制帧从不压缩；TLS 提供机密性与重放保护，server 只保存哈希
 - token 文件与 client/mount 配置均为 0600；Windows 下依赖用户目录 ACL
 - 认证要求 TLS：`NewWithOptions` 在只给 token 文件不给 TLS 时拒绝启动
 
-### invite 与启动流程
+### 启动流程
 
-- `peerfold invite` 输出一条 `pf://host:port?fp=…&name=…&role=…&token=…`
-- 首次 `peerfold client`/`mount` 粘贴 invite，一次保存地址、指纹、principal
-  和 token；之后正常启动不再提问
-- 已存在的旧配置在下次交互启动时会提示粘贴 invite 完成升级；直接回车可以
-  继续显式明文模式（仅适用于 `--insecure` server）
-- 客户端升级时 invite 的名字必须与已有配置的 client name 一致，否则拒绝，
-  避免把凭据保存到另一个名字的配置里
 - 旧 peer 默认被 TLS server 拒绝；`peerfold server --insecure` 是显式明文
-  逃生口，此时客户端没有 invite 配置也能连接
-- 后台/自启进程不提问：凭据在交互设置阶段写入配置
-- server 交互启动会打印指纹和 `peerfold invite` 提示；客户端/mount 的 invite
-  解析失败会明确报错，不会静默降级
+  逃生口，此时客户端没有登录码也能连接
+- 已存在的旧配置在下次交互启动时会提示补登录码；直接回车可以继续显式明文
+  模式（仅适用于 `--insecure` server）
+- 后台/自启进程不提问：登录码在交互设置阶段写入配置，首次连接后替换成
+  per-name token
+- server 交互启动会打印登录码；客户端/mount 的登录码解析失败会明确报错，
+  不会静默降级
 
 测试：`TestServerCertificateIsStableAcrossLoads`、
 `TestClientRejectsTheWrongPinnedCertificate`、
 `TestClientTLSConfigRefusesAPlaintextServer`、
-`TestTokensAreHashedAndBoundToNameAndRole`、`TestInviteRoundTripAndValidation`、
+`TestTokensAreHashedAndBoundToNameAndRole`、
+`TestLoginCodeRoundTripAndValidation`、
 `TestSecureServerAcceptsOnlyTheTokenBoundToTheNameAndRole`、
 `TestSecureServerRefusesAPlaintextHandshake`、
-`TestE2ESecureFlow`、`TestInteractiveClientSavesInvite`、
-`TestInviteCommandProducesAWorkingViewerCredential`、
-`TestInteractiveMountRepairsAnIncompleteInvite`
+`TestEnrollmentIssuesATokenAndThenUsesIt`、
+`TestEnrollmentDoesNotChangeARecordedRole`、`TestE2ESecureFlow`、
+`TestInteractiveClientSavesLoginCode`、
+`TestInteractiveMountRepairsAnIncompleteLoginCode`、
+`TestInteractiveClientUpgradesAnExistingConfigWithALoginCode`、
+`TestCmdServerPrintsALoginCode`
 
 ### P1 残余风险
 
-- invite 里的 token 是凭据，不能贴到公开日志/聊天；需要泄露时重新生成同名
-  invite 即可轮换
+- 登录码是登记凭据，不能贴到公开日志/聊天；泄露后删除 `enroll.key` 并重启
+  即可轮换（已签发 token 仍有效，需要同时清理 `tokens.json` 里对应项）
+- 任何拿到登录码的人都可以登记一个新名字；P2 的授权还不能限制新登记的
+  viewer 能看什么。不要对不可信的人分发登录码
 - `--write` 已经记录在 token 记录里，但 P2 尚未在请求入口执行读写授权；
   目前所有已认证 viewer 仍可写
 - 没有 token 过期、单独撤销命令或连接频率限制；P3 补齐
-- server 本机的 `ls/cat/status` 需要一份带 invite 的配置；否则它们只能连
-  明文 server。自动为本机创建 viewer 凭据留给后续
+- server 本机的 `ls/cat/status` 需要一份带 per-name token 的配置；否则它们
+  只能连明文 server。自动为本机创建 viewer 凭据留给后续
 - TLS 只保护传输；server 主机仍能看到所有文件名和转发内容
 
 ## 下一步（未实现）

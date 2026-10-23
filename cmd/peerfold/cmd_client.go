@@ -159,12 +159,12 @@ func cmdClient(args []string, stdout, stderr io.Writer) int {
 		},
 	}
 	if hasCredentials(cfg) {
-		// The token is bound to the name in the invite. A local name that
-		// differs would authenticate as that principal and then index under a
-		// name the server never registered, so it is refused here instead of
-		// failing halfway through the handshake.
+		// The token is bound to the enrolled name. A local name that differs
+		// would authenticate as that principal and then index under a name the
+		// server never registered, so it is refused here instead of failing
+		// halfway through the handshake.
 		if cfg.AuthName != "" && clientName != cfg.AuthName {
-			fmt.Fprintf(stderr, "client: name %q does not match the invite principal %q; create an invite for this name or use the invited one\n",
+			fmt.Fprintf(stderr, "client: name %q does not match the enrolled principal %q; use that name or re-enroll this config\n",
 				clientName, cfg.AuthName)
 			return 1
 		}
@@ -182,6 +182,20 @@ func cmdClient(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	defer c.Close()
+
+	// First login with the server's login code answers with this machine's own
+	// token. Persist it now, so later starts and reconnects do not need the
+	// enrollment secret again.
+	if issued := c.IssuedToken(); issued != "" {
+		cfg.Token = issued
+		cfg.AuthName = clientName
+		if err := config.Save(path, cfg); err != nil {
+			fmt.Fprintf(stderr, "client: enrolled, but could not save the issued token to %s: %v\n", path, err)
+			fmt.Fprintln(stderr, "client: the login code remains in the config; enrollment will be repeated on the next start")
+		} else {
+			fmt.Fprintf(stdout, "enrolled as %s\n", clientName)
+		}
+	}
 
 	if err := c.UploadTree(); err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)

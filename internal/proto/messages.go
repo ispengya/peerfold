@@ -138,6 +138,12 @@ type HelloOKBody struct {
 	// frames. A client that asked and gets false — an older server, or one
 	// configured not to compress — sends plain frames.
 	Compress bool `json:"compress,omitempty"`
+
+	// IssuedToken is set only when the hello carried the server's enrollment
+	// secret and the server created a per-name token for this machine. The
+	// client stores it and uses it for every later connection; the enrollment
+	// secret is not needed after this answer.
+	IssuedToken string `json:"issued_token,omitempty"`
 }
 
 // NodeJSON mirrors node.Node for the wire, so the two encode identically and

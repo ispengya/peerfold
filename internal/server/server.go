@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -128,6 +129,13 @@ type Server struct {
 	// a bearer token on a plaintext connection would be visible to anyone on
 	// the path, so NewWithOptions refuses that combination.
 	tokensPath string
+	// enrollSecret is the server-printed code a machine presents once to get
+	// its own per-name token. It never becomes an identity itself: a successful
+	// enrollment issues a fresh token and returns it in the hello reply.
+	enrollSecret string
+	// enrollMu serialises token-file read/modify/write during enrollment. Two
+	// machines enrolling at once would otherwise overwrite each other's records.
+	enrollMu sync.Mutex
 }
 
 // Options configures a secure server. The zero value is the plaintext server
@@ -139,6 +147,10 @@ type Options struct {
 	TLSConfig *tls.Config
 	// TokensPath is the per-name credential file. Setting it requires TLS.
 	TokensPath string
+	// EnrollSecret is the value printed at startup as the login code. A peer
+	// that presents it once receives a fresh per-name token. Empty disables
+	// enrollment; only pre-created tokens would work.
+	EnrollSecret string
 }
 
 // New returns a plaintext Server listening on listen.
@@ -165,6 +177,7 @@ func NewWithOptions(listen string, opt Options) *Server {
 		router:           &Router{clients: make(map[string]*clientLink)},
 		broadcastTimeout: DefaultEventBroadcastTimeout,
 		tokensPath:       opt.TokensPath,
+		enrollSecret:     opt.EnrollSecret,
 	}
 	if opt.TokensPath != "" && opt.TLSConfig == nil {
 		s.lnErr = errors.New("server: token authentication requires TLS")
@@ -335,16 +348,41 @@ func (s *Server) handleConn(conn net.Conn) {
 	compress := hb.Compress
 	c.SetCompression(compress)
 
-	// Authentication comes before registration or any view of the index. The
-	// token is a bearer credential over TLS, looked up under the claimed name;
-	// the same answer is given for an unknown name, a wrong token, and a role
-	// mismatch, so the connection cannot be used to discover which names exist.
+	// Authentication comes before registration or any view of the index. A
+	// peer either presents its own per-name token or the enrollment secret
+	// printed at startup. In the second case the server issues a fresh token,
+	// stores only its hash, and returns it once in the hello reply. The same
+	// answer is given for an unknown name, a wrong token, and a role mismatch,
+	// so the connection cannot be used to discover which names exist.
+	issuedToken := ""
 	if s.tokensPath != "" {
 		if hb.Name == "" {
 			_ = c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindHello, Err: "authentication required: name is required"})
 			return
 		}
-		if _, ok := identity.CheckToken(s.tokensPath, hb.Name, hb.Role, hb.Token); !ok {
+		if _, ok := identity.CheckToken(s.tokensPath, hb.Name, hb.Role, hb.Token); ok {
+			// Normal login with a token issued earlier.
+		} else if s.enrollSecret != "" && subtle.ConstantTimeCompare([]byte(hb.Token), []byte(s.enrollSecret)) == 1 {
+			rec, exists, err := identity.LookupToken(s.tokensPath, hb.Name)
+			if err != nil || (exists && rec.Role != hb.Role) {
+				logging.Errorf("server: enrollment refused for %q as %s from %s", hb.Name, hb.Role, conn.RemoteAddr())
+				_ = c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindHello, Err: "authentication failed"})
+				return
+			}
+			token, err := identity.NewToken()
+			if err == nil {
+				s.enrollMu.Lock()
+				err = identity.SetToken(s.tokensPath, hb.Name, hb.Role, token, true)
+				s.enrollMu.Unlock()
+			}
+			if err != nil {
+				logging.Errorf("server: enroll %q: %v", hb.Name, err)
+				_ = c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindHello, Err: "authentication failed: could not issue a token"})
+				return
+			}
+			issuedToken = token
+			logging.Infof("server: enrolled %q as %s from %s", hb.Name, hb.Role, conn.RemoteAddr())
+		} else {
 			logging.Errorf("server: authentication failed for %q from %s", hb.Name, conn.RemoteAddr())
 			_ = c.Send(proto.Envelope{ID: env.ID, Kind: proto.KindHello, Err: "authentication failed"})
 			return
@@ -378,7 +416,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			logging.Infof("server: mount %q at %q connected from %s (compression=%v)",
 				hb.Name, hb.MountPoint, conn.RemoteAddr(), compress)
 		}
-		if err := s.replyHello(c, env.ID, hb.Name, false, compress); err != nil {
+		if err := s.replyHello(c, env.ID, hb.Name, false, compress, issuedToken); err != nil {
 			return
 		}
 		if hb.Watching() {
@@ -441,7 +479,7 @@ func (s *Server) handleConn(conn net.Conn) {
 	})
 	defer s.unregisterClientInfo(c)
 
-	if err := s.replyHello(c, env.ID, hb.Name, aggregate, compress); err != nil {
+	if err := s.replyHello(c, env.ID, hb.Name, aggregate, compress, issuedToken); err != nil {
 		return
 	}
 	// Requests can only be forwarded to a client that is reachable, and this
@@ -465,10 +503,13 @@ func (s *Server) handleConn(conn net.Conn) {
 	s.serveLoop(hb.Name, c, cleanup)
 }
 
-// replyHello answers a hello with the server's ruling on the aggregate role and
-// on connection compression.
-func (s *Server) replyHello(c *proto.Conn, id uint64, name string, aggregate, compress bool) error {
-	body, err := json.Marshal(proto.HelloOKBody{Name: name, Aggregate: aggregate, Compress: compress})
+// replyHello answers a hello with the server's ruling on the aggregate role,
+// on connection compression, and — only after enrollment — the token this
+// machine should use from now on.
+func (s *Server) replyHello(c *proto.Conn, id uint64, name string, aggregate, compress bool, issuedToken string) error {
+	body, err := json.Marshal(proto.HelloOKBody{
+		Name: name, Aggregate: aggregate, Compress: compress, IssuedToken: issuedToken,
+	})
 	if err != nil {
 		return err
 	}

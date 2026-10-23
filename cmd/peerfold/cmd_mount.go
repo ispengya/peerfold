@@ -152,8 +152,8 @@ func runMount(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	// Credentials live in the mount config. An absent file or absent invite is
-	// the plaintext mode; a secure server will refuse it, which is better than
+	// Credentials live in the mount config. An absent file or absent code is the
+	// plaintext mode; a secure server will refuse it, which is better than
 	// silently downgrading a connection that was meant to be encrypted.
 	var cfg config.Config
 	if cfgPath != "" {
@@ -170,20 +170,28 @@ func runMount(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	// Declare the mount in the handshake. The name is the authenticated
-	// principal when an invite is in use; a token is bound to one name.
-	mountName := defaultClientName()
-	if hasCredentials(cfg) {
-		if cfg.AuthName == "" {
-			fmt.Fprintln(stderr, "mount: the invite has no principal; paste the invite again")
-			return 1
-		}
-		mountName = cfg.AuthName
+	// Declare the mount in the handshake. The name is the principal this
+	// machine enrolls under; a token is bound to it.
+	mountName := cfg.AuthName
+	if mountName == "" {
+		mountName = defaultClientName()
 	}
 	v, err := viewer.DialMountWithConfig(server, mountName, mountPoint, dialCfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "mount: %v\n", err)
 		return 1
+	}
+	if issued := v.IssuedToken(); issued != "" {
+		// First login with the server's code: keep the per-name token so the
+		// next start and every reconnect use it instead of re-enrolling.
+		cfg.Token = issued
+		cfg.AuthName = mountName
+		dialCfg.Token = issued
+		if cfgPath != "" {
+			if err := config.Save(cfgPath, cfg); err != nil {
+				fmt.Fprintf(stderr, "mount: enrolled, but could not save the issued token: %v\n", err)
+			}
+		}
 	}
 	caller := mount.NewPooledViewerCaller(v, opts.ReadConcurrency)
 	defer caller.Close()
